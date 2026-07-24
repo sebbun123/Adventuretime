@@ -11,6 +11,8 @@ A MacroQuest Lua UI for driving a boxed group on EverQuest Project Lazarus, buil
 
 ## Troubleshooting DanNet issues
 
+If you only see your driver populating stuff, you're likely having trouble with Dannet. The below should fix most dannet issues. 
+
 Sometimes DanNet doesn't start properly, or is on a defunct network adapter. You can fix it with the following steps:
 
 1. Find the DanNet config — it'll be in `E3 folder` → `Config` → `MQ2DanNet`
