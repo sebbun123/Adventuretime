@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-countsafe-2026-07-25'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-diblind-2026-07-25'   -- bump on every change; prints on startup
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
@@ -168,6 +168,19 @@ local WANTS_ENDURANCE = { WAR = true, PAL = true, SHD = true, BST = true, RNG = 
 local function is_endurance(item) return item:find('Frenzied Endurance', 1, true) ~= nil or item:find('Earthen Grit', 1, true) ~= nil end
 -- Classes that use mana - the Clear Mind (mana) draught is skipped for everyone else (pure melee).
 local WANTS_MANA = { CLR = true, DRU = true, SHM = true, NEC = true, WIZ = true, MAG = true, ENC = true }
+-- Class strings arrive from two places (Me.Class.ShortName locally, a /dquery for peers) and the
+-- unknown value is '?', not ''. Normalise here, and treat anything we could not resolve as UNKNOWN so
+-- the caller can skip the class filter entirely rather than reading '?' as "a class that does not want
+-- this" - which greyed out Clear Mind on priests whenever the class query happened to fail.
+local CLASS_SHORT = { WARRIOR='WAR', CLERIC='CLR', PALADIN='PAL', RANGER='RNG', SHADOWKNIGHT='SHD',
+                      ['SHADOW KNIGHT']='SHD', DRUID='DRU', MONK='MNK', BARD='BRD', ROGUE='ROG',
+                      SHAMAN='SHM', NECROMANCER='NEC', WIZARD='WIZ', MAGICIAN='MAG', ENCHANTER='ENC',
+                      BEASTLORD='BST', BERSERKER='BER' }
+function class_key(c)
+    c = tostring(c or ''):upper()
+    if c == '' or c == '?' or c == 'NULL' then return nil end   -- unknown: do not filter on it
+    return CLASS_SHORT[c] or c
+end
 local function is_mana(item) return item:find('Clear Mind', 1, true) ~= nil end
 
 -- Encode/decode an item name for passing over the peer command channel (names have spaces).
@@ -241,7 +254,9 @@ local function peer_cmdf(char, fmt, ...)
     else mq.cmdf('/dex %s %s', char, cmd) end
 end
 local function peer_bcast(fmt, ...)   -- broadcast to the whole in-game group in ONE relay (5x less window spam than looping /dex)
-    if not peerChan then peer_cmdf(myName, '/echo') end   -- force channel detection + commandecho-off
+    -- mq.TLO directly, not myName: peer_bcast is defined ABOVE the myName local, so referring to it
+    -- here read a nil global and the detection ping went to an empty name.
+    if not peerChan then peer_cmdf(tostring(mq.TLO.Me.Name() or ''), '/echo') end   -- force channel detection + commandecho-off
     local cmd = fmt:format(...)
     if peerChan == 'e3' then mq.cmdf('/e3bcga %s', cmd)
     elseif peerChan == 'eqbc' then mq.cmdf('/bcga %s', cmd)
@@ -378,6 +393,8 @@ local function query_all_counts(peers, items)
         return
     end
     local t0all = mq.gettime()
+    -- Ask the group to hold its chatter. Generous window, refreshed below if the pass runs long.
+    pcall(function() peer_bcast('/at_quiet %d', 15000) end)
 
     local function fire(p, q) pcall(function() mq.cmdf('/squelch /dquery %s -q "%s"', p, q) end) end
     local function readQ(p, q)
@@ -390,9 +407,18 @@ local function query_all_counts(peers, items)
         return got, raw
     end
 
-    -- Class (static): only query peers we haven't cached; simple pipelined wait, one query each.
+    -- Class needs NO network. member_class reads it from burnClass (pushed by peers on their burn
+    -- reports) and falls back to a local spawn lookup - both free. It used to be a /dquery per peer,
+    -- which is one more thing to lose under load: when it lost, the class became '?' and every
+    -- class-gated decision went wrong for that toon until the next run. A query we do not send cannot
+    -- fail. Only peers that resolve to nothing fall through to the query.
     local need = {}
-    for _, p in ipairs(peers) do if not peerClass[p:lower()] then need[#need + 1] = p end end
+    for _, p in ipairs(peers) do
+        if not peerClass[p:lower()] then
+            local c = (member_class(p) or ''):upper()
+            if c ~= '' and c ~= '?' then peerClass[p:lower()] = c else need[#need + 1] = p end
+        end
+    end
     if #need > 0 then
         for _, p in ipairs(need) do fire(p, 'Me.Class.ShortName') end
         local dl, left = mq.gettime() + 1500, #need
@@ -405,9 +431,13 @@ local function query_all_counts(peers, items)
                 end
             end
         end
-        for _, p in ipairs(need) do peerClass[p:lower()] = peerClass[p:lower()] or '?' end
+        -- Deliberately NOT caching a failure: leaving it nil means the next run retries, instead of a
+        -- single unlucky query poisoning this toon's class for the rest of the session.
+        for _, p in ipairs(need) do
+            if not peerClass[p:lower()] then log('[counts] class unresolved for %s - will retry next run', p) end
+        end
     end
-    for _, p in ipairs(peers) do counts[p:lower()].__class = peerClass[p:lower()] or '?' end
+    for _, p in ipairs(peers) do counts[p:lower()].__class = peerClass[p:lower()] or '?' end   -- '?' = unknown; class_key() treats it as 'do not filter'
 
     -- Item counts, pipelined per peer. On a nil (a query lost under load, NOT a real 0) we RE-FIRE the same
     -- item a few times before giving up on it - transient drops recover. We only abandon a whole peer after
@@ -418,11 +448,26 @@ local function query_all_counts(peers, items)
     for _, p in ipairs(peers) do idx[p] = 1; tries[p] = 0; dead[p] = 0; ans[p] = 0; fired[p] = false end
 
     local PER_Q      = 300   -- a working query answers in ~50ms; no answer in this long = lost, re-fire
-    local MAX_TRIES  = 4     -- re-fires of one item before we mark it unknown and move on
+    local MAX_TRIES  = 3     -- re-fires of one item before we park it for the sweep below
     local MAX_DEAD   = 4     -- consecutive fully-failed items before we call the peer dark and drop it
-    local FIRE_GAP   = 25    -- min ms between ANY two /dquery fires (across all peers) - staggers the bursts
+    -- Starting gap is derived from a TIME BUDGET, not hardcoded. 5 peers x 16 items = 80 queries, so
+    -- the old fixed 25ms was really a 2-second budget by accident - fast, and far too tight: bunched
+    -- fires are exactly what DanNet drops. Spending 5s instead roughly triples the spacing and the
+    -- pass then usually finishes first time, which is quicker overall than 2s plus a retry storm.
+    -- Clamped so a tiny run does not crawl and a huge one does not take all day.
+    local BUDGET_MS  = 5000
+    local FIRE_GAP   = math.max(25, math.min(150, math.floor(BUDGET_MS / math.max(1, #peers * #items))))
     local lastFire   = 0     -- gettime of the last fire (global), so no two queries go out the same instant
-    local hardDl = mq.gettime() + 20000
+    -- Adaptive gap. A fixed stagger cannot know how much this network can take, so it either wastes
+    -- time when things are fine or floods when they are not. Widen on every exhausted item, and creep
+    -- back down after a run of clean answers. Retrying INTO the congestion that caused the miss is
+    -- what turned an ~2s job into a 22s one.
+    local gap, GAP_MAX, goodRun, refires = FIRE_GAP, 250, 0, 0
+    log('[counts] %d peers x %d items = %d queries, %dms gap (%.1fs budget)',
+        #peers, #items, #peers * #items, FIRE_GAP, BUDGET_MS / 1000)
+    local unresolved = {}   -- { {peer, itemIndex}, ... } parked for the quiet sweep after the main pass
+    -- Deadline scales with the budget rather than sitting at a flat 20s.
+    local hardDl = mq.gettime() + math.max(20000, BUDGET_MS * 4)
     local function pending() for _, p in ipairs(peers) do if idx[p] then return true end end return false end
     local nextLog = mq.gettime() + 700
 
@@ -434,7 +479,7 @@ local function query_all_counts(peers, items)
                 if not fired[p] then
                     -- item i needs firing; only fire if the global gap has passed, so fires never bunch up
                     -- (DanNet drops queries when a burst goes out at once - that was the scattered nils).
-                    if mq.gettime() - lastFire >= FIRE_GAP then
+                    if mq.gettime() - lastFire >= gap then
                         fire(p, qstr[i]); firedAt[p] = mq.gettime(); lastFire = mq.gettime(); fired[p] = true
                     end
                 else
@@ -442,18 +487,25 @@ local function query_all_counts(peers, items)
                     if v then
                         counts[p:lower()][items[i]] = tonumber(v) or 0
                         ans[p] = ans[p] + 1; dead[p] = 0; tries[p] = 0
+                        goodRun = goodRun + 1
+                        if goodRun >= 8 and gap > FIRE_GAP then gap = math.max(FIRE_GAP, gap - 10); goodRun = 0 end
                         idx[p] = i + 1; fired[p] = false
                         if idx[p] > #items then idx[p] = nil end
                     elseif (mq.gettime() - (firedAt[p] or 0)) > PER_Q then
                         tries[p] = tries[p] + 1
                         if tries[p] < MAX_TRIES then
-                            fired[p] = false                                -- lost query: re-fire same item (gated by FIRE_GAP)
+                            refires = refires + 1
+                            fired[p] = false                                -- lost query: re-fire same item (gated by the adaptive gap)
                         else
-                            log('[counts]   MISS %s item%d "%s" -> raw=[%s] (after %d tries)', p, i, items[i], raw, tries[p])
-                            counts[p:lower()][items[i]] = 0
+                            -- Park it rather than calling it 0. It gets one more go in the sweep, once
+                            -- every other peer has finished and there is nothing to contend with.
+                            unresolved[#unresolved + 1] = { p, i }
+                            gap = math.min(GAP_MAX, gap + 25); goodRun = 0
                             dead[p] = dead[p] + 1; tries[p] = 0
                             if dead[p] >= MAX_DEAD then                     -- several items in a row fully failed: peer is dark
-                                for j = i, #items do counts[p:lower()][items[j]] = counts[p:lower()][items[j]] or 0 end
+                                for j = i, #items do
+                                    if counts[p:lower()][items[j]] == nil then unresolved[#unresolved + 1] = { p, j } end
+                                end
                                 idx[p] = nil; log('[counts] %s DROPPED (dark) after item %d, ans %d', p, i, ans[p])
                             else
                                 idx[p] = i + 1; fired[p] = false
@@ -467,24 +519,83 @@ local function query_all_counts(peers, items)
             end
         end
     end
+    -- Anything still in flight at the deadline joins the parked list - the sweep gets a crack at it too.
     if pending() then
         local st = {}
-        for _, p in ipairs(peers) do if idx[p] then st[#st + 1] = p .. '@item' .. idx[p] end end
-        log('[counts] !! HARD DEADLINE (%dms) - still pending: %s', mq.gettime() - t0all, table.concat(st, ', '))
-        -- Mark every item this peer never answered as UNKNOWN. The MISS path above deliberately writes
-        -- 0 after MAX_TRIES ("we asked, assume none") - but a deadline is not an answer, and letting it
-        -- fall through as nil made held() read it as 0, so a peer stuck at item 6 looked like it held
-        -- none of items 6..N and got handed a full target of each. Queries advance in order, so
-        -- everything from idx[p] to the end is unanswered.
         for _, p in ipairs(peers) do
             if idx[p] then
-                local pl = p:lower()
-                counts[pl].__unknown = counts[pl].__unknown or {}
-                for j = idx[p], #items do counts[pl].__unknown[items[j]] = true end
+                st[#st + 1] = p .. '@item' .. idx[p]
+                for j = idx[p], #items do
+                    if counts[p:lower()][items[j]] == nil then unresolved[#unresolved + 1] = { p, j } end
+                end
+            end
+        end
+        log('[counts] !! HARD DEADLINE (%dms) - still pending: %s', mq.gettime() - t0all, table.concat(st, ', '))
+    end
+
+    -- QUIET SWEEP. Everything above ran while five other peers were also being queried; by now that is
+    -- over, so the parked items get retried one at a time with a wide gap and a patient timeout. This is
+    -- the cheapest reliability we can buy - the failures were caused by contention, and there is none
+    -- left here. Only what fails THIS pass is genuinely unknown.
+    if #unresolved > 0 then
+        local before, t0sweep = #unresolved, mq.gettime()
+        log('[counts] sweep: retrying %d unanswered item(s) with the network quiet', before)
+        local SWEEP_GAP, SWEEP_Q, SWEEP_TRIES, sweepDl = 120, 800, 2, mq.gettime() + 12000
+        local still = {}
+        for _, u in ipairs(unresolved) do
+            local pr, ii = u[1], u[2]
+            if counts[pr:lower()][items[ii]] == nil and mq.gettime() < sweepDl then
+                local got = false
+                for _ = 1, SWEEP_TRIES do
+                    fire(pr, qstr[ii])
+                    local dl = mq.gettime() + SWEEP_Q
+                    while mq.gettime() < dl do
+                        mq.delay(20)
+                        local v = readQ(pr, qstr[ii])
+                        if v then counts[pr:lower()][items[ii]] = tonumber(v) or 0; got = true; break end
+                    end
+                    if got then break end
+                    mq.delay(SWEEP_GAP)
+                end
+                if not got then still[#still + 1] = { pr, ii } end
+            elseif counts[pr:lower()][items[ii]] == nil then
+                still[#still + 1] = { pr, ii }
+            end
+        end
+        log('[counts] sweep recovered %d/%d in %dms', before - #still, before, mq.gettime() - t0sweep)
+        for _, u in ipairs(still) do
+            local pl = u[1]:lower()
+            counts[pl].__unknown = counts[pl].__unknown or {}
+            counts[pl].__unknown[items[u[2]]] = true
+        end
+    end
+
+    do
+        -- Belt and braces: anything still nil after the sweep is UNKNOWN, and must NOT read as zero -
+        -- held() ends in 'or 0', so a nil would look like "carries none" and earn a full hand-out.
+        for _, p in ipairs(peers) do
+            local pl = p:lower()
+            for _, it in ipairs(items) do
+                if counts[pl][it] == nil then
+                    counts[pl].__unknown = counts[pl].__unknown or {}
+                    counts[pl].__unknown[it] = true
+                end
             end
         end
     end
+    pcall(function() peer_bcast('/at_quiet 0') end)   -- pass over: everyone may talk again
     for _, p in ipairs(peers) do counts[p:lower()].__got = true end
+    local miss = 0
+    for _, p in ipairs(peers) do
+        local u = counts[p:lower()].__unknown
+        if u then for _ in pairs(u) do miss = miss + 1 end end
+    end
+    -- refires and the final gap are the diagnostic: 0 re-fires with the gap still at its starting value
+    -- means the pass was genuinely clean and the budget could come down. A grown gap means queries were
+    -- lost and quietly recovered in-pass - healthy result, unhealthy network.
+    log('[counts] done in %dms - %d/%d answered%s | %d re-fire(s), gap %d->%dms', mq.gettime() - t0all,
+        (#peers * #items) - miss, #peers * #items,
+        miss > 0 and string.format(', %d still unknown', miss) or '', refires, FIRE_GAP, gap)
 end
 
 -- ============ Tank XTargets: healers put the RAID's tanks on their XTarget list (E3 XTarget heals) ============
@@ -514,9 +625,9 @@ local function raid_tank_names()
 end
 
 -- Healer-only. Clears the managed slots (2..13, leaving slot 1 for autohater), then sets each tank BY NAME
--- via /xtarget set - never targeting them. /rsay the list. If announceOnlyIfChanged, only /rsay on a change.
+-- via /xtarget set - never targeting them. The list is recorded to the log file, not announced.
 local function set_tank_xtargets(auto)
-    -- auto=true : only touch XTargets (and /rsay) when the tank list CHANGED since last time (no churn).
+    -- auto=true : only touch XTargets when the tank list CHANGED since last time (no churn).
     -- auto=false: manual - always clear/set and always announce.
     local myCls = (mq.TLO.Me.Class.ShortName() or ''):upper()
     if not HEALER_CLASS[myCls] then return nil end   -- only healers manage tank XTargets
@@ -547,8 +658,11 @@ local function set_tank_xtargets(auto)
             slot = slot + 1
         end
     end
+    -- The /rsay announce that used to live here is gone: it was there to prove the slots were being
+    -- set correctly, that has held up, and it was raid-wide chat on every change. Kept as a local log
+    -- line so it is still checkable after the fact without saying anything to the raid.
     if #tanks > 0 then
-        pcall(function() mq.cmdf('/rsay %s added Xtargets: %s', myName, table.concat(tanks, ', ')) end)
+        rezlog('[xtank] set %d xtarget(s): %s', #tanks, table.concat(tanks, ', '))
     end
     return tanks
 end
@@ -571,8 +685,12 @@ local burnRefreshRequested = false   -- Burns tab 'Refresh' - re-parse the INI a
 local burnStartAt    = 0     -- first poll is delayed: reporting before the driver's binds exist loses items
 local lastBurnResync = 0     -- slow full re-report; reports only fire on CHANGE, so a dropped one is
                              -- otherwise lost until that item next flips. This heals it.
+local lastBurnSend   = 0     -- rate limiter for burn reports (their own lane - see the dribble below)
 local burnPending    = {}    -- name -> pending report. Firing a burn flips EVERY item at once, so we queue
                              -- the reports and dribble them out instead of dumping 20+ messages in one tick.
+-- Declared AFTER burnPending: a function placed above it would capture a GLOBAL of that name (nil),
+-- and pairs(nil) is a hard error the moment the first report queues.
+local function burnQueueLen() local n = 0; for _ in pairs(burnPending) do n = n + 1 end; return n end
 local discWatch      = nil   -- { name=, at=, expected= } : the disc currently running, for the fade log
 local lastDiscPoll   = 0
 local burnState      = {}    -- driver: burnState[char][item] = { secs=, updated= }
@@ -885,7 +1003,9 @@ end
 do   -- 8s settle + up to 3s of per-character offset, so the group's first reports don't collide
     local off = 0
     for i = 1, #myName do off = off + myName:byte(i) end
-    burnStartAt = mq.gettime() + 8000 + (off % 3000)
+    -- 8-16s, not 8-11s: a 3s spread across five workers still bunches them. Wider stagger means the
+    -- opening dumps interleave instead of stacking.
+    burnStartAt = mq.gettime() + 8000 + (off % 8000)
 end
 
 -- ===== Rez target priority: a reorderable, persisted list (top gets rezzed first) =====
@@ -901,7 +1021,9 @@ local function rez_rank(cls)
     if TANK_CLASS[cls] then return 1 elseif HEALER_CLASS[cls] then return 2
     elseif cls == 'BRD' or cls == 'ENC' then return 4 else return 3 end   -- 3 = DPS, 4 = support
 end
-local function member_class(nm)
+-- Global, not local: query_all_counts sits ABOVE this line and calls it. A local would not be in
+-- scope there and would resolve as a nil global at runtime.
+function member_class(nm)
     local c = burnClass[nm]
     if not c or c == '' then pcall(function() c = (mq.TLO.Spawn('pc =' .. nm).Class.ShortName() or ''):upper() end) end
     return c or ''
@@ -1267,6 +1389,7 @@ DI = {
     state   = {},     -- name -> { staff, emeralds, dgReady, saveUp, updated }
     key     = '',     -- my last-pushed state, for change detection
     lastPush = 0, lastPoll = 0, firedAt = 0, trigAt = 0, dbg = '',
+    startedAt = 0,    -- set at load; the staff will not fire until the state table has had time to fill
 }
 
 -- Everything I can see about myself, read locally.
@@ -1366,6 +1489,21 @@ local function di_tick()
 
     local ts = DI.state[tank]
     if ts and ts.saveUp == 1 then DI.dbg = tank .. ' already has a save up'; DI.trigAt = 0; return end
+    -- EVERY guard below is a reason to HOLD, so an empty DI.state makes them all pass vacuously and the
+    -- staff fires blind. That is what happened one second after load: no tank report yet, so "does he
+    -- already have a save" could not be asked, nobody was known to be ahead, and nothing said wait.
+    -- Refuse to commit without a fresh word from the tank - firing when he is already saved is exactly
+    -- the waste this whole baton exists to prevent.
+    if not ts or (now - (ts.updated or 0)) >= 8000 then
+        DI.dbg = 'no fresh report from ' .. tank .. ' - holding'
+        DI.trigAt = 0
+        return
+    end
+    if (now - DI.startedAt) < 12000 then
+        DI.dbg = 'settling after load'   -- peers report on their own schedule; do not act on a half-built table
+        DI.trigAt = 0
+        return
+    end
 
     for nm, st in pairs(DI.state) do                       -- any cleric still holding a DG source: wait
         if st.dgReady == 1 and (now - (st.updated or 0)) < 8000 then
@@ -1432,6 +1570,17 @@ local function rez_dead(name)
 end
 -- Heartbeat cadence state. On a global table rather than four locals: this chunk is at Lua's ceiling.
 HB = { rezFast = false, diFast = false, lastCheck = 0, corpse = false }
+-- Set by the driver while it is running a count pass. Workers hold their OWN chatter for the duration,
+-- so the queries get the network to themselves. Workers cannot see the driver's `distributing` flag,
+-- and the two collide by construction: a worker's first burn poll lands 8-11s after load and dumps
+-- every watched item at once, which is exactly when the driver's startup Refresh is querying.
+-- Expires on its own so a driver that dies mid-pass cannot mute the group forever.
+-- Only the BURN dribble honours this. The rez and DI heartbeats keep talking: their staleness windows
+-- are 6s and 8s, shorter than a quiet window, and a toon that goes silent is indistinguishable from a
+-- toon whose script died - which is the exact failure those heartbeats exist to prevent. They are a
+-- handful of messages against the burn burst's 86.
+quietUntil = 0
+function peer_quiet() return mq.gettime() < quietUntil end
 -- Is there a rez event in progress from where I stand? Throttled to once a second: it is asked every
 -- frame to decide the cadence, and SpawnCount is not free. Counts ANY pc corpse in zone rather than
 -- walking the group by name - one TLO call instead of eighteen, and over-triggering on a stranger's
@@ -1690,6 +1839,10 @@ pcall(function()
                             aas = aas, updated = mq.gettime() }
     end)
     mq.bind('/at_mgbclick', function() mgb_click() end)
+    mq.bind('/at_quiet', function(ms)
+        local n = tonumber(ms) or 0
+        quietUntil = (n > 0) and (mq.gettime() + math.min(n, 30000)) or 0
+    end)
     mq.bind('/at_diauto', function(mode) DI.auto = (mode == 'on') end)
     mq.bind('/at_pot', function(key)   -- group draught button: drink the best tier I hold
         local base = pot_base_for(key)
@@ -2195,8 +2348,9 @@ local function give_out()
     local function class_of(who) return (counts[who:lower()] and counts[who:lower()].__class) or '' end
     local function eff_target(who, item)
         local c = class_of(who)
-        if is_endurance(item) and c ~= '' and not WANTS_ENDURANCE[c] then return 0 end
-        if is_mana(item) and c ~= '' and not WANTS_MANA[c] then return 0 end
+        local ck = class_key(c)
+        if ck and is_endurance(item) and not WANTS_ENDURANCE[ck] then return 0 end
+        if ck and is_mana(item) and not WANTS_MANA[ck] then return 0 end
         return target[item] or 0
     end
 
@@ -2390,7 +2544,8 @@ local function render_group(label, color, items)
                     ImGui.TableNextColumn()
                     local c = (statusCounts[nm:lower()] and statusCounts[nm:lower()].__class) or ''
                     local n = (statusCounts[nm:lower()] and statusCounts[nm:lower()][it]) or 0
-                    if (is_endurance(it) and c ~= '' and not WANTS_ENDURANCE[c]) or (is_mana(it) and c ~= '' and not WANTS_MANA[c]) then
+                    local ck = class_key(c)
+                    if ck and ((is_endurance(it) and not WANTS_ENDURANCE[ck]) or (is_mana(it) and not WANTS_MANA[ck])) then
                         ImGui.TextDisabled(tostring(n))   -- holds this many but won't use them (grey = not needed)
                     elseif n >= tgt then
                         ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(n))
@@ -2497,6 +2652,9 @@ end
 -- MQ ships FontAwesome, so use real icons when the module is there and fall back to ASCII when it
 -- isn't - no image assets to load and nothing to break on a build without it.
 local ICONS_OK, ICO = pcall(require, 'mq.icons')
+local BURN_DOT = '#'   -- the dot glyph; ASCII so it renders in any ImGui font. Swap freely.
+                       -- Declared HERE, above burn_glyph: it used to sit below, so the 'or BURN_DOT'
+                       -- fallback read a nil global and an unknown kind rendered nothing at all.
 local BURN_GLYPH, BURN_GLYPH_BY_NAME
 if ICONS_OK and type(ICO) == 'table' then
     -- Other item candidates if the hand doesn't land: MD_TOUCH_APP, FA_DIAMOND, MD_DIAMOND,
@@ -2519,7 +2677,6 @@ function burn_glyph(st, itemName)
     end
     return BURN_GLYPH[st.kind or 'i'] or BURN_DOT
 end
-local BURN_DOT = '#'   -- the dot glyph; ASCII so it renders in any ImGui font. Swap freely.
 -- The tiers actually being reported, ordered, as { key, label } entries. Built from the data rather
 -- than a fixed list, so an INI using keys we've never seen still displays.
 -- A tier's IDENTITY is the INI KEY, not the worker's numeric rank. parse_burns' rank_for() numbers
@@ -3352,7 +3509,12 @@ if SHOW_UI then
 else
     log('ready [%s] (worker - headless; obeying the driver).', BUILD_TAG)
 end
-refreshRequested = true   -- populate the status columns as soon as we start
+-- DRIVER ONLY. This populates the Pots status columns, which only exist on the driver - but it used to
+-- run unconditionally, so all six toons each fired a full peers x items query pass at startup. Six
+-- concurrent 80-query passes is 480 queries in a few seconds, and that self-inflicted burst was most
+-- of the congestion the pacing above was working around. A worker has no status board to fill.
+if SHOW_UI then refreshRequested = true end
+DI.startedAt = mq.gettime()   -- clock the settling window from load, not from the first tick
 
 -- Driver only, ONCE at startup: spread a headless worker to each GROUP member so they're present to take
 -- commands (tank XTargets, etc.). Not a recurring ping - no pingpong. Counts still come straight from
@@ -3424,7 +3586,7 @@ while running do
         collectRequested = false
         collect_all()
     end
-    if refreshRequested and not distributing then
+    if refreshRequested and not distributing and SHOW_UI then   -- belt and braces: workers never refresh
         refreshRequested = false
         distributing = true
         uiStatus = 'Reading group counts...'
@@ -3484,14 +3646,22 @@ while running do
         peer_bcast('/at_burnrefresh')
         mq.cmd('/at_burnrefresh')               -- and re-read my own
     end
-    if next(burnPending) ~= nil then   -- dribble queued burn reports out, at most a few per pass
+    -- Burn reports are the ONLY bulk traffic here - everything else is a handful of small, latency-
+    -- sensitive messages. So they get their own rate limit rather than sharing the main loop's pace:
+    -- 2 per 250ms pass is 8/s per toon, 40/s across the group, and the opening dump is 86 reports.
+    -- Slowing them is close to free because the DRIVER counts down locally from `updated` - a late
+    -- report delays the first value appearing, not the accuracy of a running timer. A bulk dump
+    -- (startup, or Refresh) spreads wider still, since nothing is waiting on it.
+    if next(burnPending) ~= nil and not peer_quiet()
+       and (mq.gettime() - lastBurnSend) >= (burnQueueLen() > 8 and 600 or 300) then
+        lastBurnSend = mq.gettime()
         local sent = 0
         for nm, d in pairs(burnPending) do
             burnPending[nm] = nil
             if driverName then peer_cmdf(driverName, '/at_burn %s %s %d %d %d %d %s %d %s %s', myName, myClass, d.tier, d.secs, d.av, d.dsecs, d.kind or 'i', d.ord or 0, d.tkey or '?', nm)
             else peer_bcast('/at_burn %s %s %d %d %d %d %s %d %s %s', myName, myClass, d.tier, d.secs, d.av, d.dsecs, d.kind or 'i', d.ord or 0, d.tkey or '?', nm) end
             sent = sent + 1
-            if sent >= 2 then break end
+            if sent >= 1 then break end
         end
     end
     if driverName and (mq.gettime() - lastTribPush) > 15000 then   -- report MY tribute to the driver, unprompted
