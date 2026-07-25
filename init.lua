@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-diblind-2026-07-25'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-e3glob-2026-07-25'   -- bump on every change; prints on startup
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
@@ -602,6 +602,7 @@ end
 local HEALER_CLASS = { CLR = true, DRU = true, SHM = true }
 local TANK_CLASS   = { WAR = true, PAL = true, SHD = true }
 local lastXTankKey = nil   -- last list this toon set (for the on-change announce)
+local lastGroupKey = nil   -- group roster as last seen, so a membership change can re-test the network
 
 -- OTHER groups' raid tanks, minus me and minus my OWN group's tank (he's already covered by the group
 -- heal/assist setup - an XTarget slot on him is wasted). Deduped. Not raiding => nothing to watch.
@@ -928,28 +929,155 @@ function pot_state(base)
 end
 
 -- Parse THIS toon's own [Burn] 5minBurn lines from its E3 INI -> bare names (strip the /... suffix).
+-- Where this machine keeps its E3 character INIs, when it is not somewhere we would guess.
+-- Needed because a boxed group can be split across COMPUTERS: each client resolves its own MQ paths
+-- fine, but if E3 lives outside MQ's config tree on one of them, nothing below will find it.
+-- Read from a one-line file beside this script rather than from settings, because parse_burns runs
+-- long before load_settings and a setting would arrive far too late to be used.
+local function e3_path_override()
+    local dir
+    local ok, src = pcall(function() return debug.getinfo(1, 'S').source end)
+    if ok and src then dir = tostring(src):gsub('^@', ''):match('^(.*[/\\])') end
+    local fh = io.open((dir or '') .. 'AdventureTime_e3path.txt', 'r')
+    if not fh then return nil end
+    local line = fh:read('*l'); fh:close()
+    if not line then return nil end
+    line = line:gsub('^%s+', ''):gsub('%s+$', ''):gsub('[/\\]+$', '')
+    if line == '' or line:sub(1, 1) == ';' then return nil end
+    return line
+end
+
+-- Last resort when none of the guessed paths hit: LOOK for the file. LuaFileSystem is available in
+-- this MQ build, so instead of maintaining a list of places E3 might be installed, we walk a few
+-- roots and find <Char>_<Server>.ini wherever it actually lives. That makes the whole thing
+-- computer-agnostic, which matters when a group is split across machines with different layouts.
+-- Bounded hard - depth, total directories, and a skip list - because a filesystem walk on a big
+-- drive is not free and this runs at startup.
+local function find_e3_ini(who, roots)
+    local ok, lfs = pcall(require, 'lfs')
+    if not ok or type(lfs) ~= 'table' then return nil end
+    local SKIP = { resources = true, logs = true, icons = true, images = true, temp = true,
+                   cache = true, ['.git'] = true, backup = true, backups = true, fonts = true }
+    local MAX_DIRS, MAX_DEPTH, seen = 600, 4, 0
+
+    local function walk(dir, depth)
+        if depth > MAX_DEPTH or seen > MAX_DIRS then return nil end
+        seen = seen + 1
+        local okIt, it = pcall(function() return lfs.dir(dir) end)
+        if not okIt or not it then return nil end
+        -- Match ANY <Char>_*.ini rather than one exact name. The server suffix differs between
+        -- machines ('Lazarus' vs 'Project Lazarus'), and globbing sidesteps that entirely.
+        local pat = '^' .. who:lower():gsub('%W', '%%%0') .. '_.+%.ini$'
+        local subs, hitFile = {}, nil
+        local okScan = pcall(function()
+            for entry in it do
+                if entry ~= '.' and entry ~= '..' then
+                    local p = dir .. '\\' .. entry
+                    local a
+                    pcall(function() a = lfs.attributes(p) end)
+                    if a and a.mode == 'directory' then
+                        if not SKIP[entry:lower()] then subs[#subs + 1] = p end
+                    elseif not hitFile and entry:lower():match(pat) then
+                        hitFile = entry
+                    end
+                end
+            end
+        end)
+        if not okScan then return nil end
+        if hitFile then return dir, hitFile end
+        for _, sd in ipairs(subs) do
+            local hit, hf = walk(sd, depth + 1)   -- both values: capturing only the dir loses the name
+            if hit then return hit, hf end
+        end
+        return nil
+    end
+
+    for _, r in ipairs(roots) do
+        if r and r ~= '' then
+            local hit, hitFile = walk((r:gsub('[/\\]+$', '')), 1)
+            if hit then return hit, hitFile end
+        end
+    end
+    return nil
+end
+
+-- Remember a discovered folder so the next load takes the fast path instead of walking again.
+local function write_e3_path(dir)
+    local d
+    local ok, src = pcall(function() return debug.getinfo(1, 'S').source end)
+    if ok and src then d = tostring(src):gsub('^@', ''):match('^(.*[/\\])') end
+    local fh = io.open((d or '') .. 'AdventureTime_e3path.txt', 'w')
+    if not fh then return end
+    fh:write('; found automatically - delete this file to search again\n')
+    fh:write(dir .. '\n')
+    fh:close()
+end
+
 local function parse_burns()
-    local fn = myName .. '_Lazarus.ini'   -- Laz char INIs are <Char>_Lazarus.ini
+    -- The server TLO is NOT reliable for this: it returns 'Lazarus' on one machine and 'Project
+    -- Lazarus' on another, and E3 names the file after the short form. Trusting it blindly meant
+    -- hunting for Azyue_Project Lazarus.ini while Azyue_Lazarus.ini sat right there. So: try every
+    -- plausible form, and let the directory search below glob rather than match an exact name.
+    local srv = ''
+    pcall(function() srv = tostring(mq.TLO.MacroQuest.Server() or '') end)
+    if srv == 'NULL' then srv = '' end
+    local fnames, fseen = {}, {}
+    local function addfn(v)
+        if v and v ~= '' then
+            local nm = myName .. '_' .. v .. '.ini'
+            if not fseen[nm] then fseen[nm] = true; fnames[#fnames + 1] = nm end
+        end
+    end
+    addfn(srv)                                   -- whatever the client calls it
+    addfn(srv:match('(%S+)%s*$'))                -- last word: 'Project Lazarus' -> 'Lazarus'
+    addfn((srv:gsub('%s+', '')))                 -- spaces stripped: 'ProjectLazarus'
+    addfn('Lazarus')                             -- the known-good form on Laz
+    local fn = fnames[1] or (myName .. '_Lazarus.ini')
     local cfg, root = '', ''
     pcall(function() cfg  = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
     pcall(function() root = tostring(mq.TLO.MacroQuest.Path('root')()   or '') end)
-    local candidates = {}
+    local dirs = {}
+    local ovr = e3_path_override()
+    if ovr then dirs[#dirs + 1] = ovr; dirs[#dirs + 1] = ovr .. '\\e3 Bot Inis' end
     if cfg ~= '' then
-        candidates[#candidates + 1] = cfg .. '\\e3 Bot Inis\\' .. fn          -- Path[config] = ...\config
-        candidates[#candidates + 1] = cfg .. '\\config\\e3 Bot Inis\\' .. fn   -- if Path[config] = MQ root
+        dirs[#dirs + 1] = cfg .. '\\e3 Bot Inis'            -- Path[config] = ...\config
+        dirs[#dirs + 1] = cfg .. '\\config\\e3 Bot Inis'    -- if Path[config] = MQ root
     end
-    -- Every candidate derives from MQ's OWN paths - no install-specific fallback, so this runs on
-    -- anyone's machine. If none hit, the log below prints every path tried.
+    -- Every folder derives from MQ's OWN paths - no install-specific fallback, so this runs anywhere.
     if root ~= '' then
-        candidates[#candidates + 1] = root .. '\\config\\e3 Bot Inis\\' .. fn
-        candidates[#candidates + 1] = root .. '\\e3 Bot Inis\\' .. fn
+        dirs[#dirs + 1] = root .. '\\config\\e3 Bot Inis'
+        dirs[#dirs + 1] = root .. '\\e3 Bot Inis'
+        dirs[#dirs + 1] = root .. '\\..\\config\\e3 Bot Inis'   -- MQ installed beside E3
+    end
+    local candidates = {}
+    for _, d in ipairs(dirs) do
+        for _, nm in ipairs(fnames) do candidates[#candidates + 1] = d .. '\\' .. nm end
     end
     local f, path
     for _, cand in ipairs(candidates) do
         local fh = io.open(cand, 'r')
         if fh then f, path = fh, cand; break end
     end
-    if not f then log('[burns] no INI found; tried: %s', table.concat(candidates, ' | ')); return nil end
+    if not f then
+        -- Guesses exhausted: go looking for it, then remember where it was so we only do this once.
+        local found, foundFile = find_e3_ini(myName, { cfg, root, (root ~= '' and root .. '\\..' or nil) })
+        if found and foundFile then
+            local fh = io.open(found .. '\\' .. foundFile, 'r')
+            if fh then
+                f, path = fh, found .. '\\' .. foundFile
+                log('[burns] found E3 config by searching: %s', path)
+                write_e3_path(found)
+            end
+        end
+    end
+    if not f then
+        log('\\ar[burns] no INI found for %s\\ax', fn)
+        for _, c in ipairs(candidates) do log('   tried: %s', c) end
+        log('\\ayA search of the MQ folders did not find it either. Put the folder holding %s', fn)
+        log('\\ayinto a file named AdventureTime_e3path.txt next to this script - one line, no')
+        log('\\ayquotes - then reload.\\ax')
+        return nil
+    end
     -- rank for a key: known keys keep their escalation order; anything else sorts after them by the
     -- order it first appeared in the file, so unrecognised names still display sensibly.
     -- Tier order is simply the order the keys appear in the INI. No known-key list to maintain, and
@@ -3548,6 +3676,10 @@ local function check_peer_network()
 end
 
 load_settings()   -- restore persisted toggles (auto-rez) before we start talking to anyone
+-- The peer check was written and then never wired in, so the one diagnostic aimed at split/broken
+-- networks has never run. Deferred rather than immediate: DanNet needs a moment to discover peers,
+-- and asking too early reports everyone missing on a perfectly healthy setup.
+local peerCheckAt = mq.gettime() + 12000
 if SHOW_UI then
     pcall(function()
         local gpeers = {}
@@ -3577,6 +3709,19 @@ while running do
         mq.delay(300)   -- let the broadcast go out before we drop
         running = false
         break
+    end
+    if peerCheckAt > 0 and mq.gettime() >= peerCheckAt then
+        peerCheckAt = 0
+        pcall(check_peer_network)
+    end
+    -- Group changed since the last look? Re-test. A peer on ANOTHER machine can drop off DanNet without
+    -- leaving the in-game group, and nothing else in here would ever notice - the reports just stop.
+    do
+        local gk = table.concat(group_members(), ',')
+        if gk ~= lastGroupKey then
+            lastGroupKey = gk
+            if peerCheckAt == 0 then peerCheckAt = mq.gettime() + 8000 end
+        end
     end
     if giveRequested and not distributing then
         giveRequested = false
