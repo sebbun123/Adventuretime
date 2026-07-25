@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-minitanksave-2026-07-24'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-countsafe-2026-07-25'   -- bump on every change; prints on startup
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
@@ -75,12 +75,15 @@ local function log_to_file(line)
     if not LOG_FILE_PATH then return end
     local fh = io.open(LOG_FILE_PATH, 'a')
     if not fh then return end
+    -- Strip MQ colour codes: they are for the console, and in a text file they are noise. Also drops
+    -- any stray BEL that a single-backslash '\a' escape would produce.
+    line = tostring(line):gsub('\27%[[%d;]*m', ''):gsub('\\a[a-z]', ''):gsub('%c', '')
     fh:write(string.format('[%s] %s\n', os.date('%H:%M:%S'), line))
     fh:close()
 end
 local function log(fmt, ...)
     local msg = (select('#', ...) > 0) and string.format(fmt, ...) or fmt
-    printf('\ao[AdventureTime]\ax ' .. msg)
+    printf('\\ao[AdventureTime]\\ax ' .. msg)
     log_to_file(msg)
 end
 local function rezlog(fmt, ...)   -- file-only (keeps the [rez] chatter out of the MQ window)
@@ -468,6 +471,18 @@ local function query_all_counts(peers, items)
         local st = {}
         for _, p in ipairs(peers) do if idx[p] then st[#st + 1] = p .. '@item' .. idx[p] end end
         log('[counts] !! HARD DEADLINE (%dms) - still pending: %s', mq.gettime() - t0all, table.concat(st, ', '))
+        -- Mark every item this peer never answered as UNKNOWN. The MISS path above deliberately writes
+        -- 0 after MAX_TRIES ("we asked, assume none") - but a deadline is not an answer, and letting it
+        -- fall through as nil made held() read it as 0, so a peer stuck at item 6 looked like it held
+        -- none of items 6..N and got handed a full target of each. Queries advance in order, so
+        -- everything from idx[p] to the end is unanswered.
+        for _, p in ipairs(peers) do
+            if idx[p] then
+                local pl = p:lower()
+                counts[pl].__unknown = counts[pl].__unknown or {}
+                for j = idx[p], #items do counts[pl].__unknown[items[j]] = true end
+            end
+        end
     end
     for _, p in ipairs(peers) do counts[p:lower()].__got = true end
 end
@@ -1035,10 +1050,15 @@ COTH = {
     claims = {},           -- name -> expiry, so two summoners don't grab the same target
     lastPush = 0, lastPoll = 0, castAt = 0, startedAt = 0, dbg = '',
     pending = nil,         -- { name, at } : who I summoned, awaiting confirmation they arrived
+    anchor  = nil,         -- who everyone is gathering ON: whoever STARTED this gather
 }
 
 -- Who everyone is gathering ON: the driver.
+-- Who everyone gathers ON. Whoever started the gather, not whoever runs the UI - so /atcoth from any
+-- character pulls the group to THAT character. Falls back to the driver only if a gather is somehow
+-- running without an anchor having been announced.
 function coth_anchor()
+    if COTH.anchor and COTH.anchor ~= '' then return COTH.anchor end
     if SHOW_UI then return myName end
     return driverName
 end
@@ -1090,23 +1110,44 @@ function coth_targets()
     return hold
 end
 
+-- Start or stop the gather, and tell the group. The Misc tab button, the mini button and /atcoth all
+-- come through here so the three can never drift apart. Callable from ANY toon, not just the driver:
+-- the binds are registered everywhere, so whoever runs /atcoth becomes the one who kicks it off.
+function coth_set(on, anchor)
+    COTH.active = on and true or false
+    anchor = (anchor and anchor ~= '' and anchor) or myName
+    if COTH.active then
+        COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime()
+        COTH.anchor = anchor
+        COTH.state  = {}   -- distances were measured against the OLD anchor; they mean nothing now
+    else
+        COTH.anchor = nil
+    end
+    for _, nm in ipairs(group_members()) do
+        if nm:lower() ~= myName:lower() then
+            peer_cmdf(nm, '/at_cothgo %s %s', COTH.active and 'on' or 'off', anchor)
+        end
+    end
+    log('[coth] gather %s%s', COTH.active and 'started' or 'stopped',
+        COTH.active and (' - gathering on ' .. anchor) or '')
+end
+
 function draw_misc_tab()
     ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Call of the Hero')
     ImGui.TextDisabled('Gathers the group. Emblem holders are pulled first - each one becomes another')
     ImGui.TextDisabled('summoner, so it cascades instead of one toon casting five times.')
     ImGui.Spacing()
     if COTH.active then
-        if ImGui.Button('Stop gather', 110, 0) then
-            COTH.active = false
-            for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_cothgo off') end end
-        end
+        if ImGui.Button('Stop gather', 110, 0) then coth_set(false) end
     else
-        if ImGui.Button('CoTH Group', 110, 0) then
-            COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime(); COTH.active = true
-            for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_cothgo on') end end
-        end
+        if ImGui.Button('CoTH Group', 110, 0) then coth_set(true) end
     end
-    ImGui.SameLine(); if COTH.active then ImGui.TextColored(0.36,0.80,0.46,1,'gathering') else ImGui.TextDisabled('idle') end
+    ImGui.SameLine()
+    if COTH.active then
+        ImGui.TextColored(0.36, 0.80, 0.46, 1, 'gathering on ' .. (coth_anchor() or '?'))
+    else
+        ImGui.TextDisabled('idle')
+    end
     ImGui.Spacing()
     if ImGui.BeginTable('##cothtbl', 4, (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)) then
         ImGui.TableSetupColumn(''); ImGui.TableSetupColumn('Emblem')
@@ -1389,6 +1430,23 @@ end
 local function rez_dead(name)
     local d = false; pcall(function() d = (mq.TLO.Group.Member(name).Dead() == true) end); return d
 end
+-- Heartbeat cadence state. On a global table rather than four locals: this chunk is at Lua's ceiling.
+HB = { rezFast = false, diFast = false, lastCheck = 0, corpse = false }
+-- Is there a rez event in progress from where I stand? Throttled to once a second: it is asked every
+-- frame to decide the cadence, and SpawnCount is not free. Counts ANY pc corpse in zone rather than
+-- walking the group by name - one TLO call instead of eighteen, and over-triggering on a stranger's
+-- corpse only costs us the fast cadence we would otherwise have had anyway.
+function rez_event_now()
+    if (mq.gettime() - HB.lastCheck) > 1000 then
+        HB.lastCheck = mq.gettime()
+        local dead, n = false, 0
+        pcall(function() dead = (mq.TLO.Me.Dead() == true) end)
+        pcall(function() n = tonumber(mq.TLO.SpawnCount('pccorpse')) or 0 end)
+        HB.corpse = dead or n > 0
+    end
+    return HB.corpse
+end
+
 local function rez_corpse(name)   -- returns corpseID, distance. Laz names PC corpses "<Name>'s corpse".
     local id, dist = 0, 99999
     local forms = { name .. " corpse", "=" .. name .. "'s corpse", "pccorpse " .. name }
@@ -1569,7 +1627,18 @@ pcall(function()
     end)
     mq.bind('/at_cothclaim', function(name) if name then COTH.claims[name] = mq.gettime() + 25000 end end)
     mq.bind('/at_cothfail', function(name) if name then COTH.claims[name] = nil end end)
-    mq.bind('/at_cothgo', function(mode) COTH.active = (mode == 'on'); COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime() end)
+    -- User-facing: /atcoth [on|off|stop]. No arg = start. Registered on every toon, so the gather can
+    -- be kicked off from whichever one you happen to be looking at rather than only from the driver.
+    mq.bind('/atcoth', function(mode)
+        local m = tostring(mode or ''):lower()
+        if m == 'off' or m == 'stop' then coth_set(false) else coth_set(true) end
+    end)
+    mq.bind('/at_cothgo', function(mode, anchor)
+        COTH.active = (mode == 'on')
+        COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime()
+        COTH.anchor = COTH.active and (anchor ~= '' and anchor or nil) or nil
+        COTH.state  = {}   -- old distances were measured against a different anchor
+    end)
     mq.bind('/at_di', function(name, staff, em, dg, save)
         if name then DI.state[name] = { staff = tonumber(staff) or -1, emeralds = tonumber(em) or 0,
                                         dgReady = tonumber(dg) or 0, saveUp = tonumber(save) or 0,
@@ -1838,7 +1907,7 @@ local function give_items_to(receiver, bundle)   -- bundle = { {item=, qty=}, ..
 
     local ok = pcall(function()
         local pid = mq.TLO.Spawn(string.format('pc =%s', receiver)).ID() or 0
-        if pid == 0 then log('\arCannot find %s in zone.\ax', receiver); return end
+        if pid == 0 then log('\\arCannot find %s in zone.\\ax', receiver); return end
         if (mq.TLO.Spawn('id ' .. pid).Distance() or 999) > 15 then
             mq.cmdf('/nav id %d', pid)
             mq.delay(8000, function() return (mq.TLO.Spawn('id ' .. pid).Distance() or 999) <= 15 end)
@@ -1846,7 +1915,7 @@ local function give_items_to(receiver, bundle)   -- bundle = { {item=, qty=}, ..
         end
         mq.cmdf('/target id %d', pid)
         mq.delay(600, function() return (mq.TLO.Target.ID() or 0) == pid end)
-        if (mq.TLO.Target.ID() or 0) ~= pid then log('\arCould not target %s.\ax', receiver); return end
+        if (mq.TLO.Target.ID() or 0) ~= pid then log('\\arCould not target %s.\\ax', receiver); return end
 
         -- keep opening trades (8 stacks each) until everything is handed or nothing more can be picked up
         local guard = 0
@@ -1881,7 +1950,7 @@ local function give_items_to(receiver, bundle)   -- bundle = { {item=, qty=}, ..
     end)
     giving = false
     if not ok then clear_cursor() end
-    for item, placed in pairs(placedMap) do log('\agHanded %d %s to %s.\ax', placed, item, receiver) end
+    for item, placed in pairs(placedMap) do log('\\agHanded %d %s to %s.\\ax', placed, item, receiver) end
     return placedMap
 end
 
@@ -1920,7 +1989,7 @@ local function buy_from_vendor(vendor, item, qty)
     if qty <= 0 then return 0 end
     local before = my_count(item)
     local pid = mq.TLO.Spawn(string.format('npc =%s', vendor)).ID() or 0
-    if pid == 0 then log('\arVendor %s isn\'t in this zone - can\'t buy %s.\ax', vendor, item); return 0 end
+    if pid == 0 then log('\\arVendor %s isn\'t in this zone - can\'t buy %s.\\ax', vendor, item); return 0 end
     mq.cmdf('/target id %d', pid)
     mq.delay(700, function() return (mq.TLO.Target.ID() or 0) == pid end)
     if (mq.TLO.Target.Distance() or 999) > 2 then
@@ -1930,13 +1999,13 @@ local function buy_from_vendor(vendor, item, qty)
     end
     mq.cmd('/invoke ${Merchant.OpenWindow}')
     mq.delay(3000, function() return mq.TLO.Merchant.Open() end)
-    if not mq.TLO.Merchant.Open() then log('\arCould not open %s\'s merchant window.\ax', vendor); return 0 end
+    if not mq.TLO.Merchant.Open() then log('\\arCould not open %s\'s merchant window.\\ax', vendor); return 0 end
     mq.delay(6000, function() return mq.TLO.Merchant.ItemsReceived() end)
 
     mq.TLO.Merchant.SelectItem('=' .. item)()   -- by-name exact select (skips the widget row-walk)
     mq.delay(1800, function() return (mq.TLO.Merchant.SelectedItem.Name() or ''):upper() == item:upper() end)
     if (mq.TLO.Merchant.SelectedItem.Name() or ''):upper() ~= item:upper() then
-        log('\ar%s doesn\'t sell %s (or it couldn\'t be selected).\ax', vendor, item)
+        log('\\ar%s doesn\'t sell %s (or it couldn\'t be selected).\\ax', vendor, item)
         mq.cmd('/notify MerchantWnd MW_Done_Button leftmouseup'); return 0
     end
 
@@ -1956,7 +2025,7 @@ local function buy_from_vendor(vendor, item, qty)
     end
     mq.cmd('/notify MerchantWnd MW_Done_Button leftmouseup')
     local got = my_count(item) - before
-    if got > 0 then log('\agBought %d %s from %s.\ax', got, item, vendor) end
+    if got > 0 then log('\\agBought %d %s from %s.\\ax', got, item, vendor) end
     return got
 end
 
@@ -2050,7 +2119,7 @@ local miniMode        = false   -- compact window when minimized
 -- (Also buys four back against the 200-local ceiling.)
 miniBurns       = true    -- show the burn dot matrix in the mini window
 miniRez         = true    -- show crown/token cooldowns in the mini window
-miniDI          = false   -- add a DI staff cooldown row to the rez table in the mini window
+miniDI          = false   -- show the tank save line + DI staff cooldowns in the mini window
 miniPots        = false   -- show the group draught buttons in the mini window
 miniClicks      = false   -- show the per-class MGB/group click buttons in the mini window
 miniCoth        = false   -- show the CoTH Group button in the mini window
@@ -2101,6 +2170,11 @@ local function give_out()
     local roster = { myName }
     for _, p in ipairs(peers) do roster[#roster + 1] = p end
     local function held(who, item) return (counts[who:lower()] and counts[who:lower()][item]) or 0 end
+    -- True when we never got an answer for this item from this toon. Distinct from "holds none".
+    local function unknown(who, item)
+        local c = counts[who:lower()]
+        return (c and c.__unknown and c.__unknown[item]) and true or false
+    end
     local giverUp = {}   -- givers we successfully brought up (filled after planning)
 
     -- PLAN: aggregate every hand-off into giver -> receiver -> {item = qty}. No trades yet, so we can
@@ -2130,7 +2204,9 @@ local function give_out()
         local tgt = target[item] or 0
         if tgt > 0 then
             local richest, richestN = roster[1], -1
-            for _, m in ipairs(roster) do if held(m, item) > richestN then richest, richestN = m, held(m, item) end end
+            for _, m in ipairs(roster) do
+                if not unknown(m, item) and held(m, item) > richestN then richest, richestN = m, held(m, item) end
+            end
             local surplus = math.max(0, richestN - eff_target(richest, item))
             local function cover(member, short)
                 local give = math.min(short, surplus)
@@ -2147,7 +2223,16 @@ local function give_out()
                 end
             end
             for _, m in ipairs(roster) do
-                if m:lower() ~= richest:lower() then cover(m, math.max(0, eff_target(m, item) - held(m, item))) end
+                if m:lower() ~= richest:lower() then
+                    if unknown(m, item) then
+                        -- Refuse to guess. Handing a full target to a toon that may already be carrying
+                        -- one is worse than handing nothing, and it is silent when it goes wrong.
+                        shortfalls[#shortfalls + 1] = string.format('%s: %s count unknown (timed out) - skipped', item, m)
+                        log('  %s count unknown for %s - skipped rather than assuming zero', item, m)
+                    else
+                        cover(m, math.max(0, eff_target(m, item) - held(m, item)))
+                    end
+                end
             end
             cover(richest, math.max(0, eff_target(richest, item) - richestN))   -- the holder itself may still be under target
         end
@@ -2577,17 +2662,68 @@ end
 
 -- Mini rez: just the crown/token cooldowns. Anyone owning neither is left out entirely - the point
 -- is 'who can rez right now', not a full roster.
+-- One cooldown cell, shared by the rez rows and the DI staff row so they read identically:
+-- '-' when not carried, green 'ready', else the usual yellow -> orange -> red ramp.
+function rez_cell(base, updated)
+    if (base or -1) < 0 then ImGui.TextDisabled('-'); return end
+    local left = math.max(0, base - math.floor((mq.gettime() - (updated or 0)) / 1000))
+    if left == 0 then
+        ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'ready')
+    else
+        local cr, cg, cb
+        if left < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
+        elseif left < 300 then cr, cg, cb = 0.95, 0.62, 0.25
+        else                   cr, cg, cb = 0.85, 0.35, 0.35 end
+        ImGui.TextColored(cr, cg, cb, 1.0, string.format('%d:%02d', math.floor(left / 60), left % 60))
+    end
+end
+
+-- DI staff, kept OUT of the crown/token table so that stays exactly as it was. The tank's save state
+-- comes first (it is the thing you actually want to know), then the staff cooldowns underneath.
+function draw_di_mini()
+    local tank = di_tank()
+    if not tank then
+        ImGui.TextDisabled('no tank in group')
+    else
+        local ds = DI.state[tank]
+        if not ds then
+            ImGui.TextDisabled(tank .. ': no report')
+        elseif ds.saveUp == 1 then
+            ImGui.TextColored(0.35, 0.90, 1.00, 1.0, tank .. ' has a save')
+        else
+            ImGui.TextDisabled(tank .. ': no save')
+        end
+    end
+
+    local cols = {}
+    for _, nm in ipairs(rezPriority) do
+        local ds = DI.state[nm]
+        if ds and (ds.staff or -1) >= 0 then cols[#cols + 1] = nm end
+    end
+    if #cols == 0 then ImGui.TextDisabled('no DI staff reports'); return end
+    local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
+                + (ImGuiTableFlags.SizingFixedFit or 0)
+    if not ImGui.BeginTable('##dimini', 1 + #cols, flags) then return end
+    ImGui.TableSetupColumn('')
+    for _, nm in ipairs(cols) do ImGui.TableSetupColumn(nm:sub(1, 9)) end
+    ImGui.TableHeadersRow()
+    ImGui.TableNextRow()
+    ImGui.TableNextColumn()
+    ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Staff')
+    for _, nm in ipairs(cols) do
+        ImGui.TableNextColumn()
+        local ds = DI.state[nm]
+        rez_cell(ds and ds.staff or -1, ds and ds.updated)
+    end
+    ImGui.EndTable()
+end
+
 local function draw_rez_mini()
     -- Same shape as the Burns tab: characters across the top, one row per clicky.
-    -- Columns include anyone reporting a crown/token OR a DI staff, so a toon that carries the staff
-    -- but no rez clicky still gets a column (showing '-' for the rez rows).
     local cols = {}
     for _, nm in ipairs(rezPriority) do
         local rr = rezReady[nm]
-        local ds = DI.state[nm]
-        local hasRez   = rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0)
-        local hasStaff = miniDI and ds and (ds.staff or -1) >= 0
-        if hasRez or hasStaff then cols[#cols + 1] = nm end
+        if rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0) then cols[#cols + 1] = nm end
     end
     if #cols == 0 then ImGui.TextDisabled('rez: no crown/token reports'); return end
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
@@ -2596,54 +2732,19 @@ local function draw_rez_mini()
     ImGui.TableSetupColumn('')
     for _, nm in ipairs(cols) do ImGui.TableSetupColumn(nm:sub(1, 9)) end
     ImGui.TableHeadersRow()
-    -- One cell renderer for every row: '-' when not carried, 'ready' green, else the usual ramp.
-    local function cell(base, updated)
-        if (base or -1) < 0 then ImGui.TextDisabled('-'); return end
-        local left = math.max(0, base - math.floor((mq.gettime() - (updated or 0)) / 1000))
-        if left == 0 then
-            ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'ready')
-        else
-            local cr, cg, cb
-            if left < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
-            elseif left < 300 then cr, cg, cb = 0.95, 0.62, 0.25
-            else                   cr, cg, cb = 0.85, 0.35, 0.35 end
-            ImGui.TextColored(cr, cg, cb, 1.0, string.format('%d:%02d', math.floor(left / 60), left % 60))
-        end
-    end
-    local function row(label, get)
+    local function row(which, label)
         ImGui.TableNextRow()
         ImGui.TableNextColumn()
         ImGui.TextColored(0.85, 0.72, 0.35, 1.0, label)
         for _, nm in ipairs(cols) do
             ImGui.TableNextColumn()
-            cell(get(nm))
+            local rr = rezReady[nm]
+            rez_cell(rr and rr[which] or -1, rr and rr.updated)
         end
     end
-    row('Token', function(nm) local rr = rezReady[nm]; return rr and rr.token or -1, rr and rr.updated end)
-    row('Crown', function(nm) local rr = rezReady[nm]; return rr and rr.crown or -1, rr and rr.updated end)
-    if miniDI then
-        row('Staff', function(nm) local ds = DI.state[nm]; return ds and ds.staff or -1, ds and ds.updated end)
-    end
+    row('token', 'Token')   -- token first: it's the scarce one, so it burns first
+    row('crown', 'Crown')
     ImGui.EndTable()
-
-    -- One line under the table: does the tank currently have a death save on him? Cyan when he does,
-    -- because that is the "stop worrying" state and the whole point of the staff. Shown either way
-    -- rather than only when up, so a quiet row cannot be mistaken for the section not rendering.
-    if miniDI then
-        local tank = di_tank()
-        if not tank then
-            ImGui.TextDisabled('no tank in group')
-        else
-            local ds = DI.state[tank]
-            if not ds then
-                ImGui.TextDisabled(tank .. ': no report')
-            elseif ds.saveUp == 1 then
-                ImGui.TextColored(0.35, 0.90, 1.00, 1.0, tank .. ' has a save')
-            else
-                ImGui.TextDisabled(tank .. ': no save')
-            end
-        end
-    end
 end
 
 local function draw_burn_dots()
@@ -2934,16 +3035,10 @@ end
 -- Mini: CoTH gather on its own row. Same toggle the Misc tab uses, so pressing either is the same act.
 function draw_coth_mini()
     if COTH.active then
-        if ImGui.SmallButton('Stop gather##at_coth_mini') then
-            COTH.active = false
-            for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_cothgo off') end end
-        end
-        ImGui.SameLine(); ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'gathering')
+        if ImGui.SmallButton('Stop gather##at_coth_mini') then coth_set(false) end
+        ImGui.SameLine(); ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'on ' .. (coth_anchor() or '?'))
     else
-        if ImGui.SmallButton('CoTH Group##at_coth_mini') then
-            COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime(); COTH.active = true
-            for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_cothgo on') end end
-        end
+        if ImGui.SmallButton('CoTH Group##at_coth_mini') then coth_set(true) end
     end
 end
 
@@ -2966,6 +3061,10 @@ local function render()
             if miniRez then
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 draw_rez_mini()
+            end
+            if miniDI then
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                draw_di_mini()
             end
             if miniBurns then
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
@@ -3220,7 +3319,7 @@ local function render()
                 do
                     local a, b, c, d, e, f2 = miniRez, miniBurns, miniPots, miniCoth, miniClicks, miniDI
                     miniRez    = ImGui.Checkbox('Rez in mini', miniRez)
-                    miniDI     = ImGui.Checkbox('DI staff row in mini rez table', miniDI)
+                    miniDI     = ImGui.Checkbox('DI staff in mini', miniDI)
                     miniBurns  = ImGui.Checkbox('Burns in mini', miniBurns)
                     miniPots   = ImGui.Checkbox('Group draught buttons in mini', miniPots)
                     miniClicks = ImGui.Checkbox('Class MGB buttons in mini', miniClicks)
@@ -3248,7 +3347,8 @@ end
 if SHOW_UI then mq.imgui.init(scriptName, render) end
 pcall(function() mq.bind('/at', function() windowOpen = not windowOpen end) end)
 if SHOW_UI then
-    log('ready [%s] - \ay/lua run adventuretime\ax on each toon; open \ay/at\ax here and Give out.', BUILD_TAG)
+    log('ready [%s] - \\ay/lua run adventuretime\\ax on each toon; open \\ay/at\\ax here and Give out.', BUILD_TAG)
+    log('   \\ay/atcoth\\ax starts the CoTH gather from any toon (\\ay/atcoth off\\ax to stop).')
 else
     log('ready [%s] (worker - headless; obeying the driver).', BUILD_TAG)
 end
@@ -3266,8 +3366,8 @@ local function check_peer_network()
     if #mine == 0 then
         -- Not grouped. Everything here is group-scoped (burns, rez targets, potion counts), so this
         -- looks identical to a broken network from the outside. Say which it is.
-        log('\ayNot in a group - AdventureTime only reports on GROUP members, so nothing will populate.\ax')
-        log('\ayForm your group in-game, then reload (or hit Refresh on the Burns tab).\ax')
+        log('\\ayNot in a group - AdventureTime only reports on GROUP members, so nothing will populate.\\ax')
+        log('\\ayForm your group in-game, then reload (or hit Refresh on the Burns tab).\\ax')
         return
     end
     local peers = ''
@@ -3277,12 +3377,12 @@ local function check_peer_network()
         if not peers:find(m:lower(), 1, true) then missing[#missing + 1] = m end
     end
     if #missing == 0 then return end
-    log('\ar*** PEER NETWORK PROBLEM ***\ax')
-    log('\arCannot see %d of %d group member(s) on DanNet: %s\ax', #missing, #mine, table.concat(missing, ', '))
-    log('\ayNothing from those characters will arrive - no burns, no rez help, no potion counts.\ax')
-    log('\ayCheck: /dnet info on each toon. If they only list themselves, they are on separate')
-    log('\ayDanNet islands - fix the Interface setting in MQ2DanNet.ini (config folder) so every')
-    log('\ayclient matches, then FULLY restart them. See the AdventureTime readme.\ax')
+    log('\\ar*** PEER NETWORK PROBLEM ***\\ax')
+    log('\\arCannot see %d of %d group member(s) on DanNet: %s\\ax', #missing, #mine, table.concat(missing, ', '))
+    log('\\ayNothing from those characters will arrive - no burns, no rez help, no potion counts.\\ax')
+    log('\\ayCheck: /dnet info on each toon. If they only list themselves, they are on separate')
+    log('\\ayDanNet islands - fix the Interface setting in MQ2DanNet.ini (config folder) so every')
+    log('\\ayclient matches, then FULLY restart them. See the AdventureTime readme.\\ax')
 end
 
 load_settings()   -- restore persisted toggles (auto-rez) before we start talking to anyone
@@ -3499,23 +3599,32 @@ while running do
     if COTH.active and not distributing and (mq.gettime() - COTH.lastPoll) > 1000 then
         COTH.lastPoll = mq.gettime()
         local ok, err = pcall(coth_tick)
-        if not ok then COTH.active = false; log('\ar[coth] stopped after an error: %s\ax', tostring(err)) end
+        if not ok then COTH.active = false; log('\\ar[coth] stopped after an error: %s\\ax', tostring(err)) end
     end
-    if DI.auto and not distributing and (mq.gettime() - DI.lastPush) > 2000 then
+    if DI.auto and not distributing then
+        local ic = false
+        pcall(function() ic = (tostring(mq.TLO.Me.CombatState() or ''):upper() == 'COMBAT') end)
+        if ic ~= HB.diFast then HB.diFast = ic; DI.lastPush = 0 end   -- edge -> push now
+        -- 6000 not 20000: the cleric-DG hold only trusts a report < 8000ms old. A cleric that has
+        -- not taken aggro is not COMBAT-flagged, so it would sit on the slow tick and read as
+        -- stale - and the staff would fire early believing no DG source is left.
+        if (mq.gettime() - DI.lastPush) > (ic and 2000 or 6000) then
         DI.lastPush = mq.gettime()
         local a, b, c, d = di_read_self()
         DI.state[myName] = { staff = a, emeralds = b, dgReady = c, saveUp = d, updated = mq.gettime() }
         -- Heartbeat, not push-on-change: with change-only pushes a stable toon never re-announces, so
         -- everyone else's table holds only themselves - and then everyone thinks they're first. That is
-        -- exactly the dogpile the rez baton was built to stop.
+        -- exactly the dogpile the rez baton was built to stop. Out of combat it drops to a 20s keepalive
+        -- and snaps back to 2s the instant combat starts.
         peer_bcast('/at_di %s %d %d %d %d', myName, a, b, c, d)
+        end
     end
     if DI.auto and not distributing and (mq.gettime() - DI.lastPoll) > 1000 then
         DI.lastPoll = mq.gettime()
         local ok, err = pcall(di_tick)
         if not ok then
             DI.auto = false                     -- stop rather than error every second
-            log('\ar[di] disabled after an error: %s\ax', tostring(err))
+            log('\\ar[di] disabled after an error: %s\\ax', tostring(err))
         end
     end
     if rezAuto and not distributing then   -- (held during a counts/give pass so we never drown its /dquery replies)
@@ -3527,7 +3636,18 @@ while running do
             peer_bcast('/at_rezdone %s', myName)
         end
     end
-    if rezAuto and not distributing and (mq.gettime() - lastRezReadyPoll) > 2000 then   -- HEARTBEAT (held while distributing)
+    -- Adaptive heartbeat. These two 2s broadcasts were ~93% of idle DanNet traffic, and BOTH are only
+    -- ever consumed during an event: di_tick early-returns unless in combat, and the rez baton only
+    -- matters once a corpse exists. So run fast during the event and slow between - but force an
+    -- IMMEDIATE push on the edge INTO the event, because a stale first tick is precisely the failure
+    -- the heartbeat was added to prevent. Slow is a keepalive, not silence: a toon that stopped
+    -- talking entirely could not be told apart from one whose script died.
+    if rezAuto and not distributing then
+        local ev = rez_event_now()
+        if ev ~= HB.rezFast then HB.rezFast = ev; lastRezReadyPoll = 0 end   -- edge -> push now
+        -- 5000 not 10000: the picker treats a report >= 6000ms old as dead-or-stale (deadStale),
+        -- so the idle cadence has to stay UNDER that window or every living toon reads stale.
+        if (mq.gettime() - lastRezReadyPoll) > (ev and 2000 or 5000) then
         lastRezReadyPoll = mq.gettime()                 -- on-change-only made stable-but-alive toons look stale -> baton skipped them
         local cr, tk = my_rez_secs(CROWN_ITEM), my_rez_secs(TOKEN_ITEM)
         local dead = false; pcall(function() dead = (mq.TLO.Me.Dead() == true) end)
@@ -3535,6 +3655,7 @@ while running do
         local al = dead and 0 or 1
         rezReady[myName] = { crown = cr, token = tk, alive = (al == 1), zone = zone, updated = mq.gettime() }
         peer_bcast('/at_rezready %s %d %d %d %d', myName, cr, tk, al, zone)
+        end
     end
     if distributing then
         wasDistributing = true
