@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-e3glob-2026-07-25'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-mgbability-2026-07-25'   -- bump on every change; prints on startup
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
@@ -770,14 +770,23 @@ local function ability_state(name)
         local ds = my_effect_secs(name, function() return mq.TLO.FindItem('=' .. name).Spell.Name() end)
         return true, (t == 0), t, (ds > 0), ds, 'i'
     end
-    local isAA = false
-    pcall(function() isAA = (tonumber(mq.TLO.Me.AltAbility(name).ID()) or 0) > 0 end)
+    -- OWNERSHIP, not existence. Me.AltAbility[x].ID resolves out of the game's AA table and answers
+    -- "is this a real AA", not "have I bought it" - so every character claimed to own Radiant Cure.
+    -- It never showed up before because this function was only ever asked about abilities already
+    -- known to be owned (burns come from the toon's own [Burn]; MGB entries are gated by class first).
+    -- Rank OR ready, and deliberately NOT the timer: on this build AltAbilityTimer returns 1 for an AA
+    -- the character does not own, so treating "timer > 0" as ownership marked everyone an owner.
+    --   has it:        rank=9 ready=true  timer=0
+    --   does not:      rank=0 ready=false timer=1   <- the 1 is noise, not a cooldown
+    local aaRank, aaRdy, aaSecs = 0, false, -1
+    pcall(function() aaRank = tonumber(mq.TLO.Me.AltAbility(name).Rank()) or 0 end)
+    pcall(function() aaRdy  = (mq.TLO.Me.AltAbilityReady(name)() == true) end)
+    pcall(function() aaSecs = tonumber(mq.TLO.Me.AltAbilityTimer(name).TotalSeconds()) or -1 end)
+    local isAA = (aaRank > 0) or aaRdy
     if isAA then
         local ds = my_effect_secs(name, function() return mq.TLO.Me.AltAbility(name).Spell.Name() end)
-        local rdy = false; pcall(function() rdy = (mq.TLO.Me.AltAbilityReady(name)() == true) end)
-        if rdy then return true, true, 0, (ds > 0), ds, 'a' end
-        local secs = -1; pcall(function() secs = tonumber(mq.TLO.Me.AltAbilityTimer(name).TotalSeconds()) or -1 end)
-        return true, false, (secs and secs > 0 and secs or -1), (ds > 0), ds, 'a'
+        if aaRdy then return true, true, 0, (ds > 0), ds, 'a' end
+        return true, false, (aaSecs and aaSecs > 0 and aaSecs or -1), (ds > 0), ds, 'a'
     end
     local isSpell = false   -- otherwise a discipline
     pcall(function() isSpell = (tonumber(mq.TLO.Spell(name).ID()) or 0) > 0 end)
@@ -846,29 +855,46 @@ end
 -- MGB is attached to the FIRST AA only: it buffs the next spell cast, so a second attachment would
 -- do nothing. That mirrors the hand-built macro this replaces.
 -- ---------------------------------------------------------------------------
+-- Keyed by ABILITY, not class: an ability can be usable by several classes, and a class can have
+-- more than one. A beastlord gets two buttons (Mercy and Paragon) because they are different
+-- abilities on different timers, and each can go into a combo on its own.
+MGB_WHO = { CLR='Cleric', DRU='Druid', SHM='Shaman', BRD='Bard', ENC='Enchanter',
+            BST='Beastlord', RNG='Ranger' }
 MGB_CLICKS = {
-    -- who/say = the raid announce, sent as "<who> <say>" (e.g. "Cleric MGB heals").
-    -- abils   = fired in order. MGB attaches to the FIRST one only - it buffs the next cast, so a
-    --           second attachment would do nothing. Entries may be AAs *or* clicky items; which one
-    --           is worked out at cast time, so nothing here has to say which it is.
-    CLR = { label = 'Cleric Heals',     who = 'Cleric',    say = 'MGB heals',
-            abils = { 'Celestial Regeneration', 'Exquisite Benediction' } },
-    DRU = { label = 'Druid Heals',      who = 'Druid',     say = 'MGB heals',
-            abils = { 'Spirit of the Wood' } },
-    SHM = { label = 'Shaman Heals',     who = 'Shaman',    say = 'MGB heals',
-            abils = { 'Ancestral Aid' } },
-    BRD = { label = 'Bard Mercy',       who = 'Bard',      say = "MGB Nife's Mercy",
-            abils = { "Tome of Nife's Mercy" } },
-    ENC = { label = 'Enchanter Mercy',  who = 'Enchanter', say = "MGB Nife's Mercy",
-            abils = { "Tome of Nife's Mercy" } },
-    BST = { label = 'Beastlord Paragon', who = 'Beastlord', say = 'MGB Paragon',
-            abils = { 'Paragon of Spirit' } },
-    RNG = { label = 'Ranger Auspice',   who = 'Ranger',    say = 'MGB Auspice',
-            abils = { 'Auspice of the Hunter' } },
+    -- short = the button's second word; the first is the caster's class, so a beastlord reads
+    -- 'Beastlord Mercy' and 'Beastlord Paragon'. say = the raid announce after the class name.
+    { key = 'celestial', short = 'Heals',   say = 'MGB heals',        classes = { 'CLR' },
+      abils = { 'Celestial Regeneration', 'Exquisite Benediction' } },
+    { key = 'wood',      short = 'Heals',   say = 'MGB heals',        classes = { 'DRU' },
+      abils = { 'Spirit of the Wood' } },
+    { key = 'ancestral', short = 'Heals',   say = 'MGB heals',        classes = { 'SHM' },
+      abils = { 'Ancestral Aid' } },
+    { key = 'mercy',     short = 'Mercy',   say = "MGB Nife's Mercy", classes = { 'BRD', 'ENC', 'BST' },
+      abils = { "Tome of Nife's Mercy" } },
+    { key = 'paragon',   short = 'Paragon', say = 'MGB Paragon',      classes = { 'BST' },
+      abils = { 'Paragon of Spirit' } },
+    { key = 'auspice',   short = 'Auspice', say = 'MGB Auspice',      classes = { 'RNG' },
+      abils = { 'Auspice of the Hunter' } },
 }
+function mgb_entry(key)
+    for _, e in ipairs(MGB_CLICKS) do if e.key == key then return e end end
+    return nil
+end
+function mgb_entries_for(cls)
+    local out = {}
+    for _, e in ipairs(MGB_CLICKS) do
+        for _, c in ipairs(e.classes) do
+            if c == cls then out[#out + 1] = e; break end
+        end
+    end
+    return out
+end
+function mgb_label(cls, e)
+    return ((MGB_WHO[cls] or cls) .. ' ' .. (e.short or e.key))
+end
 MGB_AA    = 'Mass Group Buff'
 healState = {}   -- driver: healState[char] = { cls, raid, mgb, aas = {secs...}, updated }
-healLast  = ''   -- worker: last-pushed key, for change detection
+healLast  = {}   -- worker: last-pushed key per ability entry, for change detection
 
 -- Seconds until an ability is usable. 0 = ready now, -1 = I do not have it, >0 = cooling.
 -- Routed through ability_state so an ENTRY CAN BE AN AA OR A CLICKY ITEM without the table saying
@@ -882,26 +908,25 @@ end
 
 -- Fire my own class's heal chain. The RAID decision is made here, on the healer, not on the driver -
 -- raid membership is a local fact and asking for it over the network would only add a way to be wrong.
-function mgb_click()
+function mgb_click(key)
     local cls = (mq.TLO.Me.Class.ShortName() or ''):upper()
-    local cfg = MGB_CLICKS[cls]
-    if not cfg or #cfg.abils == 0 then return end
+    local e = mgb_entry(key)
+    if not e or #e.abils == 0 then return end
     local raiding = (tonumber(mq.TLO.Raid.Members()) or 0) > 0
-    for i, ab in ipairs(cfg.abils) do
+    for i, ab in ipairs(e.abils) do
         -- A clicky needs /CastType|Item or E3 looks for a spell by that name and finds nothing.
-        -- Detected here rather than declared in the table, so entries stay one string each.
         local isItem = false
         pcall(function() isItem = (tonumber(mq.TLO.FindItem('=' .. ab).ID()) or 0) > 0 end)
         local opts = isItem and '/CastType|Item' or ''
         if raiding and i == 1 then
-            -- MGB rides the FIRST ability only (it buffs the next cast), so the announce fires once too.
+            -- MGB rides the FIRST ability only (it buffs the next cast), so the announce fires once.
             pcall(function() mq.cmdf('/nowcast %s "%s%s/BeforeSpell|%s"', myName, ab, opts, MGB_AA) end)
-            pcall(function() mq.cmdf('/rsay %s %s', cfg.who or cls, cfg.say or 'MGB') end)
+            pcall(function() mq.cmdf('/rsay %s %s', MGB_WHO[cls] or cls, e.say or 'MGB') end)
         else
             pcall(function() mq.cmdf('/nowcast %s "%s%s"', myName, ab, opts) end)
         end
     end
-    log('[mgb] %s%s', cfg.label, raiding and ' (MGB, raid)' or ' (group)')
+    log('[mgb] %s%s', mgb_label(cls, e), raiding and ' (MGB, raid)' or ' (group)')
 end
 
 -- What I can see about ONE draught line, read locally. Both tiers share a recast and land the same
@@ -1204,6 +1229,9 @@ local function save_settings()
             f:write('diAuto=' .. (DI.auto and '1' or '0') .. '\n')
             f:write('miniRez=' .. (miniRez and '1' or '0') .. '\n')
             f:write('miniDI=' .. (miniDI and '1' or '0') .. '\n')
+            f:write('miniCombos=' .. (miniCombos and '1' or '0') .. '\n')
+            f:write('miniCures=' .. (miniCures and '1' or '0') .. '\n')
+            f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
             f:write('miniBurns=' .. (miniBurns and '1' or '0') .. '\n')
             f:write('miniPots=' .. (miniPots and '1' or '0') .. '\n')
             f:write('miniClicks=' .. (miniClicks and '1' or '0') .. '\n')
@@ -1228,6 +1256,12 @@ local function load_settings()
             if k == 'diAuto'    then DI.auto   = (v == '1' or v:lower() == 'true') end
             if k == 'miniRez'   then miniRez   = (v == '1' or v:lower() == 'true') end
             if k == 'miniDI'    then miniDI    = (v == '1' or v:lower() == 'true') end
+            if k == 'miniCombos' then miniCombos = (v == '1' or v:lower() == 'true') end
+            if k == 'miniCures' then miniCures  = (v == '1' or v:lower() == 'true') end
+            if k == 'miniOrder' then
+                miniOrder = {}
+                for part in v:gmatch('[^,]+') do miniOrder[#miniOrder + 1] = part end
+            end
             if k == 'miniBurns' then miniBurns = (v == '1' or v:lower() == 'true') end
             if k == 'miniPots'  then miniPots  = (v == '1' or v:lower() == 'true') end
             -- miniHealers: the old name for this setting, still read so it is not lost on upgrade.
@@ -1957,16 +1991,38 @@ pcall(function()
         end
         log('[potprobe] my buffs: %s', table.concat(names, ' | '))
     end)
-    mq.bind('/at_healstate', function(char, cls, raid, ...)
-        if not char or not cls then return end
+    mq.bind('/at_healstate', function(char, key, raid, ...)
+        if not char or not key then return end
         local secs = {}
         for _, v in ipairs({ ... }) do secs[#secs + 1] = tonumber(v) or -1 end
         local aas = {}
         for i = 2, #secs do aas[#aas + 1] = secs[i] end
-        healState[char] = { cls = cls, raid = (tonumber(raid) == 1), mgb = secs[1] or -1,
-                            aas = aas, updated = mq.gettime() }
+        healState[char] = healState[char] or {}
+        healState[char][key] = { raid = (tonumber(raid) == 1), mgb = secs[1] or -1,
+                                 aas = aas, updated = mq.gettime() }
     end)
-    mq.bind('/at_mgbclick', function() mgb_click() end)
+    mq.bind('/at_mgbclick', function(key) mgb_click(key) end)
+    mq.bind('/at_cureprobe', function()   -- diagnostic: what does each cure source resolve to on me?
+        for _, e in ipairs(CURE_CLICKS) do
+            local itemID, rank, rdy, secs, spellID = 0, 0, false, -1, 0
+            pcall(function() itemID  = tonumber(mq.TLO.FindItem('=' .. e.name).ID()) or 0 end)
+            pcall(function() rank    = tonumber(mq.TLO.Me.AltAbility(e.name).Rank()) or 0 end)
+            pcall(function() rdy     = (mq.TLO.Me.AltAbilityReady(e.name)() == true) end)
+            pcall(function() secs    = tonumber(mq.TLO.Me.AltAbilityTimer(e.name).TotalSeconds()) or -1 end)
+            pcall(function() spellID = tonumber(mq.TLO.Spell(e.name).ID()) or 0 end)
+            local have = cure_state(e.name)
+            log('[cureprobe] %s | item=%d aaRank=%d ready=%s timer=%s spellID=%d -> %s',
+                e.name, itemID, rank, tostring(rdy), tostring(secs), spellID,
+                have == 1 and 'MINE (button shown)' or 'not mine')
+        end
+    end)
+    mq.bind('/at_cure', function(key) cure_click(key) end)
+    mq.bind('/at_curestate', function(char, key, have, secs)
+        if not char or not key then return end
+        cureState[char] = cureState[char] or {}
+        cureState[char][key] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
+                                 updated = mq.gettime() }
+    end)
     mq.bind('/at_quiet', function(ms)
         local n = tonumber(ms) or 0
         quietUntil = (n > 0) and (mq.gettime() + math.min(n, 30000)) or 0
@@ -2403,6 +2459,8 @@ miniRez         = true    -- show crown/token cooldowns in the mini window
 miniDI          = false   -- show the tank save line + DI staff cooldowns in the mini window
 miniPots        = false   -- show the group draught buttons in the mini window
 miniClicks      = false   -- show the per-class MGB/group click buttons in the mini window
+miniCombos      = false   -- show the combo buttons in the mini window
+miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the mini window
 miniCoth        = false   -- show the CoTH Group button in the mini window
 -- GLOBAL, not local: this chunk is at Lua's hard 200-local ceiling and one more would stop it
 -- compiling. One table holds every section toggle rather than a local per setting.
@@ -3003,6 +3061,196 @@ function draw_di_mini()
     ImGui.EndTable()
 end
 
+-- ---------------------------------------------------------------------------
+-- Combos: one button that presses several of the class buttons. Members are stored as typed keys
+-- ('mgb:CLR') rather than bare class names so draughts or CoTH can join later without a file format
+-- change. Labels are DERIVED from the members - no text box to build, nothing to type, and the label
+-- can never drift out of step with what the button actually does.
+-- ---------------------------------------------------------------------------
+COMBOS = {}
+local COMBO_FILE
+
+-- Members are 'mgb:<CLASS>:<abilitykey>' - class AND ability, because a beastlord has two buttons and
+-- a combo has to be able to take one without the other.
+function combo_parse(m)
+    local cls, key = m:match('^mgb:(%u+):(%w+)$')
+    if cls then return cls, key end
+    return nil
+end
+function combo_label(c)
+    local parts = {}
+    for _, m in ipairs(c.members or {}) do
+        local cls, key = combo_parse(m)
+        local e = key and mgb_entry(key)
+        parts[#parts + 1] = (cls and e) and mgb_label(cls, e) or m
+    end
+    return (#parts > 0) and table.concat(parts, ' + ') or '(empty)'
+end
+
+-- Old combos stored just 'mgb:<CLASS>', from when a class had exactly one ability. That mapping is
+-- unambiguous looking backwards, so upgrade in place rather than making anyone rebuild their combos.
+local LEGACY_MEMBER = { CLR='celestial', DRU='wood', SHM='ancestral',
+                        BRD='mercy', ENC='mercy', BST='paragon', RNG='auspice' }
+local function combo_migrate(m)
+    local cls = m:match('^mgb:(%u+)$')
+    if cls and LEGACY_MEMBER[cls] then return 'mgb:' .. cls .. ':' .. LEGACY_MEMBER[cls] end
+    return m
+end
+
+local function save_combos()
+    if not COMBO_FILE then return end
+    local fh = io.open(COMBO_FILE, 'w')
+    if not fh then return end
+    fh:write('; AdventureTime combos - one per line: members separated by commas.\n')
+    fh:write('; mgb:<CLASS> presses that class button. Delete a line to remove the combo.\n')
+    for _, c in ipairs(COMBOS) do
+        if #(c.members or {}) > 0 then fh:write(table.concat(c.members, ',') .. '\n') end
+    end
+    fh:close()
+end
+
+local function load_combos()
+mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale settings file
+    local cfg = ''
+    pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    COMBO_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_combos.txt')) or 'adventuretime_combos.txt'
+    COMBOS = {}
+    local fh = io.open(COMBO_FILE, 'r')
+    if not fh then return end
+    for line in fh:lines() do
+        line = line:gsub('^%s+', ''):gsub('%s+$', '')
+        if line ~= '' and line:sub(1, 1) ~= ';' then
+            local members = {}
+            for m in line:gmatch('[^,]+') do
+                m = m:gsub('^%s+', ''):gsub('%s+$', '')
+                if m ~= '' then members[#members + 1] = combo_migrate(m) end
+            end
+            if #members > 0 then COMBOS[#COMBOS + 1] = { members = members } end
+        end
+    end
+    fh:close()
+end
+
+-- Press every member that is actually in the group. A member for a class nobody is playing is simply
+-- skipped rather than being an error - combos are built once and groups change.
+function combo_fire(c)
+    local fired = 0
+    for _, m in ipairs(c.members or {}) do
+        local cls, key = combo_parse(m)
+        if cls and key then
+            for _, nm in ipairs(group_members()) do
+                if (member_class(nm) or ''):upper() == cls then
+                    if nm:lower() == myName:lower() then mgb_click(key)
+                    else peer_cmdf(nm, '/at_mgbclick %s', key) end
+                    fired = fired + 1
+                    break
+                end
+            end
+        end
+    end
+    log('[combo] %s - pressed %d', combo_label(c), fired)
+end
+
+-- ---------------------------------------------------------------------------
+-- Cure clicks. Unlike the MGB buttons these are keyed by OWNERSHIP, not class: anyone holding the AA
+-- or the item gets a button, whatever they are. ability_state already resolves item-or-AA, so adding
+-- another cure source is one line here and nothing else changes.
+-- ---------------------------------------------------------------------------
+CURE_CLICKS = {
+    { key = 'radiant', label = 'Radiant Cure',   name = 'Radiant Cure' },
+    { key = 'band',    label = 'Cleansing Band', name = 'Cleansing Band of Twilight' },
+}
+cureState = {}   -- driver: cureState[char][key] = { have, secs, updated }
+cureLast  = {}   -- worker: last-pushed key per source
+
+function cure_source(key)
+    for _, e in ipairs(CURE_CLICKS) do if e.key == key then return e end end
+    return nil
+end
+
+-- Do I have this, and can I fire it? have=0 means no button is drawn for me at all.
+-- Deliberately NOT routed through ability_state: that function falls through to a Spell[] lookup for
+-- disciplines, and Spell['Radiant Cure'].ID resolves out of the GLOBAL spell table - so every
+-- character matched and every character got a button. Harmless for burns (a toon only ever asks about
+-- entries from its own [Burn] section) but wrong here, where we ask everyone about a fixed list.
+-- Only two things count as proof of ownership: the item is in my inventory, or the AA has a rank /
+-- reports ready. The AA timer is excluded - it returns 1 for an AA the character does not own.
+function cure_state(name)
+    local itemID = 0
+    pcall(function() itemID = tonumber(mq.TLO.FindItem('=' .. name).ID()) or 0 end)
+    if itemID > 0 then
+        local t = 0
+        pcall(function() t = tonumber(mq.TLO.FindItem('=' .. name).TimerReady()) or 0 end)
+        return 1, (t > 0) and math.floor(t) or 0
+    end
+    local rank, rdy = 0, false
+    pcall(function() rank = tonumber(mq.TLO.Me.AltAbility(name).Rank()) or 0 end)
+    pcall(function() rdy  = (mq.TLO.Me.AltAbilityReady(name)() == true) end)
+    if (rank > 0) or rdy then
+        if rdy then return 1, 0 end
+        local s = -1
+        pcall(function() s = tonumber(mq.TLO.Me.AltAbilityTimer(name).TotalSeconds()) or -1 end)
+        return 1, (s and s > 0) and math.floor(s) or 0
+    end
+    return 0, -1
+end
+
+function cure_click(key)
+    local e = cure_source(key)
+    if not e then return end
+    local isItem = false
+    pcall(function() isItem = (tonumber(mq.TLO.FindItem('=' .. e.name).ID()) or 0) > 0 end)
+    pcall(function()
+        mq.cmdf('/nowcast %s "%s%s"', myName, e.name, isItem and '/CastType|Item' or '')
+    end)
+    log('[cure] %s', e.label)
+end
+
+-- Mini: cures, grouped by source with one button per OWNER. Only characters that actually hold the
+-- AA or the item get a button, so the row stays short - a source nobody has draws nothing at all.
+-- Button label is just the character name; the source is named once at the head of its row.
+function draw_cure_buttons()
+    local drewAny = false
+    for _, e in ipairs(CURE_CLICKS) do
+        local owners = {}
+        for _, nm in ipairs(group_members()) do
+            local st = (cureState[nm] or {})[e.key]
+            if st and st.have == 1 then owners[#owners + 1] = { nm = nm, st = st } end
+        end
+        if #owners > 0 then
+            drewAny = true
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.label)
+            for oi, o in ipairs(owners) do
+                ImGui.SameLine()
+                local r = o.st.secs or -1
+                if r > 0 then r = math.max(0, r - math.floor((mq.gettime() - (o.st.updated or 0)) / 1000)) end
+                local cr, cg, cb
+                if r <= 0 then          cr, cg, cb = 0.36, 0.80, 0.46   -- green: can fire now
+                elseif r < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
+                elseif r < 300 then     cr, cg, cb = 0.95, 0.62, 0.25
+                else                    cr, cg, cb = 0.85, 0.35, 0.35 end
+                local pushed = false
+                if ImGuiCol and ImGuiCol.Text then
+                    ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
+                end
+                if ImGui.SmallButton(o.nm .. '##at_cure_' .. e.key .. '_' .. o.nm) then
+                    if o.nm:lower() == myName:lower() then cure_click(e.key)
+                    else peer_cmdf(o.nm, '/at_cure %s', e.key) end
+                end
+                if pushed then ImGui.PopStyleColor() end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function()
+                        ImGui.SetTooltip(string.format('%s - %s\n  %s', o.nm, e.label,
+                            (r <= 0) and 'ready' or string.format('%d:%02d', math.floor(r / 60), r % 60)))
+                    end)
+                end
+                if oi == #owners then ImGui.Spacing() end
+            end
+        end
+    end
+    if not drewAny then ImGui.TextDisabled('no cure sources in group') end
+end
+
 local function draw_rez_mini()
     -- Same shape as the Burns tab: characters across the top, one row per clicky.
     local cols = {}
@@ -3218,7 +3466,7 @@ end
 -- press will not use it, so letting it gate the colour would sit the button red all night for a
 -- reason that does not apply.
 function mgb_button_state(nm, cfg)
-    local st = healState[nm]
+    local st = (healState[nm] or {})[cfg.key]
     if not st then return 'unknown', {} end
     local age  = math.floor((mq.gettime() - (st.updated or 0)) / 1000)
     local rows, down = {}, false
@@ -3241,48 +3489,96 @@ function mgb_button_state(nm, cfg)
         rows[#rows + 1] = txt .. (note or '')
     end
     add(MGB_AA, st.mgb or -1, st.raid, st.raid and '' or '   (unused - not in raid)')
-    for i, aa in ipairs(cfg.abils) do add(aa, (st.aas or {})[i] or -1, true) end
+    for i, ab in ipairs(cfg.abils) do add(ab, (st.aas or {})[i] or -1, true) end
     return (down and 'down' or 'ready'), rows, st.raid
 end
 
-function draw_mgb_buttons()
-    -- Count classes first: two toons of the SAME class would otherwise draw two buttons with the same
-    -- ImGui id (it was keyed on class), and ImGui treats same-id widgets as one - clicking the second
-    -- fired the first. Ids are per-CHARACTER now, and a duplicated class gets its name in the label so
-    -- the two are tellable apart.
-    local seen = {}
-    for _, nm in ipairs(group_members()) do
-        local c = (member_class(nm) or ''):upper()
-        if MGB_CLICKS[c] then seen[c] = (seen[c] or 0) + 1 end
-    end
+-- Mini: one button per configured combo. Colour is the WORST of its members - green only when every
+-- one of them could actually fire, since a green button that half-works is worse than no button.
+function draw_combo_buttons()
     local first = true
-    for _, nm in ipairs(group_members()) do
-        local cls = (member_class(nm) or ''):upper()
-        local cfg = MGB_CLICKS[cls]
-        if cfg and #cfg.abils > 0 then
+    for ci, c in ipairs(COMBOS) do
+        if #(c.members or {}) > 0 then
+            local worst, rows, present = 'ready', {}, 0
+            for _, m in ipairs(c.members) do
+                local cls, key = combo_parse(m)
+                local e = key and mgb_entry(key)
+                local who
+                if cls then
+                    for _, nm in ipairs(group_members()) do
+                        if (member_class(nm) or ''):upper() == cls then who = nm; break end
+                    end
+                end
+                if not who or not e then
+                    rows[#rows + 1] = ((cls and e) and mgb_label(cls, e) or m) .. '  not in group'
+                else
+                    present = present + 1
+                    local st, srows = mgb_button_state(who, e)
+                    if st == 'down' then worst = 'down'
+                    elseif st == 'unknown' and worst ~= 'down' then worst = 'unknown' end
+                    rows[#rows + 1] = who .. '  (' .. mgb_label(cls, e) .. ')'
+                    for _, r in ipairs(srows) do rows[#rows + 1] = '   ' .. r end
+                end
+            end
             if not first then ImGui.SameLine() end
             first = false
-            local label = cfg.label .. ((seen[cls] or 0) > 1 and (' (' .. nm .. ')') or '')
-            local state, rows, raiding = mgb_button_state(nm, cfg)
             local cr, cg, cb
-            if state == 'unknown'  then cr, cg, cb = 0.55, 0.55, 0.55   -- grey: no report yet
-            elseif state == 'down' then cr, cg, cb = 0.85, 0.35, 0.35   -- red: something it needs is down
-            else                        cr, cg, cb = 0.36, 0.80, 0.46   -- green: everything ready
-            end
+            if present == 0        then cr, cg, cb = 0.55, 0.55, 0.55
+            elseif worst == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
+            elseif worst == 'unknown' then cr, cg, cb = 0.55, 0.55, 0.55
+            else                        cr, cg, cb = 0.36, 0.80, 0.46 end
             local pushed = false
             if ImGuiCol and ImGuiCol.Text then
                 ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
             end
-            if ImGui.SmallButton(label .. '##at_mgb_' .. nm) then
-                if nm:lower() == myName:lower() then mgb_click()
-                else peer_cmdf(nm, '/at_mgbclick') end
-            end
+            if ImGui.SmallButton(combo_label(c) .. '##at_combo_' .. ci) and present > 0 then combo_fire(c) end
             if pushed then ImGui.PopStyleColor() end
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                local lines = { string.format('%s  (%s)', nm, raiding and 'raid: MGB + announce' or 'group only') }
+                local lines = { combo_label(c) }
                 for _, r in ipairs(rows) do lines[#lines + 1] = '  ' .. r end
-                if state == 'unknown' then lines[#lines + 1] = '  no report yet' end
                 pcall(function() ImGui.SetTooltip(table.concat(lines, '\n')) end)
+            end
+        end
+    end
+end
+
+function draw_mgb_buttons()
+    -- One button per (character, ability). A beastlord draws two; two toons of the same class each
+    -- draw their own, disambiguated by name. Ids are per character AND per ability, because two
+    -- widgets sharing an id are treated as one by ImGui and the second click fires the first.
+    local seen = {}
+    for _, nm in ipairs(group_members()) do
+        local c = (member_class(nm) or ''):upper()
+        if #mgb_entries_for(c) > 0 then seen[c] = (seen[c] or 0) + 1 end
+    end
+    local first = true
+    for _, nm in ipairs(group_members()) do
+        local cls = (member_class(nm) or ''):upper()
+        for _, e in ipairs(mgb_entries_for(cls)) do
+            if #e.abils > 0 then
+                if not first then ImGui.SameLine() end
+                first = false
+                local label = mgb_label(cls, e) .. ((seen[cls] or 0) > 1 and (' (' .. nm .. ')') or '')
+                local state, rows, raiding = mgb_button_state(nm, e)
+                local cr, cg, cb
+                if state == 'unknown'  then cr, cg, cb = 0.55, 0.55, 0.55
+                elseif state == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
+                else                        cr, cg, cb = 0.36, 0.80, 0.46 end
+                local pushed = false
+                if ImGuiCol and ImGuiCol.Text then
+                    ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
+                end
+                if ImGui.SmallButton(label .. '##at_mgb_' .. nm .. '_' .. e.key) then
+                    if nm:lower() == myName:lower() then mgb_click(e.key)
+                    else peer_cmdf(nm, '/at_mgbclick %s', e.key) end
+                end
+                if pushed then ImGui.PopStyleColor() end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    local lines = { string.format('%s  (%s)', nm, raiding and 'raid: MGB + announce' or 'group only') }
+                    for _, r in ipairs(rows) do lines[#lines + 1] = '  ' .. r end
+                    if state == 'unknown' then lines[#lines + 1] = '  no report yet' end
+                    pcall(function() ImGui.SetTooltip(table.concat(lines, '\n')) end)
+                end
             end
         end
     end
@@ -3327,6 +3623,37 @@ function draw_coth_mini()
     end
 end
 
+-- Mini section registry. Order lives in ONE list so it can be reordered in Settings and saved, rather
+-- than being baked into the render function - which meant every layout change was a code change.
+-- Tribute is not here: it is the mini window's whole identity and stays pinned at the top.
+MINI_SECTIONS = {
+    { key = 'rez',    label = 'Rez',                    flag = 'miniRez',    draw = draw_rez_mini     },
+    { key = 'di',     label = 'DI staff',               flag = 'miniDI',     draw = draw_di_mini      },
+    { key = 'burns',  label = 'Burns',                  flag = 'miniBurns',  draw = draw_burn_dots    },
+    { key = 'pots',   label = 'Group draught buttons',  flag = 'miniPots',   draw = draw_pot_buttons  },
+    { key = 'mgb',    label = 'Class MGB buttons',      flag = 'miniClicks', draw = draw_mgb_buttons  },
+    { key = 'combos', label = 'Combo buttons',          flag = 'miniCombos', draw = draw_combo_buttons},
+    { key = 'cures',  label = 'Cure buttons',           flag = 'miniCures',  draw = draw_cure_buttons },
+    { key = 'coth',   label = 'CoTH Group button',      flag = 'miniCoth',   draw = draw_coth_mini    },
+}
+miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
+function mini_section(key)
+    for _, s in ipairs(MINI_SECTIONS) do if s.key == key then return s end end
+    return nil
+end
+function mini_order_normalise()
+    -- Keep only keys we know, then append anything missing. Survives an old settings file that
+    -- predates a section, and drops a key from a future one without breaking the list.
+    local out, seen = {}, {}
+    for _, k in ipairs(miniOrder) do
+        if mini_section(k) and not seen[k] then seen[k] = true; out[#out + 1] = k end
+    end
+    for _, s in ipairs(MINI_SECTIONS) do
+        if not seen[s.key] then out[#out + 1] = s.key end
+    end
+    miniOrder = out
+end
+
 local function render()
     if not windowOpen then return end
     if miniMode then   -- compact tribute-only window (its own ###id so it keeps its own small size/pos)
@@ -3343,29 +3670,12 @@ local function render()
             if ImGui.SmallButton('Rez') then miniRez = not miniRez end
             ImGui.Spacing()
             draw_tribute_mini()
-            if miniRez then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_rez_mini()
-            end
-            if miniDI then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_di_mini()
-            end
-            if miniBurns then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_burn_dots()
-            end
-            if miniPots then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_pot_buttons()
-            end
-            if miniClicks then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_mgb_buttons()
-            end
-            if miniCoth then
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                draw_coth_mini()
+            for _, k in ipairs(miniOrder) do
+                local sec = mini_section(k)
+                if sec and _G[sec.flag] and sec.draw then
+                    ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                    sec.draw()
+                end
             end
         end
         ImGui.End()
@@ -3602,15 +3912,105 @@ local function render()
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Mini window')
                 do
-                    local a, b, c, d, e, f2 = miniRez, miniBurns, miniPots, miniCoth, miniClicks, miniDI
-                    miniRez    = ImGui.Checkbox('Rez in mini', miniRez)
-                    miniDI     = ImGui.Checkbox('DI staff in mini', miniDI)
-                    miniBurns  = ImGui.Checkbox('Burns in mini', miniBurns)
-                    miniPots   = ImGui.Checkbox('Group draught buttons in mini', miniPots)
-                    miniClicks = ImGui.Checkbox('Class MGB buttons in mini', miniClicks)
-                    miniCoth   = ImGui.Checkbox('CoTH Group button in mini', miniCoth)
-                    if a ~= miniRez or b ~= miniBurns or c ~= miniPots or d ~= miniCoth or e ~= miniClicks or f2 ~= miniDI then dirty = true end
+                    -- One row per section: arrows set the order, the checkbox sets visibility. Both
+                    -- persist, so the mini window can be laid out without touching the code.
+                    for i, k in ipairs(miniOrder) do
+                        local sec = mini_section(k)
+                        if sec then
+                            if ImGui.SmallButton('^##at_up_' .. k) and i > 1 then
+                                miniOrder[i], miniOrder[i - 1] = miniOrder[i - 1], miniOrder[i]
+                                dirty = true
+                            end
+                            ImGui.SameLine()
+                            if ImGui.SmallButton('v##at_dn_' .. k) and i < #miniOrder then
+                                miniOrder[i], miniOrder[i + 1] = miniOrder[i + 1], miniOrder[i]
+                                dirty = true
+                            end
+                            ImGui.SameLine()
+                            local was = _G[sec.flag] and true or false
+                            local now = ImGui.Checkbox(sec.label .. '##at_sec_' .. k, was)
+                            if now ~= was then _G[sec.flag] = now; dirty = true end
+                        end
+                    end
                 end
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+
+                -- Combo editor. Every configured class is offered, not just the ones grouped right
+                -- now, so a combo can be built before the character it needs is online. Members that
+                -- are not in the group are simply skipped when the button is pressed.
+                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Combos')
+                ImGui.TextDisabled('One button that presses several class buttons.')
+                -- Only classes actually in the group get a checkbox. The catch: a combo built earlier
+                -- can hold a class that has since left, and that member would be invisible here while
+                -- still living in the file and still firing. So anything absent is listed below the
+                -- checkboxes with its own remove button - offered, but never hidden.
+                -- One checkbox per (grouped class, ability) pair, so a beastlord offers Mercy and
+                -- Paragon separately. Anything a combo holds whose class has left the group is listed
+                -- underneath with its own remove button - offered, but never hidden.
+                local opts, inGroup = {}, {}
+                for _, nm in ipairs(group_members()) do
+                    local cls = (member_class(nm) or ''):upper()
+                    if not inGroup[cls] then
+                        for _, e in ipairs(mgb_entries_for(cls)) do
+                            if #e.abils > 0 then
+                                opts[#opts + 1] = { key = 'mgb:' .. cls .. ':' .. e.key,
+                                                    label = mgb_label(cls, e), cls = cls }
+                            end
+                        end
+                        inGroup[cls] = true
+                    end
+                end
+                table.sort(opts, function(x, y) return x.label < y.label end)
+                if #opts == 0 then
+                    ImGui.TextDisabled('No group member has a class with MGB abilities configured.')
+                end
+                local comboDirty = false
+                for ci = #COMBOS, 1, -1 do
+                    local c = COMBOS[ci]
+                    ImGui.Separator()
+                    ImGui.Text(string.format('%d. %s', ci, combo_label(c)))
+                    ImGui.SameLine()
+                    if ImGui.SmallButton('Delete##at_cdel_' .. ci) then
+                        table.remove(COMBOS, ci); comboDirty = true
+                    else
+                        local has = {}
+                        for _, m in ipairs(c.members) do has[m] = true end
+                        for oi, opt in ipairs(opts) do
+                            if oi > 1 then ImGui.SameLine() end
+                            local was = has[opt.key] and true or false
+                            local now = ImGui.Checkbox(opt.label .. '##at_c' .. ci .. '_' .. opt.key, was)
+                            if now ~= was then
+                                if now then
+                                    c.members[#c.members + 1] = opt.key
+                                else
+                                    for k = #c.members, 1, -1 do
+                                        if c.members[k] == opt.key then table.remove(c.members, k) end
+                                    end
+                                end
+                                comboDirty = true
+                            end
+                        end
+                        for k = #c.members, 1, -1 do
+                            local mcls, mkey = combo_parse(c.members[k])
+                            if mcls and not inGroup[mcls] then
+                                local me = mgb_entry(mkey)
+                                ImGui.TextColored(0.95, 0.85, 0.30, 1.0,
+                                    '   ' .. (me and mgb_label(mcls, me) or c.members[k]) .. ' (not in group)')
+                                ImGui.SameLine()
+                                if ImGui.SmallButton('remove##at_crm_' .. ci .. '_' .. k) then
+                                    table.remove(c.members, k); comboDirty = true
+                                end
+                            end
+                        end
+                    end
+                end
+                ImGui.Separator()
+                if ImGui.Button('New combo', 110, 0) then
+                    COMBOS[#COMBOS + 1] = { members = {} }
+                    comboDirty = true
+                end
+                if comboDirty then save_combos() end
+
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ImGui.TextDisabled('build ' .. BUILD_TAG)
                 if dirty then save_settings() end
@@ -3676,6 +4076,8 @@ local function check_peer_network()
 end
 
 load_settings()   -- restore persisted toggles (auto-rez) before we start talking to anyone
+load_combos()
+mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale settings file
 -- The peer check was written and then never wired in, so the one diagnostic aimed at split/broken
 -- networks has never run. Deferred rather than immediate: DanNet needs a moment to discover peers,
 -- and asking too early reports everyone missing on a perfectly healthy setup.
@@ -3850,25 +4252,40 @@ while running do
         -- Group draughts ride the same local poll. secs/dsecs are LATCHED values, not live countdowns,
         -- so the key only moves when the state genuinely flips - one push on drink, one on fall-off.
         -- The driver counts down from `updated` itself, exactly like burn_remain does.
-        do   -- healer clicks: only healers with configured AAs report at all
+        do   -- MGB clicks: one report per ability this class can use (a beastlord has two)
             local hcls = (mq.TLO.Me.Class.ShortName() or ''):upper()
-            local hcfg = MGB_CLICKS[hcls]
-            if hcfg and #hcfg.abils > 0 then
-                local raiding = (tonumber(mq.TLO.Raid.Members()) or 0) > 0
-                local parts = { tostring(click_secs(MGB_AA)) }
-                for _, aa in ipairs(hcfg.abils) do parts[#parts + 1] = tostring(click_secs(aa)) end
-                local k = hcls .. '/' .. (raiding and 1 or 0) .. '/' .. table.concat(parts, '/')
-                if healLast ~= k then
-                    healLast = k
-                    if SHOW_UI then
-                        local sec = {}
-                        for i = 2, #parts do sec[#sec + 1] = tonumber(parts[i]) or -1 end
-                        healState[myName] = { cls = hcls, raid = raiding, mgb = tonumber(parts[1]) or -1,
-                                              aas = sec, updated = mq.gettime() }
-                    elseif driverName then
-                        peer_cmdf(driverName, '/at_healstate %s %s %d %s', myName, hcls,
-                                  raiding and 1 or 0, table.concat(parts, ' '))
+            for _, he in ipairs(mgb_entries_for(hcls)) do
+                if #he.abils > 0 then
+                    local raiding = (tonumber(mq.TLO.Raid.Members()) or 0) > 0
+                    local parts = { tostring(click_secs(MGB_AA)) }
+                    for _, ab in ipairs(he.abils) do parts[#parts + 1] = tostring(click_secs(ab)) end
+                    local k = he.key .. '/' .. (raiding and 1 or 0) .. '/' .. table.concat(parts, '/')
+                    if healLast[he.key] ~= k then
+                        healLast[he.key] = k
+                        if SHOW_UI then
+                            local sec = {}
+                            for i = 2, #parts do sec[#sec + 1] = tonumber(parts[i]) or -1 end
+                            healState[myName] = healState[myName] or {}
+                            healState[myName][he.key] = { raid = raiding, mgb = tonumber(parts[1]) or -1,
+                                                          aas = sec, updated = mq.gettime() }
+                        elseif driverName then
+                            peer_cmdf(driverName, '/at_healstate %s %s %d %s', myName, he.key,
+                                      raiding and 1 or 0, table.concat(parts, ' '))
+                        end
                     end
+                end
+            end
+        end
+        for _, ce in ipairs(CURE_CLICKS) do   -- cures: only owners ever report, so silence means "not mine"
+            local have, secs = cure_state(ce.name)
+            local k = have .. '/' .. secs
+            if cureLast[ce.key] ~= k then
+                cureLast[ce.key] = k
+                if SHOW_UI then
+                    cureState[myName] = cureState[myName] or {}
+                    cureState[myName][ce.key] = { have = have, secs = secs, updated = mq.gettime() }
+                elseif driverName then
+                    peer_cmdf(driverName, '/at_curestate %s %s %d %d', myName, ce.key, have, secs)
                 end
             end
         end
