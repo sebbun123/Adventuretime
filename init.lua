@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-mgbability-2026-07-25'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-diquiet-2026-07-25'   -- bump on every change; prints on startup
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
@@ -271,7 +271,16 @@ local function group_members()
     local n = mq.TLO.Group.Members() or 0
     for i = 1, n do
         local nm = mq.TLO.Group.Member(i).Name()
-        if nm and nm ~= '' and not seen[nm:lower()] then list[#list + 1] = nm; seen[nm:lower()] = true end
+        -- A DEAD member reports as its corpse: "Sebbun's corpse99". That name then flows into the rez
+        -- priority, the tank check, ordered_members, and the roster-change watcher - which saw a member
+        -- "leave", fired a resync, and tried to close a worker on a corpse. Strip the suffix and keep
+        -- the character: they are still in the group, they are just dead.
+        if nm and nm ~= '' then
+            local realName = nm:match("^(.-)'s? corpse%d*$") or nm
+            if realName ~= '' and not seen[realName:lower()] then
+                list[#list + 1] = realName; seen[realName:lower()] = true
+            end
+        end
     end
     return list
 end
@@ -602,7 +611,10 @@ end
 local HEALER_CLASS = { CLR = true, DRU = true, SHM = true }
 local TANK_CLASS   = { WAR = true, PAL = true, SHD = true }
 local lastXTankKey = nil   -- last list this toon set (for the on-change announce)
-local lastGroupKey = nil   -- group roster as last seen, so a membership change can re-test the network
+local lastGroupKey  = nil   -- group roster as last seen, so a membership change can re-test the network
+local lastGroupList = {}    -- the actual names, so we know WHO left and can shut their worker down
+local resyncAt     = 0     -- when to resync after a roster change (0 = nothing pending)
+local lastRevive   = 0     -- last crash-watch sweep
 
 -- OTHER groups' raid tanks, minus me and minus my OWN group's tank (he's already covered by the group
 -- heal/assist setup - an XTarget slot on him is wasted). Deduped. Not raiding => nothing to watch.
@@ -712,9 +724,40 @@ rezDebugLast = ''
 rezReady    = {}      -- char -> {crown=secs, token=secs}; -1 = doesn't own. Pushed to the group (no queries)
 rezCast     = nil     -- my in-flight rez: { id=, item=, at=, tries=, name= } - one corpse at a time
 rezConfirm  = {}      -- target name:lower -> gettime of last 'I'm at bind, ready' pong (gates the cast)
-local rezDone     = {}      -- name:lower -> expiry: this toon has a rez pending (E3 will accept it) -> stop targeting its corpse
-local lastRezDoneBcast = 0
+local rezMultiWarn = {}     -- name -> corpse count we last mentioned (only speak up when it changes)
+local rezDone     = {}      -- name:lower -> expiry: this toon has a rez pending -> stop targeting its corpse
+-- Corpse ids that have ALREADY had a rez accepted. NO expiry: on this server a corpse does not vanish
+-- when it is rezzed, it can lie there for an hour. Anything keyed on a timeout eventually lapses and
+-- re-targets a body rezzed ten minutes ago - which is how Stylin took two crowns for one death. Corpse
+-- ids are unique per death, so retiring one permanently cannot block the next.
+local rezCorpseDone = {}
+rezClaimAt  = {}      -- corpse id -> when I last broadcast a claim on it (do not spam the claim)
+rezGateAt   = {}      -- corpse id -> last time we logged which gate is holding the cast
+-- What a peer's clicky timer reads RIGHT NOW, counted down from when they reported it. This is the
+-- whole reason the rez beat had to run every 2 seconds: the baton compared the raw reported number, so
+-- a report of "90s" still said 90 a minute later and a slot that had come up long ago still read as
+-- busy. Counting down here means an old report stays an accurate one, and the beat only has to carry
+-- CHANGES - which is the difference between broadcasting every 2s and broadcasting when something
+-- actually happens.
+function rez_peer_secs(rr, clicky)
+    if not rr then return nil end
+    local base = (clicky == 'token') and rr.token or rr.crown
+    if base == nil or base < 0 then return base end          -- -1 = does not own it; leave as is
+    if base == 0 then return 0 end
+    local left = base - math.floor((mq.gettime() - (rr.updated or 0)) / 1000)
+    return (left > 0) and left or 0
+end
 rezPingAt   = {}      -- target name:lower -> gettime of my last handshake ping (rate-limit)
+rezExpectUntil = 0    -- until when a rez is inbound for ME (set when I answer a handshake)
+rezBoxAt       = 0    -- when the confirmation box appeared (0 = not showing)
+rezBoxClicked  = false -- have we already clicked this one
+rezNoBoxWarn   = 0    -- last time we said 'expecting a rez, no box found'
+rezExpectFrom  = 0    -- when the expecting-a-rez window opened
+rezWasDead     = false -- for spotting the moment I get back up
+rezAnnounceAt  = 0    -- re-announce readiness once shortly after, in case the first was lost
+rezAccept      = true -- click the rez confirmation myself instead of waiting for a human
+rezWaitFrom = {}      -- target -> when we started waiting on its handshake
+rezWaitWarn = {}      -- target -> last time we complained about the wait
 rezFireAt   = {}      -- corpseID -> my jittered earliest fire time (anti-race stagger)
 rezSkip     = {}      -- corpseID -> { name:lower -> expiry } : candidates that reported they can't rez it
 rezFirstSeen = {}     -- corpseID -> gettime first targeted (baton timeout per position)
@@ -1174,6 +1217,22 @@ local function rez_rank(cls)
     if TANK_CLASS[cls] then return 1 elseif HEALER_CLASS[cls] then return 2
     elseif cls == 'BRD' or cls == 'ENC' then return 4 else return 3 end   -- 3 = DPS, 4 = support
 end
+-- Group members in the user's chosen display order. Names in charOrder come first, in that order;
+-- anyone not listed (a new member, or a fresh install with no order saved) follows in group order.
+-- Never invents members - it only ever reorders whoever is actually grouped right now.
+function ordered_members()
+    local inGroup, out, taken = {}, {}, {}
+    for _, nm in ipairs(group_members()) do inGroup[nm:lower()] = nm end
+    for _, nm in ipairs(charOrder) do
+        local real = inGroup[tostring(nm):lower()]
+        if real and not taken[real] then taken[real] = true; out[#out + 1] = real end
+    end
+    for _, nm in ipairs(group_members()) do
+        if not taken[nm] then taken[nm] = true; out[#out + 1] = nm end
+    end
+    return out
+end
+
 -- Global, not local: query_all_counts sits ABOVE this line and calls it. A local would not be in
 -- scope there and would resolve as a nil global at runtime.
 function member_class(nm)
@@ -1223,6 +1282,7 @@ local function save_settings()
         local f = io.open(settings_path(), 'w')
         if f then
             f:write('rezAuto=' .. (rezAuto and '1' or '0') .. '\n')
+            f:write('rezAccept=' .. (rezAccept and '1' or '0') .. '\n')
             for _, k in ipairs({ 'tribute', 'pots', 'burns', 'rez', 'misc' }) do
                 f:write('show_' .. k .. '=' .. (showSec[k] and '1' or '0') .. '\n')
             end
@@ -1231,7 +1291,12 @@ local function save_settings()
             f:write('miniDI=' .. (miniDI and '1' or '0') .. '\n')
             f:write('miniCombos=' .. (miniCombos and '1' or '0') .. '\n')
             f:write('miniCures=' .. (miniCures and '1' or '0') .. '\n')
+            f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
+            f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
+            f:write('miniBurnTable=' .. (miniBurnTable and '1' or '0') .. '\n')
+            f:write('charOrder=' .. table.concat(charOrder, ',') .. '\n')
+            f:write('miniBurnFilter=' .. tostring(miniBurnFilter) .. '\n')
             f:write('miniBurns=' .. (miniBurns and '1' or '0') .. '\n')
             f:write('miniPots=' .. (miniPots and '1' or '0') .. '\n')
             f:write('miniClicks=' .. (miniClicks and '1' or '0') .. '\n')
@@ -1251,6 +1316,7 @@ local function load_settings()
             local k, v = line:match('^([%w_]+)%s*=%s*(%S+)%s*$')
             if k then
             if k == 'rezAuto' then rezAuto = (v == '1' or v:lower() == 'true') end
+            if k == 'rezAccept' then rezAccept = (v == '1' or v:lower() == 'true') end
             local sec = k:match('^show_(%w+)$')
             if sec and showSec[sec] ~= nil then showSec[sec] = (v == '1' or v:lower() == 'true') end
             if k == 'diAuto'    then DI.auto   = (v == '1' or v:lower() == 'true') end
@@ -1258,6 +1324,16 @@ local function load_settings()
             if k == 'miniDI'    then miniDI    = (v == '1' or v:lower() == 'true') end
             if k == 'miniCombos' then miniCombos = (v == '1' or v:lower() == 'true') end
             if k == 'miniCures' then miniCures  = (v == '1' or v:lower() == 'true') end
+            if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
+            if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
+            if k == 'miniBurnTable' then miniBurnTable = (v == '1' or v:lower() == 'true') end
+            if k == 'miniBurnFilter' then
+                if v == 'All' or v == 'Tank' or v == 'DPS' or v == 'Healer' then miniBurnFilter = v end
+            end
+            if k == 'charOrder' then
+                charOrder = {}
+                for part in v:gmatch('[^,]+') do charOrder[#charOrder + 1] = part end
+            end
             if k == 'miniOrder' then
                 miniOrder = {}
                 for part in v:gmatch('[^,]+') do miniOrder[#miniOrder + 1] = part end
@@ -1427,38 +1503,56 @@ function draw_misc_tab()
         if ImGui.Button('CoTH Group', 110, 0) then coth_set(true) end
     end
     ImGui.SameLine()
+    if ImGui.Button('Resync group', 110, 0) then resync_group() end
+    ImGui.SameLine()
     if COTH.active then
         ImGui.TextColored(0.36, 0.80, 0.46, 1, 'gathering on ' .. (coth_anchor() or '?'))
     else
         ImGui.TextDisabled('idle')
     end
     ImGui.Spacing()
-    if ImGui.BeginTable('##cothtbl', 4, (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)) then
-        ImGui.TableSetupColumn(''); ImGui.TableSetupColumn('Emblem')
-        ImGui.TableSetupColumn('Dist'); ImGui.TableSetupColumn('')
-        ImGui.TableHeadersRow()
+    -- No table. A gather is automatic and over in seconds, so nobody sits reading six rows of distances
+    -- while it runs - and when idle nothing reports at all, which made it six rows of '?' saying
+    -- nothing. What actually matters is a stalled gather and WHY, so: one line, detail on hover.
+    if not COTH.active and next(COTH.state) == nil then
+        ImGui.TextDisabled('Positions are only reported while a gather is running.')
+    else
+        local here, total, rows = 0, 0, {}
         for _, nm in ipairs(group_members()) do
+            total = total + 1
             local st = COTH.state[nm]
-            ImGui.TableNextRow(); ImGui.TableNextColumn()
-            ImGui.TextColored(0.70,0.70,0.70,1.0, nm:sub(1,9))
-            ImGui.TableNextColumn()
+            local why
+            if coth_gathered(nm) then
+                here = here + 1
+            elseif not st then
+                why = 'no report'
+            elseif (st.dist or -1) < 0 then
+                why = 'position unknown'
+            elseif st.dist <= COTH.RANGE and (st.los or 0) == 0 then
+                why = string.format('%d away, no line of sight', st.dist)
+            else
+                why = string.format('%d away', st.dist)
+            end
             local em = st and st.emblem or -1
-            if em < 0 then ImGui.TextDisabled('-')
-            elseif em == 0 then ImGui.TextColored(0.36,0.80,0.46,1.0,'ready')
-            else ImGui.TextColored(0.85,0.35,0.35,1.0, string.format('%d:%02d', math.floor(em/60), em%60)) end
-            ImGui.TableNextColumn()
-            local d = st and st.dist or -1
-            if d < 0 then ImGui.TextColored(0.85,0.35,0.35,1.0,'?')
-            else ImGui.TextColored(0.70,0.70,0.70,1.0, tostring(d)) end
-            ImGui.TableNextColumn()
-            if coth_gathered(nm) then ImGui.TextColored(0.36,0.80,0.46,1.0,'here')
-            elseif st and (st.dist or -1) >= 0 and st.dist <= COTH.RANGE and (st.los or 0) == 0 then
-                ImGui.TextColored(0.95,0.62,0.25,1.0,'no LoS')
-            else ImGui.TextColored(0.95,0.62,0.25,1.0,'away') end
+            if em > 0 then
+                why = (why and (why .. ', ') or '') .. string.format('emblem %d:%02d', math.floor(em / 60), em % 60)
+            end
+            if why then rows[#rows + 1] = nm .. '  ' .. why end
         end
-        ImGui.EndTable()
+        local cr, cg, cb
+        if here >= total then   cr, cg, cb = 0.36, 0.80, 0.46
+        elseif here > 0 then    cr, cg, cb = 0.95, 0.85, 0.30
+        else                    cr, cg, cb = 0.85, 0.35, 0.35 end
+        ImGui.TextColored(cr, cg, cb, 1.0, string.format('%d/%d gathered', here, total))
+        if #rows > 0 then
+            ImGui.SameLine()
+            ImGui.TextDisabled('(hover for who)')
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                pcall(function() ImGui.SetTooltip(table.concat(rows, '\n')) end)
+            end
+        end
     end
-    if COTH.dbg ~= '' then ImGui.Spacing(); ImGui.TextColored(0.55,0.70,0.80,1.0, COTH.dbg) end
+    if COTH.dbg ~= '' then ImGui.Spacing(); ImGui.TextColored(0.55, 0.70, 0.80, 1.0, COTH.dbg) end
 end
 
 local function coth_tick()
@@ -1470,6 +1564,12 @@ local function coth_tick()
     -- so a fast cast doesn't cost us a fixed wait. (Same pattern the rez cast machine uses.)
     if COTH.castAt > 0 then
         if (now - COTH.castAt) < 1000 then return end
+        -- Refresh the claim while my cast is in the air. A single 15s claim is enough on paper, but a
+        -- dropped broadcast would silently free the corpse mid-cast and invite a second rezzer.
+        if (now - (rezClaimAt[rezCast.id] or 0)) > 3000 then
+            rezClaimAt[rezCast.id] = now
+            peer_bcast('/at_rezclaim %d %d', rezCast.id, 15000)
+        end
         local casting = false
         pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
         if casting then COTH.dbg = 'casting...'; return end
@@ -1686,9 +1786,9 @@ local function di_tick()
     local knownAble, unknown = false, false
     for i = 1, myPos - 1 do
         local st = DI.state[order[i]]
-        local fresh = st and (now - (st.updated or 0)) < 8000
+        local fresh = st and (now - (st.updated or 0)) < 30000   -- keepalive is 20s idle / 4s in combat
         if fresh then
-            if st.staff == 0 and (st.emeralds or 0) > 0 then knownAble = true; break end
+            if di_peer_staff(st) == 0 and (st.emeralds or 0) > 0 then knownAble = true; break end
         else
             unknown = true
         end
@@ -1758,14 +1858,80 @@ function rez_event_now()
     return HB.corpse
 end
 
-local function rez_corpse(name)   -- returns corpseID, distance. Laz names PC corpses "<Name>'s corpse".
+-- How far the rez clickies actually reach, asked of the item rather than assumed. Cached, because it
+-- cannot change mid-session - but only once a real answer comes back, so a toon that has not got the
+-- item yet does not lock in the fallback forever.
+-- Do not even try beyond this. The clicky reports 200 of reach and we briefly attempted out to 300 on
+-- the theory that the reading might be stale - but with Distance3D on a 250ms tick it is current, and
+-- every one of those long casts failed while burning a charge. 150 is inside the reach with room for
+-- the boundary flicker that comes from a group moving.
+REZ_MAX_DIST = 150
+rezRangeCache = nil
+function rez_range()
+    if rezRangeCache then return rezRangeCache end
+    local best = 0
+    for _, it in ipairs({ CROWN_ITEM, TOKEN_ITEM }) do
+        local r = 0
+        pcall(function() r = tonumber(mq.TLO.FindItem('=' .. it).Spell.MyRange()) or 0 end)
+        if r > best then best = r end
+    end
+    if best > 0 then
+        rezRangeCache = best
+        rezlog('[rez] cast range resolved to %d from the clicky', best)
+        return best
+    end
+    return 100   -- no item in hand yet: assume the usual, ask again next time
+end
+
+-- Returns corpseID, distance - the NEWEST corpse this toon has.
+-- A character can have several corpses at once, because a rezzed one does not disappear here. Asking
+-- Spawn[] for "their corpse" returns whichever the search happens to hit, and different rezzers got
+-- different answers: one targeted a body from ten minutes ago, another the fresh one, each claimed a
+-- different id, and the poor sod got rezzed twice. Spawn ids climb over time, so the highest is the
+-- most recent death - and every rezzer picking the highest means everyone agrees on the same body.
+local function rez_corpse(name)
     local id, dist = 0, 99999
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.SpawnCount('pccorpse ' .. name)()) or 0 end)
+    if n and n > 1 then
+        for i = 1, n do
+            local sid, sd = 0, 99999
+            pcall(function()
+                local sp = mq.TLO.NearestSpawn(string.format('%d, pccorpse %s', i, name))
+                sid = tonumber(sp.ID()) or 0
+                sd  = tonumber(sp.Distance3D()) or tonumber(sp.Distance()) or 99999
+            end)
+            if sid > id then id, dist = sid, sd end
+        end
+        if id > 0 then
+            -- Only when the COUNT changes. Throttled by time it landed on the keepalive tick and said
+            -- the same thing every twenty seconds on all six toons, for a fact that only changes when
+            -- somebody dies.
+            if rezMultiWarn[name] ~= n then
+                rezMultiWarn[name] = n
+                -- log(), not rezdbg(): rezdbg is declared BELOW this function, so calling it here would
+                -- resolve to a nil global. Throttled to once per 20s per name, so the console is safe.
+                log('[rez] %s has %d corpses here - taking the newest (%d)', name, n, id)
+            end
+            return id, dist
+        end
+    end
+
     local forms = { name .. " corpse", "=" .. name .. "'s corpse", "pccorpse " .. name }
     for _, f in ipairs(forms) do
         pcall(function()
             local sp = mq.TLO.Spawn(f)
             local sid = tonumber(sp.ID()) or 0
-            if sid > 0 then id = sid; dist = tonumber(sp.Distance()) or 99999 end
+            if sid > 0 then
+                id = sid
+                -- Distance3D, not Distance. Distance is HORIZONTAL only, so a corpse thirty units below
+                -- you measures as nearer than it is - which decides the wrong way right on the boundary,
+                -- and the boundary is exactly where the group tends to stand.
+                local d
+                pcall(function() d = tonumber(sp.Distance3D()) end)
+                if not d then pcall(function() d = tonumber(sp.Distance()) end) end
+                dist = d or 99999
+            end
         end)
         if id > 0 then break end
     end
@@ -1777,6 +1943,105 @@ local function rez_note(msg)
 end
 
 local function rezdbg(msg) if msg ~= rezDebugLast then rezDebugLast = msg; rezlog('[rez] ' .. msg) end; rezDebug = msg end
+
+-- Take the rez ourselves. The corpse only clears when the box is ACCEPTED, so a rez nobody clicks
+-- leaves the corpse up, the picker re-targets it, and a second clicky gets spent on the same person.
+-- Only ever runs inside the 15s window opened by answering a handshake.
+-- MQ bindings are inconsistent about booleans: true, 1 and "TRUE" all turn up depending on build and
+-- TLO. Comparing to `true` alone silently reported every window shut even while one was on screen.
+local function win_open(w)
+    local v
+    local ok = pcall(function() v = mq.TLO.Window(w).Open() end)
+    if not ok or v == nil then return false, 'nil' end
+    if v == true or v == 1 then return true, tostring(v) end
+    local sv = tostring(v):upper()
+    return (sv == 'TRUE' or sv == '1'), tostring(v)
+end
+
+-- Identify the box by its TEXT, not by probing for a button. Window(x).Child(y).ID is not a member in
+-- this build, so the old existence check errored, `has` stayed false, and the box was never matched
+-- even with the window plainly open. The wording is also a far better signal than a button name: it
+-- confirms this is a resurrection offer rather than some other yes/no the game decided to ask.
+--   "Nityrc wants to cast spiritual awakening (100 percent) upon you? Do you wish this?"
+local REZ_WINDOW = 'ConfirmationDialogBox'
+local REZ_TEXT   = { 'wants to cast', 'upon you' }
+local REZ_BUTTONS = { 'CD_Yes_Button', 'Yes_Button', 'CD_OK_Button' }
+local function rez_autoaccept()
+    local now = mq.gettime()
+    local isRez, txt = false, ''
+    if win_open(REZ_WINDOW) then
+        pcall(function() txt = tostring(mq.TLO.Window(REZ_WINDOW).Child('CD_TextOutput').Text() or '') end)
+        local low = txt:lower()
+        isRez = true
+        for _, needle in ipairs(REZ_TEXT) do
+            if not low:find(needle, 1, true) then isRez = false; break end
+        end
+    end
+
+    if not isRez then
+        -- ...but not straight away. Being ready and the box existing are seconds apart by nature, and
+        -- warning in that gap cries wolf on a perfectly normal rez.
+        if now < rezExpectUntil and (now - rezExpectFrom) > 6000 and (now - rezNoBoxWarn) > 4000 then
+            rezNoBoxWarn = now
+            rezlog('\\ay[rez] expecting a rez but no resurrection box is open\\ax')
+        end
+        if rezBoxAt > 0 then
+            rezlog('[rez] rez box gone after %dms%s', now - rezBoxAt,
+                   rezBoxClicked and ' (we clicked it)' or ' (NOT clicked by us)')
+            rezBoxAt, rezBoxClicked = 0, false
+        end
+        return
+    end
+
+    if rezBoxAt == 0 then
+        rezBoxAt, rezBoxClicked = now, false
+        rezlog('[rez] rez box OPEN: %s', txt:sub(1, 70))
+        -- Announce the moment the box exists, whether or not WE click it. The previous version polled
+        -- Window().Open() == true from the main loop - the same truthiness bug that hid the box from us
+        -- for several builds - so in practice it never announced at all.
+        rezDone[myName:lower()] = now + 15000
+        pcall(function() peer_bcast('/at_rezdone %s', myName) end)
+    end
+    if rezBoxClicked or not rezAccept then return end
+
+    -- Try each button name; the first that makes the window go away was the right one.
+    for _, b in ipairs(REZ_BUTTONS) do
+        pcall(function() mq.cmdf('/notify %s %s leftmouseup', REZ_WINDOW, b) end)
+        mq.delay(60)
+        if not win_open(REZ_WINDOW) then
+            rezBoxClicked = true
+            rezExpectUntil = 0
+            rezlog('[rez] accepted with %s, %dms after the box opened', b, now - rezBoxAt)
+            return
+        end
+    end
+    rezlog('\\ay[rez] rez box is open but none of the buttons closed it: %s\\ax', table.concat(REZ_BUTTONS, ', '))
+    rezBoxClicked = true   -- do not hammer it every tick
+end
+
+-- Tell the group I am up the INSTANT I release, instead of waiting for a rezzer to ask. The ping/pong
+-- costs a round trip - the ask lands on one tick, the answer is read on the next - and every rezzer
+-- pays it separately. I already know the moment I stand up, so one broadcast replaces all of them.
+-- Cheaper as well as faster: one message per death instead of a ping and a pong per rezzer.
+local function rez_announce_ready()
+    local dead, zoning = false, false
+    pcall(function() dead = (mq.TLO.Me.Dead() == true) end)
+    pcall(function() zoning = (mq.TLO.Me.Zoning() == true) end)
+    if zoning then return end
+    if rezWasDead and not dead then          -- just got back up
+        rezWasDead = false
+        rezExpectFrom  = mq.gettime()
+        rezExpectUntil = mq.gettime() + 15000
+        peer_bcast('/at_rezrdy! %s', myName)
+        rezAnnounceAt = mq.gettime() + 1200   -- once more shortly, a lost broadcast costs a whole rez
+    elseif dead then
+        rezWasDead = true
+    end
+    if rezAnnounceAt > 0 and mq.gettime() >= rezAnnounceAt then
+        rezAnnounceAt = 0
+        peer_bcast('/at_rezrdy! %s', myName)
+    end
+end
 
 local function rez_tick()
     if #rezPriority == 0 then load_rez_priority() end   -- workers have no UI to load it; load here so their picker runs
@@ -1799,39 +2064,91 @@ local function rez_tick()
         if cid == 0 or cid ~= rezCast.id then rezCast = nil; return end
         local casting = false
         pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
-        if casting then return end                                 -- still casting - wait
+        if casting then
+            if (now - (rezGateAt[rezCast.id] or 0)) > 900 then
+                rezGateAt[rezCast.id] = now
+                rezdbg(string.format('cast in flight on %s, still casting', rezCast.name))
+            end
+            return
+        end
         if (now - rezCast.at) < 1500 then return end               -- 1s cast + settle; recast fast if it was interrupted
-        if my_rez_secs(rezCast.item) == 0 and rezCast.tries < 3 then   -- clicky still ready => interrupted; recast
+        -- One attempt when we were already beyond reach, three when we were not. A cast that failed on
+        -- range will fail again from the same spot, so grinding out three of them just holds the baton.
+        local maxTries = rezCast.far and 1 or 3
+        if my_rez_secs(rezCast.item) == 0 and rezCast.tries < maxTries then   -- clicky still ready => it did not go off
             rezCast.tries = rezCast.tries + 1; rezCast.at = now
             rezlog('[rez] retry %d /nowcast me "%s" %d', rezCast.tries, rezCast.item, rezCast.id)
             pcall(function() mq.cmdf('/nowcast me "%s" %d', rezCast.item, rezCast.id) end)
             return
         end
-        rezCast = nil   -- done with this cast; if the corpse is still there, the picker re-handshakes and tries again
+        if my_rez_secs(rezCast.item) == 0 then
+            -- Tries exhausted with the clicky untouched: it never went off. PASS THE BATON rather than
+            -- looping on it - somebody closer should get the chance.
+            local ck = (rezCast.item == TOKEN_ITEM) and 'token' or 'crown'
+            local key = myName:lower() .. ':' .. ck
+            rezSkip[rezCast.id] = rezSkip[rezCast.id] or {}
+            rezSkip[rezCast.id][key] = now + 5000
+            peer_bcast('/at_rezskip %s %d %d', key, rezCast.id, 5000)
+            rezlog('[rez] %s did not land on %s - passing to the next slot', rezCast.item, rezCast.name)
+        end
+        rezCast = nil   -- done; if the corpse is still there the picker re-handshakes and tries again
         return
     end
 
     -- 1) TARGET: highest-priority toon with a CORPSE in my zone, owner still connected, reachable.
     --    Uses corpse EXISTENCE, not the Dead flag - a released toon is 'alive' at bind but still has a corpse.
-    local tgtName, tgtID, anyCorpse, dbg
+    -- Every corpse we decline records WHY. Four quite different situations used to collapse into two
+    -- messages: a corpse 18 units away that another rezzer had already claimed reported as 'no
+    -- reachable corpse', which reads as a range problem and sent me looking in the wrong place.
+    local tgtName, tgtID, skipped, tgtFar, farID, tgtDist = nil, nil, {}, false, nil, -1
     local myZone0 = 0; pcall(function() myZone0 = tonumber(mq.TLO.Zone.ID()) or 0 end)
     for _, nm in ipairs(rezPriority) do
         local id, dist = rez_corpse(nm)
         if id > 0 then
             local rr = rezReady[nm]
-            local ownerHereAlive = rr and rr.alive and rr.zone == myZone0   -- owner up & in my zone => this corpse is stale
-            local rezPend = rezDone[nm:lower()] and now < rezDone[nm:lower()]   -- owner already has a rez pending -> done
-            if not ownerHereAlive and not rezPend then
-                anyCorpse = true
-                dbg = string.format('%s corpse=%d@%d', nm, id, math.floor(dist))
-                if dist <= 100 and not (rezPending[id] and now < rezPending[id]) then
-                    tgtName, tgtID = nm, id; break
-                end
+            local ownerHereAlive = rr and rr.alive and rr.zone == myZone0   -- owner up & in my zone => corpse is stale
+            local rezPend = rezDone[nm:lower()] and now < rezDone[nm:lower()]   -- owner already has a rez inbound
+            if rezCorpseDone[id] then
+                rezPend = true
+                skipped[#skipped + 1] = nm .. ': already rezzed (corpse ' .. id .. ' retired)'
+            end
+            local claimed = rezPending[id] and now < rezPending[id]             -- another rezzer called it
+            if ownerHereAlive then
+                skipped[#skipped + 1] = nm .. ': owner is already up'
+            elseif rezPend then
+                skipped[#skipped + 1] = nm .. ': rez already inbound'
+            elseif claimed then
+                skipped[#skipped + 1] = string.format('%s: claimed by another rezzer (%dm away)', nm, math.floor(dist))
+            elseif dist > REZ_MAX_DIST then
+                -- Beyond arguing with. Inside REZ_TRY_MAX we attempt regardless of the reach figure,
+                -- because the reading is a snapshot - the corpse may be summoned in, we may be walking
+                -- up, and a cast that cannot reach just does not consume the clicky. Past it, the corpse
+                -- is somewhere else entirely and trying only holds the baton.
+                skipped[#skipped + 1] = string.format('%s: too far, %dm (limit %d)', nm, math.floor(dist), REZ_MAX_DIST)
+                farID = farID or id
+            else
+                tgtName, tgtID, tgtFar, tgtDist = nm, id, (dist > rez_range()), math.floor(dist)
+                break
             end
         end
     end
-    if not anyCorpse then rezdbg('no corpses in zone'); return end
-    if not tgtID then rezdbg('no reachable corpse | ' .. (dbg or '')); return end
+    if not tgtID then
+        -- Too far to try is a SKIP, or the baton sits on me: alive, reporting, clicky ready, so everyone
+        -- behind waits out the (slot-1) x 2s timeout instead. Short TTL - walk closer and I am back in.
+        if farID then
+            for _, sl in ipairs(rezOrder) do
+                if sl.name:lower() == myName:lower() then
+                    local key = myName:lower() .. ':' .. sl.clicky
+                    rezSkip[farID] = rezSkip[farID] or {}
+                    rezSkip[farID][key] = now + 3000
+                    peer_bcast('/at_rezskip %s %d %d', key, farID, 3000)
+                end
+            end
+        end
+        if #skipped == 0 then rezdbg('no corpses in zone')
+        else rezdbg('nothing to rez | ' .. table.concat(skipped, ' | ')) end
+        return
+    end
 
     -- 2) REZZER = SLOT baton over rezOrder (name + clicky). I act when one of MY slots is the first not-out slot.
     --    A slot is 'out' if its owner skipped it, is dead/stale, or doesn't own that clicky. Default = wait (assume handled).
@@ -1855,17 +2172,53 @@ local function rez_tick()
         for _, sl in ipairs(rezOrder) do
             if sl.name:lower() == myName:lower() then
                 local key = myName:lower() .. ':' .. sl.clicky
-                rezSkip[tgtID] = rezSkip[tgtID] or {}; rezSkip[tgtID][key] = now + 8000
-                peer_bcast('/at_rezskip %s %d', key, tgtID)
+                rezSkip[tgtID] = rezSkip[tgtID] or {}; rezSkip[tgtID][key] = now + 3000
+                peer_bcast('/at_rezskip %s %d %d', key, tgtID, 3000)   -- re-sent each tick while true
             end
         end
         rezdbg(string.format('target %s(%d): I (%s) have no clicky; baton passes me', tgtName, tgtID, myName))
         return
     end
 
+    -- THE TANK HOLDS while anybody else could do it. The tank is the one who walks out to fetch a body,
+    -- so it is routinely the only character in range of a corpse the group is nowhere near - and the
+    -- baton, seeing everyone else skip on distance, hands it the cast. Dragging it back is the point;
+    -- rezzing it where it lies defeats that.
+    -- IN MY ZONE, not "alive": death auto-zones to bind here, so a corpse reports alive=1 and a dead
+    -- healer with a ready crown would look like a perfectly good rezzer. The zone is what separates
+    -- someone still in the fight from someone standing at their bind point waiting for this very rez.
+    if rez_rank(member_class(myName)) == 1 then
+        local other
+        for _, nm in ipairs(group_members()) do
+            if nm:lower() ~= myName:lower() and nm:lower() ~= tgtName:lower() then
+                local rr = rezReady[nm]
+                if rr and (rr.zone or 0) == myZone and rr.zone > 0
+                   and ((rez_peer_secs(rr, 'token') == 0) or (rez_peer_secs(rr, 'crown') == 0)) then
+                    other = nm; break
+                end
+            end
+        end
+        if other then
+            rezdbg(string.format('target %s(%d): I am the tank and %s is up in-zone with a clicky - holding',
+                                 tgtName, tgtID, other))
+            return
+        end
+    end
+
+    -- Respect my OWN skip. Passing the baton then immediately re-taking it is not passing: Lunafeet
+    -- fired, gave up, and fired again one second later, burning a second charge from the same spot the
+    -- first one failed at. If I have skipped this corpse for this clicky, I am out until it lapses.
+    do
+        local mine = rezSkip[tgtID] and rezSkip[tgtID][myName:lower() .. ':' .. myClicky]
+        if mine and now < mine then
+            rezdbg(string.format('target %s(%d): I passed on this one, waiting %dms', tgtName, tgtID, mine - now))
+            return
+        end
+    end
+
     -- am I cleared? every slot before mine must be out (skipped / owner dead-stale / doesn't own it). My own earlier
     -- (unusable) slots count as out since I know locally I can't use them.
-    local cleared = true
+    local cleared, blocker = true, nil
     for pos = 1, myPos - 1 do
         local sl = rezOrder[pos]
         local owner, clicky = sl.name, sl.clicky
@@ -1874,47 +2227,128 @@ local function rez_tick()
             local sk = rezSkip[tgtID] and rezSkip[tgtID][key]
             local skipped = sk and now < sk
             local rr = rezReady[owner]
-            local deadStale = rr and ((rr.alive == false) or (now - (rr.updated or 0)) >= 6000)
+            local deadStale = rr and ((rr.alive == false) or (now - (rr.updated or 0)) >= 30000)   -- keepalive is 20s
             -- 'out' if I have FRESH data showing the clicky isn't ready (cooldown or not owned). No data -> assume viable, wait.
-            local notReady = rr and ((clicky == 'token' and rr.token ~= 0) or (clicky == 'crown' and rr.crown ~= 0))
-            if not (skipped or deadStale or notReady) then cleared = false; break end   -- a ready/unknown slot ahead -> wait
+            local notReady = rr and (rez_peer_secs(rr, clicky) ~= 0)   -- counted down, not the raw report
+            if not (skipped or deadStale or notReady) then
+                -- NAME the slot we are waiting on. 'waiting my turn' alone is unfalsifiable: four toons
+                -- can all report it while each waits on a different one, and the log cannot tell you
+                -- whether the baton is working or a slot ahead has simply stopped participating.
+                cleared = false
+                blocker = string.format('slot%d %s(%s)%s', pos, owner, clicky,
+                                        rr and '' or ' [no report yet]')
+                break
+            end
         end
     end
-    local timedOut = (now - rezFirstSeen[tgtID]) >= (myPos - 1) * 2000
+    -- 600ms per slot, not 2000. This is only a fallback for a peer that has not spoken - every real
+    -- reason to pass (no clicky, out of range, cast failed, dead) now broadcasts an explicit skip. At a
+    -- 250ms tick, 600ms is two ticks of grace. Slot 9 waited 16 seconds under the old number.
+    local timedOut = (now - rezFirstSeen[tgtID]) >= (myPos - 1) * 600
     if not (cleared or timedOut) then
-        rezdbg(string.format('target %s(%d): waiting my turn [me:%s %s slot%d]', tgtName, tgtID, myName, myClicky, myPos))
+        rezdbg(string.format('target %s(%d): waiting my turn [me:%s %s slot%d] behind %s',
+                             tgtName, tgtID, myName, myClicky, myPos, blocker or '(timeout only)'))
         return
     end
     local item = (myClicky == 'token') and TOKEN_ITEM or CROWN_ITEM
     local pick = { name = myName, token = (myClicky == 'token') }
-    rezdbg(string.format('target %s(%d) <- ME %s(%s) slot%d', tgtName, tgtID, myName, myClicky, myPos))
-    -- CLAIM NOW (before the handshake) so others back off immediately instead of timing out into a dogpile.
-    peer_bcast('/at_rezclaim %d', tgtID)
+    rezdbg(string.format('target %s(%d) <- ME %s(%s) slot%d @%dm%s', tgtName, tgtID, myName, myClicky,
+                         myPos, tgtDist, tgtFar and ' (beyond reach - one attempt)' or ''))
+    -- CLAIM ONCE, not every tick. Re-broadcasting kept renewing a claim I could not act on: slot 12
+    -- claimed while it was the only one in range, then sat on the handshake for eight seconds while
+    -- slot 1 walked to 9m and got told 'claimed by another rezzer' every single tick.
+    if not (rezClaimAt[tgtID] and (now - rezClaimAt[tgtID]) < 2500) then
+        rezClaimAt[tgtID] = now
+        peer_bcast('/at_rezclaim %d %d', tgtID, 5000)   -- pre-cast: short, I may yet hand it back
+    end
 
     -- HANDSHAKE: don't cast until the target has zoned to its bind and settled (a too-early rez is wasted).
     -- Ping the target; it pongs only when at bind (valid zone, different from mine, not zoning). No pong -> keep waiting.
     local tkey = tgtName:lower()
-    if not (rezConfirm[tkey] and (now - rezConfirm[tkey]) < 2500) then
-        if (now - (rezPingAt[tkey] or 0)) > 700 then
+    -- The rez HEARTBEAT already answers this. Every toon broadcasts alive + zone every few seconds, so
+    -- a target that is alive, in a different zone from me, and reported recently is up at bind - which
+    -- is exactly what the handshake asks. Using it skips the round trip entirely and fires on the next
+    -- tick instead of the one after. The ping/pong stays for anyone whose heartbeat we have not got.
+    local trr = rezReady[tgtName]
+    local upFromBeat = trr and trr.alive and (trr.zone or 0) > 0 and trr.zone ~= myZone
+                       and (now - (trr.updated or 0)) < 30000
+    if upFromBeat then rezConfirm[tkey] = now end
+
+    -- 5s, not 2.5s. A readiness announced on release has to still count when a rezzer picks the target
+    -- a few seconds later, or the push is wasted and everyone falls back to asking.
+    if not (rezConfirm[tkey] and (now - rezConfirm[tkey]) < 5000) then
+        if (now - (rezPingAt[tkey] or 0)) > 250 then   -- match the fast tick; a lost ping cost 700ms
             rezPingAt[tkey] = now
             peer_cmdf(tgtName, '/at_rezrdy? %s %d', myName, myZone)
+        end
+        -- Say so if this is going nowhere. Waiting silently is indistinguishable from a bug, and both
+        -- real causes - target not running AdventureTime, target has not released - need a human.
+        rezWaitFrom[tkey] = rezWaitFrom[tkey] or now
+        -- LET GO. Three seconds on a handshake is long enough to know the target is not coming back
+        -- yet, and holding the claim past that blocks anyone better placed. Release it, skip my slot
+        -- briefly, and let the baton move; when the target does stand up, whoever is nearest takes it.
+        if (now - rezWaitFrom[tkey]) > 3000 then
+            rezWaitFrom[tkey] = nil
+            rezPending[tgtID] = nil
+            rezClaimAt[tgtID] = nil
+            rezFireAt[tgtID]  = nil   -- fresh jitter on the retry; the old one is spent
+            -- 750ms, not 2000. Releasing the CLAIM is the point - it lets anyone better placed step in.
+            -- Standing myself down for two seconds on top is pure cost when nobody better exists, which
+            -- is the common case: the target is simply still zoning and comes up a moment later, with
+            -- me having just benched myself.
+            local key = myName:lower() .. ':' .. myClicky
+            rezSkip[tgtID] = rezSkip[tgtID] or {}
+            rezSkip[tgtID][key] = now + 750
+            peer_bcast('/at_rezskip %s %d %d', key, tgtID, 750)
+            rezdbg(string.format('target %s(%d): no confirmation in 3s, releasing my claim', tgtName, tgtID))
+            return
+        end
+        if (now - rezWaitFrom[tkey]) > 15000 and (now - (rezWaitWarn[tkey] or 0)) > 30000 then
+            rezWaitWarn[tkey] = now
+            rezlog('\\ay[rez] %s has not confirmed in %ds - is it running AdventureTime, and has it released?\\ax',
+                   tgtName, math.floor((now - rezWaitFrom[tkey]) / 1000))
         end
         rezdbg(string.format('target %s(%d): waiting for bind handshake [me:%s]', tgtName, tgtID, myName))
         return
     end
 
+    -- Past the handshake and still not casting? SAY WHICH GATE. These three returned silently, so a
+    -- two-second hole between 'target <- ME' and 'FIRING' was indistinguishable from the script simply
+    -- not running - and there is no way to tell tuning from a bug without knowing which one held it.
+    local function blocked(why)
+        if (now - (rezGateAt[tgtID] or 0)) > 900 then
+            rezGateAt[tgtID] = now
+            rezdbg(string.format('target %s(%d): ready to fire but %s', tgtName, tgtID, why))
+        end
+    end
     -- anti-race jitter: stagger toons by a small random delay so two don't fire in the same tick.
-    if not rezFireAt[tgtID] then rezFireAt[tgtID] = now + math.random(0, 500) end
-    if now < rezFireAt[tgtID] then return end
-    if rezPending[tgtID] and now < rezPending[tgtID] then return end   -- someone else already claimed it in the meantime
-    if (now - lastRezFire) < 500 then return end
-    rezlog('[rez] FIRING /nowcast me "%s" %d (target %s)', item, tgtID, tgtName)
+    if not rezFireAt[tgtID] then rezFireAt[tgtID] = now + math.random(0, 150) end   -- claim already de-races this
+    if now < rezFireAt[tgtID] then
+        blocked(string.format('jitter, %dms left', rezFireAt[tgtID] - now)); return
+    end
+    if rezPending[tgtID] and now < rezPending[tgtID] then
+        blocked(string.format('someone else holds a claim, %dms left', rezPending[tgtID] - now)); return
+    end
+    if (now - lastRezFire) < 500 then
+        blocked(string.format('I fired %dms ago (500ms spacing)', now - lastRezFire)); return
+    end
+    -- Tell the TARGET a rez is on its way. Everything else that armed its accept-window is unreliable
+    -- on this server: the handshake ping is now skipped when the heartbeat already answers, and the
+    -- dead->alive transition never gets sampled because death IS a zone - the character is mid-zoning
+    -- when it would have been seen as dead, and alive again by the time zoning ends. The rezzer knows
+    -- for certain, so it says so.
+    pcall(function() peer_cmdf(tgtName, '/at_rezinc %s', myName) end)
+    rezlog('[rez] FIRING /nowcast me "%s" %d (target %s @%dm, reach %d)', item, tgtID, tgtName, tgtDist, rez_range())
     pcall(function() mq.cmdf('/nowcast me "%s" %d', item, tgtID) end)
     pcall(function() mq.cmdf('/gsay Clicked %s on %s', item, tgtName) end)   -- announce the rez in group chat
     lastRezFire = now
-    rezCast = { id = tgtID, item = item, at = now, tries = 1, name = tgtName }   -- wait for THIS to clear before the next
-    rezPending[tgtID] = now + 4000
-    peer_bcast('/at_rezclaim %d', tgtID)   -- CLAIM: everyone else skips this corpse
+    rezCast = { id = tgtID, item = item, at = now, tries = 1, name = tgtName, far = tgtFar }   -- wait for THIS to clear before the next
+    -- 15s, not 4s. The claim has to outlive the CAST, and the box can take eight seconds to appear when
+    -- the target is still zoning - which is exactly when someone dies. At 4s the claim lapsed mid-flight
+    -- and a second rezzer took the same corpse. A cast that genuinely fails releases this early via the
+    -- skip path, so the longer hold costs nothing when it is not needed.
+    rezPending[tgtID] = now + 15000
+    peer_bcast('/at_rezclaim %d %d', tgtID, 15000)   -- CAST IS OUT: hold it for the whole flight
     local msg = string.format('%s -> %s -> %s', myName, (pick.token and 'token' or 'crown'), tgtName)
     if SHOW_UI then rez_note(msg) elseif driverName then peer_cmdf(driverName, '/at_rezlog %s', msg) end
 end
@@ -1931,6 +2365,7 @@ pcall(function()
     mq.bind('/at_e3', function(mode) mq.cmd('/e3p ' .. (mode == 'on' and 'on' or 'off')) end)   -- pause/resume E3
     mq.bind('/at_xtank', function() set_tank_xtargets(false) end)   -- healer: set raid tanks on my XTargets
     mq.bind('/at_rezlog', function(...) rez_note(table.concat({...}, ' ')) end)   -- a rezzer reports its cast
+    mq.bind('/at_rezaccept', function(v) rezAccept = (v == 'on') end)
     mq.bind('/at_rezauto', function(mode) rezAuto = (mode == 'on'); rezlog('[rez] auto-rez %s', mode or '?') end)
     mq.bind('/at_coth', function(name, em, dist, los)
         if name then COTH.state[name] = { emblem = tonumber(em) or -1, dist = tonumber(dist) or -1,
@@ -1940,6 +2375,7 @@ pcall(function()
     mq.bind('/at_cothfail', function(name) if name then COTH.claims[name] = nil end end)
     -- User-facing: /atcoth [on|off|stop]. No arg = start. Registered on every toon, so the gather can
     -- be kicked off from whichever one you happen to be looking at rather than only from the driver.
+    mq.bind('/atsync', function() resync_group() end)
     mq.bind('/atcoth', function(mode)
         local m = tostring(mode or ''):lower()
         if m == 'off' or m == 'stop' then coth_set(false) else coth_set(true) end
@@ -2002,6 +2438,35 @@ pcall(function()
                                  aas = aas, updated = mq.gettime() }
     end)
     mq.bind('/at_mgbclick', function(key) mgb_click(key) end)
+    mq.bind('/at_rezwindows', function()   -- confirmation window names differ by build; check, do not assume
+        for _, w in ipairs({ 'ConfirmationDialogBox', 'LargeDialogWindow', 'RespawnWnd',
+                             'ConfirmDialog', 'MessageBoxWnd', 'AlertWnd', 'YesNoWnd',
+                             'RezConfirmationWnd', 'ResurrectWnd' }) do
+            local open, raw = win_open(w)
+            local kids = {}
+            for _, c in ipairs({ 'CD_Yes_Button', 'Yes_Button', 'LDW_YesButton', 'LDW_OkButton',
+                                 'CD_OK_Button', 'OK_Button' }) do
+                local id = 0
+                pcall(function() id = tonumber(mq.TLO.Window(w).Child(c).ID()) or 0 end)
+                if id > 0 then kids[#kids + 1] = c end
+            end
+            log('[rezwin] %-24s Open=%-6s -> %s%s', w, raw, open and 'OPEN' or 'shut',
+                (#kids > 0) and ('  buttons: ' .. table.concat(kids, ', ')) or '')
+        end
+        log('[rezwin] auto-accept %s, expecting-a-rez window %s', rezAccept and 'ON' or 'OFF',
+            (mq.gettime() < rezExpectUntil) and 'OPEN' or 'closed')
+    end)
+    mq.bind('/at_rezprobe', function()   -- what do the rez clickies actually report for range?
+        for _, it in ipairs({ CROWN_ITEM, TOKEN_ITEM }) do
+            local id, myr, r, nm = 0, -1, -1, ''
+            pcall(function() id  = tonumber(mq.TLO.FindItem('=' .. it).ID()) or 0 end)
+            pcall(function() nm  = tostring(mq.TLO.FindItem('=' .. it).Spell.Name() or '') end)
+            pcall(function() myr = tonumber(mq.TLO.FindItem('=' .. it).Spell.MyRange()) or -1 end)
+            pcall(function() r   = tonumber(mq.TLO.FindItem('=' .. it).Spell.Range()) or -1 end)
+            log('[rezprobe] %s | id=%d spell="%s" MyRange=%s Range=%s', it, id, nm, tostring(myr), tostring(r))
+        end
+        log('[rezprobe] gate currently using %d', rez_range())
+    end)
     mq.bind('/at_cureprobe', function()   -- diagnostic: what does each cure source resolve to on me?
         for _, e in ipairs(CURE_CLICKS) do
             local itemID, rank, rdy, secs, spellID = 0, 0, false, -1, 0
@@ -2015,6 +2480,31 @@ pcall(function()
                 e.name, itemID, rank, tostring(rdy), tostring(secs), spellID,
                 have == 1 and 'MINE (button shown)' or 'not mine')
         end
+    end)
+    mq.bind('/at_magic', function(key) magic_click(key) end)
+    mq.bind('/at_magicprobe', function()   -- what does each magic entry resolve to on me?
+        for _, e in ipairs(MAGIC_CLICKS) do
+            local have, secs, up, dsecs = magic_state(e)
+            if e.spell then
+                local gem, rdy = 0, '?'
+                pcall(function() gem = tonumber(mq.TLO.Me.Gem(e.spell)()) or 0 end)
+                pcall(function() rdy = tostring(mq.TLO.Me.SpellReady(e.spell)()) end)
+                log('[magicprobe] %s (song) | gem=%d ready=%s -> %s', e.spell, gem, rdy,
+                    have == 1 and 'MINE' or 'not memmed')
+            else
+                local id = 0
+                pcall(function() id = tonumber(mq.TLO.FindItem('=' .. e.name).ID()) or 0 end)
+                log('[magicprobe] %s (item) | id=%d -> %s', e.name, id, have == 1 and 'MINE' or 'not carried')
+            end
+            if have == 1 then log('   secs=%d running=%d left=%d', secs, up, dsecs) end
+        end
+    end)
+    mq.bind('/at_magicstate', function(char, key, have, secs, up, dsecs)
+        if not char or not key then return end
+        magicState[char] = magicState[char] or {}
+        magicState[char][key] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
+                                  up = tonumber(up) or 0, dsecs = tonumber(dsecs) or 0,
+                                  updated = mq.gettime() }
     end)
     mq.bind('/at_cure', function(key) cure_click(key) end)
     mq.bind('/at_curestate', function(char, key, have, secs)
@@ -2038,7 +2528,14 @@ pcall(function()
     end)
     mq.bind('/at_difired', function() DI.firedAt = mq.gettime(); DI.trigAt = 0 end)
     mq.bind('/at_rezready', function(char, cr, tk, al, zone) if char then rezReady[char] = { crown = tonumber(cr) or -1, token = tonumber(tk) or -1, alive = (tonumber(al) == 1), zone = tonumber(zone) or 0, updated = mq.gettime() } end end)
-    mq.bind('/at_rezdone', function(name) if name then rezDone[name:lower()] = mq.gettime() + 15000 end end)   -- that toon has a rez pending; stop targeting its corpse
+    mq.bind('/at_rezdone', function(name)
+        if not name then return end
+        rezDone[name:lower()] = mq.gettime() + 15000
+        -- Retire the corpse ITSELF, not just the name behind a timeout. Resolve it here while we still
+        -- know which body this was about; that id stays retired for the session.
+        local id = rez_corpse(name)
+        if id and id > 0 then rezCorpseDone[id] = true end
+    end)
     mq.bind('/at_rezorder?', function(who)   -- a worker just came up and wants the current order
         if not SHOW_UI or not who then return end
         if #rezOrder == 0 then load_rez_order() end
@@ -2056,17 +2553,50 @@ pcall(function()
         end
         if #ord > 0 then rezOrder = ord; save_rez_order(); rezlog('[rez] adopted shared rezzer order (%d slots)', #ord) end
     end)
-    mq.bind('/at_rezclaim', function(id) local n = tonumber(id); if n then rezPending[n] = mq.gettime() + 4000 end end)   -- a rezzer claimed this corpse
+    -- The SENDER says how long. This hardcoded 4000, so raising the firer's own hold to 15s did
+    -- nothing for anyone else: the group released the corpse four seconds in and a second rezzer took
+    -- it mid-cast. A pre-cast claim is worth a few seconds; a claim made after actually casting has to
+    -- outlive the whole cast, and the box can take eight seconds when the target is still zoning.
+    mq.bind('/at_rezclaim', function(id, ms)
+        local n = tonumber(id)
+        if n then rezPending[n] = mq.gettime() + (tonumber(ms) or 4000) end
+    end)
     mq.bind('/at_rezrdy?', function(rezzer, rzone)   -- a rezzer asks: are you at bind, ready for a rez?
         if not rezzer then return end
         local zoning = false; pcall(function() zoning = (mq.TLO.Me.Zoning() == true) end)
         local myz = 0; pcall(function() myz = tonumber(mq.TLO.Zone.ID()) or 0 end)
-        if (not zoning) and myz > 0 and myz ~= (tonumber(rzone) or -1) then   -- settled at bind (diff zone) -> ready
+        local dead = true; pcall(function() dead = (mq.TLO.Me.Dead() == true) end)
+        -- "Am I up and away from my corpse?" A DIFFERENT ZONE used to be the only proof, which is a
+        -- proxy for "released to bind" - and it never becomes true for anyone whose bind is in the zone
+        -- they died in. They sat unrezzable forever with the rezzer stuck on the handshake. Being alive
+        -- answers the real question directly, whatever the bind point is.
+        if (not zoning) and myz > 0 and ((not dead) or myz ~= (tonumber(rzone) or -1)) then
             peer_cmdf(rezzer, '/at_rezrdy! %s', myName)
+            -- A rez is now genuinely on its way to me. Only inside this window will the confirmation
+            -- box get clicked automatically - a blanket "click any Yes button" would happily accept
+            -- whatever else the game decided to ask.
+            rezExpectFrom  = mq.gettime()
+            rezExpectUntil = mq.gettime() + 15000
         end
     end)
+    mq.bind('/at_rezinc', function(from)   -- a rezzer is casting on me right now: arm the accept window
+        rezExpectFrom  = mq.gettime()
+        rezExpectUntil = mq.gettime() + 20000
+        rezlog('[rez] %s is rezzing me - watching for the confirmation box', tostring(from or '?'))
+    end)
     mq.bind('/at_rezrdy!', function(tname) if tname then rezConfirm[tname:lower()] = mq.gettime() end end)   -- target confirmed ready
-    mq.bind('/at_rezskip', function(key, id) local n = tonumber(id); if key and n then rezSkip[n] = rezSkip[n] or {}; rezSkip[n][key:lower()] = mq.gettime() + 8000; rezPending[n] = nil end end)   -- a slot can't rez this corpse; release its claim
+    -- The SENDER decides how long its skip is good for. This used to hardcode 8s, so a toon that skipped
+    -- because it was 250 units away - and then walked to 150 - stayed 'out' in everyone else's table for
+    -- eight seconds after it was able again. Distance skips are worth 3s, a failed cast 5s, no-clicky 8s.
+    -- Missing duration = 8000, so a peer on an older build still behaves as before.
+    mq.bind('/at_rezskip', function(key, id, ms)
+        local n = tonumber(id)
+        if key and n then
+            rezSkip[n] = rezSkip[n] or {}
+            rezSkip[n][key:lower()] = mq.gettime() + (tonumber(ms) or 8000)
+            rezPending[n] = nil
+        end
+    end)
     mq.bind('/at_burn', function(char, class, tier, secs, active, dsecs, kind, ord, tkey, ...)   -- driver receives a worker's item-timer report
         if not char then return end
         local item = table.concat({...}, ' ')
@@ -2091,6 +2621,14 @@ pcall(function()
     mq.event('at_raid_removed','#1# has been removed from the raid#*#', raid_changed)
     mq.event('at_raid_dispand','#*#raid has been disbanded#*#',     raid_changed)
     mq.bind('/at_pong', function(peer) if peer then alive[peer:lower()] = true end end)
+    mq.bind('/at_resync', function()   -- driver says the group changed: re-report EVERYTHING
+        burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}
+        potLast = {}; healLast = {}; cureLast = {}
+        lastBurnPoll = 0          -- poll on the next tick rather than waiting out the 2s
+        burnStartAt = 0           -- and skip the startup settle: the driver is waiting on us now
+        lastBurnResync = mq.gettime()
+        log('[sync] re-reporting everything at the driver request')
+    end)
     mq.bind('/at_burnrefresh', function()   -- re-parse my [Burn] INI and re-report every item from scratch
         local fresh = parse_burns()
         if fresh and #fresh > 0 then BURN_WATCH = fresh end
@@ -2449,7 +2987,8 @@ end
 -- ---------------------------------------------------------------------------
 local uiStatus  = ''
 local tributeRows = {}   -- { {name=, active=bool, favor=number}, ... } filled by refresh_tribute()
-local miniMode        = false   -- compact window when minimized
+miniMode        = false   -- compact window when minimized. NOT local: save_settings is defined
+                          -- further up the file and would otherwise write a same-named global.
 -- NOT local: save_settings/load_settings are defined further up the file, so a local declared here
 -- is invisible to them - they would read and write a same-named GLOBAL while the UI used the local,
 -- and the setting would silently never persist. rezAuto, showSec and DI are globals for this reason.
@@ -2461,6 +3000,26 @@ miniPots        = false   -- show the group draught buttons in the mini window
 miniClicks      = false   -- show the per-class MGB/group click buttons in the mini window
 miniCombos      = false   -- show the combo buttons in the mini window
 miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the mini window
+miniMagic       = false   -- show the magic protection clicky buttons in the mini window
+miniBurnTable   = false   -- burns section: false = dot matrix, true = the full detail table
+-- Who appears first, left to right. Separate from rezPriority on purpose: that is who gets RESSED
+-- first, which is a different question from who you want to read first. Empty = plain group order.
+charOrder       = {}
+miniBurnFilter  = 'All'   -- the mini burn view's own role filter, independent of the Burns tab
+miniSizeWanted  = false   -- one-shot: resize the mini window next frame (set when detail turns on)
+miniSizedOnce   = false   -- has the detail view been sized yet this session?
+-- Width the detail table actually needs: a column per reporting character at 250, plus room for the
+-- row labels and the window chrome. Clamped so it never asks for more than a sane screen width.
+function mini_table_size()
+    local n = 0
+    for _, c in ipairs(ordered_members()) do
+        if burnState[c] and (miniBurnFilter == 'All' or role_of(burnClass[c]) == miniBurnFilter) then
+            n = n + 1
+        end
+    end
+    if n < 1 then n = 1 end
+    return math.min(1800, n * 300 + 60), 620   -- 300: comfortable, under the 400 ceiling
+end
 miniCoth        = false   -- show the CoTH Group button in the mini window
 -- GLOBAL, not local: this chunk is at Lua's hard 200-local ceiling and one more would stop it
 -- compiling. One table holds every section toggle rather than a local per setting.
@@ -2684,8 +3243,8 @@ end
 -- UI
 -- ---------------------------------------------------------------------------
 local function display_name(it)
-    -- strip "Draught of " and the trailing tier (the group header carries I/II)
-    local n = it:gsub('^Draught of ', '')
+    -- strip "Draught of ", a leading article, and the trailing tier (the group header carries I/II)
+    local n = it:gsub('^Draught of ', ''):gsub('^the ', '')
     return (n:gsub(' II?$', ''))
 end
 
@@ -2702,20 +3261,25 @@ for _, base in ipairs(DRAUGHTS) do
     LIST_II[#LIST_II + 1] = base .. ' II'
 end
 
-local function short_name(n) return (n:sub(1, 5)) end
+local function short_name(n) return (n:sub(1, 7)) end   -- 7: 'Sunetoo' fits, 5 gave 'Sunet'
 
 local function render_group(label, color, items)
     if label then ImGui.TextColored(color[1], color[2], color[3], 1.0, label) end
-    local pushed = false
+    -- A COUNT, not a flag. pop_state_button pops n colours, and a boolean here short-circuits to a
+    -- no-op - which would leave this table-border push on the stack every frame.
+    local pushed = 0
     if ImGuiCol and ImGuiCol.TableBorderStrong then
-        ImGui.PushStyleColor(ImGuiCol.TableBorderStrong, color[1], color[2], color[3], 0.75); pushed = true
+        local ok = pcall(function()
+            ImGui.PushStyleColor(ImGuiCol.TableBorderStrong, color[1], color[2], color[3], 0.75)
+        end)
+        if ok then pushed = 1 end
     end
     local statusOn = #statusNames > 0   -- shown by default once counts are read
     local nCols = statusOn and (2 + #statusNames) or 2   -- name + [one per toon] + target
-    if ImGui.BeginTable('##grp_' .. (label or items[1]), nCols, (ImGuiTableFlags.BordersOuter or 0) + (ImGuiTableFlags.SizingStretchProp or 0)) then
-        ImGui.TableSetupColumn('##n', ImGuiTableColumnFlags.WidthStretch or 0)
+    if ImGui.BeginTable('##grp_' .. (label or items[1]), nCols, (ImGuiTableFlags.BordersOuter or 0) + (ImGuiTableFlags.SizingFixedFit or 0)) then
+        ImGui.TableSetupColumn('##n', ImGuiTableColumnFlags.WidthFixed or 0, 150)
         if statusOn then
-            for _, nm in ipairs(statusNames) do ImGui.TableSetupColumn(short_name(nm), ImGuiTableColumnFlags.WidthFixed or 0, 42) end
+            for _, nm in ipairs(statusNames) do ImGui.TableSetupColumn(short_name(nm), ImGuiTableColumnFlags.WidthFixed or 0, 56) end
         end
         ImGui.TableSetupColumn('##e', ImGuiTableColumnFlags.WidthFixed or 0, 60)
         if statusOn then ImGui.TableHeadersRow() end
@@ -2728,10 +3292,20 @@ local function render_group(label, color, items)
                 local tgt = target[it] or 0
                 for _, nm in ipairs(statusNames) do
                     ImGui.TableNextColumn()
-                    local c = (statusCounts[nm:lower()] and statusCounts[nm:lower()].__class) or ''
-                    local n = (statusCounts[nm:lower()] and statusCounts[nm:lower()][it]) or 0
+                    local sc = statusCounts[nm:lower()]
+                    local c  = (sc and sc.__class) or ''
+                    local n  = (sc and sc[it]) or 0
                     local ck = class_key(c)
-                    if ck and ((is_endurance(it) and not WANTS_ENDURANCE[ck]) or (is_mana(it) and not WANTS_MANA[ck])) then
+                    -- '?' not '0'. A count that timed out is UNKNOWN, and showing it as a red zero says
+                    -- "this toon has none" - the exact confusion that had 50 emeralds handed to people
+                    -- already carrying them. The planner already refuses to act on these; the grid you
+                    -- read while deciding should say the same thing.
+                    if sc and sc.__unknown and sc.__unknown[it] then
+                        ImGui.TextColored(0.95, 0.85, 0.30, 1.0, '?')
+                        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                            pcall(function() ImGui.SetTooltip(nm .. ': count timed out - skipped by Give out') end)
+                        end
+                    elseif ck and ((is_endurance(it) and not WANTS_ENDURANCE[ck]) or (is_mana(it) and not WANTS_MANA[ck])) then
                         ImGui.TextDisabled(tostring(n))   -- holds this many but won't use them (grey = not needed)
                     elseif n >= tgt then
                         ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(n))
@@ -2748,7 +3322,7 @@ local function render_group(label, color, items)
         end
         ImGui.EndTable()
     end
-    if pushed then ImGui.PopStyleColor() end
+    pop_state_button(pushed)
     ImGui.Spacing()
 end
 
@@ -2760,6 +3334,18 @@ end
 
 -- Query each group member's tribute over DanNet (self read directly). CurrentFavor = current favor points;
 -- TributeActive = whether tribute is toggled on. Runs from the loop (not render) so the /dquery waits yield.
+-- What a peer's staff timer reads RIGHT NOW, counted down from when they sent it. This is why the DI
+-- beat had to run every six seconds: the hold compared the raw number, so a report of "90" still said
+-- 90 a minute later. Counting down here means the beat only has to carry CHANGES.
+function di_peer_staff(st)
+    if not st then return nil end
+    local base = st.staff
+    if base == nil or base < 0 then return base end
+    if base == 0 then return 0 end
+    local left = base - math.floor((mq.gettime() - (st.updated or 0)) / 1000)
+    return (left > 0) and left or 0
+end
+
 -- Rebuild the display rows from pushed peer state (+ my own live read). Pure local work - no waiting.
 local function rebuild_tribute_rows()
     local rows = {}
@@ -3110,7 +3696,6 @@ local function save_combos()
 end
 
 local function load_combos()
-mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale settings file
     local cfg = ''
     pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
     COMBO_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_combos.txt')) or 'adventuretime_combos.txt'
@@ -3156,6 +3741,83 @@ end
 -- or the item gets a button, whatever they are. ability_state already resolves item-or-AA, so adding
 -- another cure source is one line here and nothing else changes.
 -- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- Magic protection clickies. Same ownership-driven shape as the cures - a button appears only for a
+-- toon that is actually carrying the item, and vanishes when they are not - but these confer a BUFF,
+-- so they also report whether it is currently running. Adding another is one line.
+-- ---------------------------------------------------------------------------
+-- group = the row it appears under; entries sharing a group share a row, so several ways of getting
+-- the same effect read as one thing with several buttons rather than a stack of near-identical rows.
+-- Defaults to the label, so an entry that is the only one of its kind needs no group at all.
+-- short = only used to tell two sources apart when ONE toon has both.
+MAGIC_CLICKS = {
+    { key = 'illusionist', label = 'Illusionist Shoes', name = "Forsaken Illusionist's Shoes" },
+    { key = 'jaundiced',   label = 'Jaundiced Boots',   name = 'Forsaken Jaundiced Bone Boots' },
+    { key = 'echoes',      label = 'Rune of Echoes',    group = 'Echoes', short = 'rune',
+      name = 'Imbued Rune of Echoes' },
+    -- spell = ... rather than name = ...: this one is a SONG, so "do you have it" means memmed in a
+    -- gem, not sitting in a bag. Un-memmed and the button simply is not drawn.
+    { key = 'echopast',    label = 'Echoes of the Past', group = 'Echoes', short = 'song',
+      spell = 'Echoes of the Past' },
+}
+magicState = {}   -- driver: magicState[char][key] = { have, secs, up, dsecs, updated }
+magicLast  = {}   -- worker: last-pushed key per item
+
+function magic_source(key)
+    for _, e in ipairs(MAGIC_CLICKS) do if e.key == key then return e end end
+    return nil
+end
+
+-- have / recast-remaining / is-it-running / how-much-is-left, for an ITEM or a SPELL.
+-- Ownership is deliberately concrete in both cases - the item in my inventory, or the song memmed in a
+-- gem - and never routed through ability_state, which falls through to a global Spell[] lookup and
+-- would cheerfully report that everyone owns everything.
+function magic_state(e)
+    if e.spell then
+        local gem = 0
+        pcall(function() gem = tonumber(mq.TLO.Me.Gem(e.spell)()) or 0 end)
+        if gem <= 0 then return 0, -1, 0, 0 end        -- not memmed: draw nothing
+        local rdy = false
+        pcall(function()
+            local v = mq.TLO.Me.SpellReady(e.spell)()
+            rdy = (v == true) or (tostring(v):upper() == 'TRUE')
+        end)
+        local secs = 0
+        if not rdy then
+            pcall(function() secs = math.floor(tonumber(mq.TLO.Me.GemTimer(e.spell).TotalSeconds()) or 0) end)
+            if secs <= 0 then secs = 1 end             -- not ready but no timer: show as cooling, not ready
+        end
+        local rem = 0
+        pcall(function() rem = tonumber(mq.TLO.Me.Song(e.spell).Duration.TotalSeconds()) or 0 end)
+        if rem <= 0 then pcall(function() rem = tonumber(mq.TLO.Me.Buff(e.spell).Duration.TotalSeconds()) or 0 end) end
+        return 1, secs, (rem > 0) and 1 or 0, math.floor(rem or 0)
+    end
+
+    local itemID = 0
+    pcall(function() itemID = tonumber(mq.TLO.FindItem('=' .. e.name).ID()) or 0 end)
+    if itemID <= 0 then return 0, -1, 0, 0 end
+    local t = 0
+    pcall(function() t = tonumber(mq.TLO.FindItem('=' .. e.name).TimerReady()) or 0 end)
+    local bn, rem = '', 0
+    pcall(function() bn = tostring(mq.TLO.FindItem('=' .. e.name).Spell.Name() or '') end)
+    if bn ~= '' and bn ~= 'NULL' then
+        pcall(function() rem = tonumber(mq.TLO.Me.Buff(bn).Duration.TotalSeconds()) or 0 end)
+        if rem <= 0 then pcall(function() rem = tonumber(mq.TLO.Me.Song(bn).Duration.TotalSeconds()) or 0 end) end
+    end
+    return 1, (t > 0) and math.floor(t) or 0, (rem > 0) and 1 or 0, math.floor(rem or 0)
+end
+
+function magic_click(key)
+    local e = magic_source(key)
+    if not e then return end
+    if e.spell then
+        pcall(function() mq.cmdf('/nowcast %s "%s"', myName, e.spell) end)
+    else
+        pcall(function() mq.cmdf('/nowcast %s "%s/CastType|Item"', myName, e.name) end)
+    end
+    log('[magic] %s', e.label)
+end
+
 CURE_CLICKS = {
     { key = 'radiant', label = 'Radiant Cure',   name = 'Radiant Cure' },
     { key = 'band',    label = 'Cleansing Band', name = 'Cleansing Band of Twilight' },
@@ -3209,6 +3871,93 @@ end
 -- Mini: cures, grouped by source with one button per OWNER. Only characters that actually hold the
 -- AA or the item get a button, so the row stays short - a source nobody has draws nothing at all.
 -- Button label is just the character name; the source is named once at the head of its row.
+-- Mini: magic protection, one row per GROUP with a button per owner across every source in it.
+-- Colour is the three states that matter here - CYAN the buff is up, GREEN you can click it, RED it is
+-- cooling - rather than the graded ramp the cures use, because there is nothing to weigh up between.
+-- Colour the WHOLE button, not just its label. ImGui's default button fill is a mid blue, and putting
+-- a red or green label on top of it fights for legibility - red on blue worst of all. A dark tint of
+-- the state colour lets the label sit at full strength and the button reads at a glance.
+function push_state_button(cr, cg, cb)
+    local n = 0
+    if not (ImGui.PushStyleColor and ImGuiCol) then return 0 end
+    local function try(slot, r, g, b)
+        if slot then
+            local ok = pcall(function() ImGui.PushStyleColor(slot, r, g, b, 1.0) end)
+            if ok then n = n + 1 end
+        end
+    end
+    try(ImGuiCol.Button,        cr * 0.22, cg * 0.22, cb * 0.22)
+    try(ImGuiCol.ButtonHovered, cr * 0.38, cg * 0.38, cb * 0.38)
+    try(ImGuiCol.ButtonActive,  cr * 0.55, cg * 0.55, cb * 0.55)
+    try(ImGuiCol.Text,          cr,        cg,        cb)
+    return n
+end
+function pop_state_button(n)
+    if n and n > 0 then pcall(function() ImGui.PopStyleColor(n) end) end
+end
+
+function draw_magic_buttons()
+    local order, byGroup = {}, {}
+    for _, e in ipairs(MAGIC_CLICKS) do
+        local g = e.group or e.label
+        if not byGroup[g] then byGroup[g] = {}; order[#order + 1] = g end
+        table.insert(byGroup[g], e)
+    end
+
+    local drewAny = false
+    for _, g in ipairs(order) do
+        -- Collect every (source, owner) pair in this group first, so we know whether one toon holds
+        -- two of them and its buttons need telling apart.
+        local btns, perName = {}, {}
+        for _, e in ipairs(byGroup[g]) do
+            for _, nm in ipairs(group_members()) do
+                local st = (magicState[nm] or {})[e.key]
+                if st and st.have == 1 then
+                    btns[#btns + 1] = { nm = nm, e = e, st = st }
+                    perName[nm] = (perName[nm] or 0) + 1
+                end
+            end
+        end
+        if #btns > 0 then
+            drewAny = true
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, g)
+            for bi, b in ipairs(btns) do
+                ImGui.SameLine()
+                local age  = math.floor((mq.gettime() - (b.st.updated or 0)) / 1000)
+                local left = math.max(0, (b.st.dsecs or 0) - age)
+                local r    = b.st.secs or -1
+                if r > 0 then r = math.max(0, r - age) end
+                local cr, cg, cb, tip
+                if b.st.up == 1 and left > 0 then
+                    cr, cg, cb = 0.35, 0.90, 1.00
+                    tip = string.format('running, %d:%02d left', math.floor(left / 60), left % 60)
+                elseif r <= 0 then
+                    cr, cg, cb = 0.36, 0.80, 0.46
+                    tip = 'ready'
+                else
+                    cr, cg, cb = 0.85, 0.35, 0.35
+                    tip = string.format('cooling, %d:%02d', math.floor(r / 60), r % 60)
+                end
+                local face = b.nm
+                if (perName[b.nm] or 0) > 1 then face = b.nm .. ' ' .. (b.e.short or b.e.key) end
+                local pushed = push_state_button(cr, cg, cb)
+                if ImGui.SmallButton(face .. '##at_magic_' .. b.e.key .. '_' .. b.nm) then
+                    if b.nm:lower() == myName:lower() then magic_click(b.e.key)
+                    else peer_cmdf(b.nm, '/at_magic %s', b.e.key) end
+                end
+                pop_state_button(pushed)
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function()
+                        ImGui.SetTooltip(string.format('%s - %s\n  %s', b.nm, b.e.label, tip))
+                    end)
+                end
+                if bi == #btns then ImGui.Spacing() end
+            end
+        end
+    end
+    if not drewAny then ImGui.TextDisabled('nobody is carrying a magic protection clicky') end
+end
+
 function draw_cure_buttons()
     local drewAny = false
     for _, e in ipairs(CURE_CLICKS) do
@@ -3229,15 +3978,12 @@ function draw_cure_buttons()
                 elseif r < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
                 elseif r < 300 then     cr, cg, cb = 0.95, 0.62, 0.25
                 else                    cr, cg, cb = 0.85, 0.35, 0.35 end
-                local pushed = false
-                if ImGuiCol and ImGuiCol.Text then
-                    ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
-                end
+                local pushed = push_state_button(cr, cg, cb)
                 if ImGui.SmallButton(o.nm .. '##at_cure_' .. e.key .. '_' .. o.nm) then
                     if o.nm:lower() == myName:lower() then cure_click(e.key)
                     else peer_cmdf(o.nm, '/at_cure %s', e.key) end
                 end
-                if pushed then ImGui.PopStyleColor() end
+                pop_state_button(pushed)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     pcall(function()
                         ImGui.SetTooltip(string.format('%s - %s\n  %s', o.nm, e.label,
@@ -3281,9 +4027,13 @@ local function draw_rez_mini()
 end
 
 local function draw_burn_dots()
+    -- Same order as everywhere else. This built its list from pairs(burnState) and sorted it
+    -- alphabetically, so the mini matrix read in a different order from the table right next to it -
+    -- and could still show someone who had left the group.
     local chars = {}
-    for c, _ in pairs(burnState) do chars[#chars + 1] = c end
-    table.sort(chars)
+    for _, c in ipairs(ordered_members()) do
+        if burnState[c] then chars[#chars + 1] = c end
+    end
     if #chars == 0 then ImGui.TextDisabled('no burn reports yet'); return end
     -- A TABLE, so every tier starts at the same x for every character - a tier with nothing in it
     -- shows as an empty cell rather than shifting everything after it leftwards.
@@ -3351,6 +4101,19 @@ function draw_rez_tab()
                if prev ~= rezAuto then
                    save_settings()
                    for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_rezauto %s', rezAuto and 'on' or 'off') end end
+               end
+            end
+            do local prevA = rezAccept
+               rezAccept = ImGui.Checkbox('Auto-accept the rez box', rezAccept)
+               if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                   pcall(function() ImGui.SetTooltip(
+                       'Clicks the confirmation for you, but only in the 15s after answering a rez\n' ..
+                       'handshake - so it never accepts some other dialog. Without it the corpse stays\n' ..
+                       'up until a human clicks, and the picker may spend a second clicky on it.') end)
+               end
+               if prevA ~= rezAccept then
+                   save_settings()
+                   for _, nm in ipairs(group_members()) do if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_rezaccept %s', rezAccept and 'on' or 'off') end end
                end
             end
             if rezAuto then ImGui.TextColored(0.55,0.70,0.80,1.0, 'picker: ' .. (rezDebug ~= '' and rezDebug or '(evaluating...)')) end
@@ -3527,12 +4290,9 @@ function draw_combo_buttons()
             elseif worst == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
             elseif worst == 'unknown' then cr, cg, cb = 0.55, 0.55, 0.55
             else                        cr, cg, cb = 0.36, 0.80, 0.46 end
-            local pushed = false
-            if ImGuiCol and ImGuiCol.Text then
-                ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
-            end
+            local pushed = push_state_button(cr, cg, cb)
             if ImGui.SmallButton(combo_label(c) .. '##at_combo_' .. ci) and present > 0 then combo_fire(c) end
-            if pushed then ImGui.PopStyleColor() end
+            pop_state_button(pushed)
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 local lines = { combo_label(c) }
                 for _, r in ipairs(rows) do lines[#lines + 1] = '  ' .. r end
@@ -3564,15 +4324,12 @@ function draw_mgb_buttons()
                 if state == 'unknown'  then cr, cg, cb = 0.55, 0.55, 0.55
                 elseif state == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
                 else                        cr, cg, cb = 0.36, 0.80, 0.46 end
-                local pushed = false
-                if ImGuiCol and ImGuiCol.Text then
-                    ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
-                end
+                local pushed = push_state_button(cr, cg, cb)
                 if ImGui.SmallButton(label .. '##at_mgb_' .. nm .. '_' .. e.key) then
                     if nm:lower() == myName:lower() then mgb_click(e.key)
                     else peer_cmdf(nm, '/at_mgbclick %s', e.key) end
                 end
-                if pushed then ImGui.PopStyleColor() end
+                pop_state_button(pushed)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     local lines = { string.format('%s  (%s)', nm, raiding and 'raid: MGB + announce' or 'group only') }
                     for _, r in ipairs(rows) do lines[#lines + 1] = '  ' .. r end
@@ -3597,12 +4354,9 @@ function draw_pot_buttons()
         elseif worst < 300 then                cr, cg, cb = 0.95, 0.62, 0.25   -- orange
         else                                   cr, cg, cb = 0.85, 0.35, 0.35   -- red: a long way out
         end
-        local pushed = false
-        if ImGuiCol and ImGuiCol.Text then
-            ImGui.PushStyleColor(ImGuiCol.Text, cr, cg, cb, 1.0); pushed = true
-        end
+        local pushed = push_state_button(cr, cg, cb)
         if ImGui.SmallButton(p.label .. '##at_pot_' .. p.key) then group_pot(p.key) end
-        if pushed then ImGui.PopStyleColor() end
+        pop_state_button(pushed)
         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
             local lines = { string.format('%s  %d/%d up, %d/%d can click', p.label, upN, total, readyN, total) }
             for _, r in ipairs(rows) do lines[#lines + 1] = '  ' .. r end
@@ -3626,15 +4380,47 @@ end
 -- Mini section registry. Order lives in ONE list so it can be reordered in Settings and saved, rather
 -- than being baked into the render function - which meant every layout change was a code change.
 -- Tribute is not here: it is the mini window's whole identity and stays pinned at the top.
+-- get/set CLOSURES, not a _G lookup by name. MQ gives each Lua script its own environment, so _G is
+-- NOT this chunk's globals: the checkbox wrote _G.miniPots while save_settings read the real miniPots,
+-- two different variables. It looked fine in-session (the checkbox and the render loop agreed with
+-- each other) and saved nothing, which is a horrible way to fail. Closures capture the actual upvalue.
 MINI_SECTIONS = {
-    { key = 'rez',    label = 'Rez',                    flag = 'miniRez',    draw = draw_rez_mini     },
-    { key = 'di',     label = 'DI staff',               flag = 'miniDI',     draw = draw_di_mini      },
-    { key = 'burns',  label = 'Burns',                  flag = 'miniBurns',  draw = draw_burn_dots    },
-    { key = 'pots',   label = 'Group draught buttons',  flag = 'miniPots',   draw = draw_pot_buttons  },
-    { key = 'mgb',    label = 'Class MGB buttons',      flag = 'miniClicks', draw = draw_mgb_buttons  },
-    { key = 'combos', label = 'Combo buttons',          flag = 'miniCombos', draw = draw_combo_buttons},
-    { key = 'cures',  label = 'Cure buttons',           flag = 'miniCures',  draw = draw_cure_buttons },
-    { key = 'coth',   label = 'CoTH Group button',      flag = 'miniCoth',   draw = draw_coth_mini    },
+    { key = 'rez',    label = 'Rez',                   draw = draw_rez_mini,
+      get = function() return miniRez end,    set = function(v) miniRez = v end },
+    { key = 'di',     label = 'DI staff',              draw = draw_di_mini,
+      get = function() return miniDI end,     set = function(v) miniDI = v end },
+    { key = 'burns',  label = 'Burns',
+      draw = function()
+          if not miniBurnTable then draw_burn_dots(); return end
+          for i, f in ipairs({ 'All', 'Tank', 'DPS', 'Healer' }) do
+              if i > 1 then ImGui.SameLine() end
+              local on, pushed = (miniBurnFilter == f), 0   -- count, so pop_state_button balances
+              if on and ImGuiCol and ImGuiCol.Button then
+                  local ok = pcall(function() ImGui.PushStyleColor(ImGuiCol.Button, 0.20, 0.45, 0.70, 1.0) end)
+                  if ok then pushed = 1 end
+              end
+              if ImGui.SmallButton(f .. '##at_mbf_' .. f) and not on then
+                  miniBurnFilter = f; save_settings()
+              end
+              pop_state_button(pushed)
+          end
+          ImGui.SameLine()
+          if ImGui.SmallButton('fit##at_minifit') then miniSizeWanted = true end
+          draw_burn_table(miniBurnFilter)
+      end,
+      get = function() return miniBurns end,  set = function(v) miniBurns = v end },
+    { key = 'pots',   label = 'Group draught buttons', draw = draw_pot_buttons,
+      get = function() return miniPots end,   set = function(v) miniPots = v end },
+    { key = 'mgb',    label = 'Class MGB buttons',     draw = draw_mgb_buttons,
+      get = function() return miniClicks end, set = function(v) miniClicks = v end },
+    { key = 'combos', label = 'Combo buttons',         draw = draw_combo_buttons,
+      get = function() return miniCombos end, set = function(v) miniCombos = v end },
+    { key = 'cures',  label = 'Cure buttons',          draw = draw_cure_buttons,
+      get = function() return miniCures end,  set = function(v) miniCures = v end },
+    { key = 'magic',  label = 'Magic protection',      draw = draw_magic_buttons,
+      get = function() return miniMagic end,  set = function(v) miniMagic = v end },
+    { key = 'coth',   label = 'CoTH Group button',     draw = draw_coth_mini,
+      get = function() return miniCoth end,   set = function(v) miniCoth = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
 function mini_section(key)
@@ -3654,25 +4440,321 @@ function mini_order_normalise()
     miniOrder = out
 end
 
+-- Bring the group's picture back in step after a membership change. Two halves:
+--   NEW characters may not be running the script at all, and even if they are, every report is
+--   change-detected - a toon that has been sitting idle has nothing to "change", so it would stay
+--   invisible to a driver that has never heard from it until the 120s burn resync came round.
+--   DEPARTED characters leave entries in every state table. Mostly harmless because the draws all
+--   iterate group_members(), but it keeps stale numbers around to resurface if they rejoin.
+function resync_group()
+    local inGroup, peers = {}, {}
+    for _, nm in ipairs(group_members()) do
+        inGroup[nm:lower()] = true
+        if nm:lower() ~= myName:lower() then peers[#peers + 1] = nm end
+    end
+    local function prune(t)
+        if type(t) ~= 'table' then return 0 end
+        local n = 0
+        for k in pairs(t) do
+            if type(k) == 'string' and not inGroup[k:lower()] and k:sub(1, 2) ~= '__' then
+                t[k] = nil; n = n + 1
+            end
+        end
+        return n
+    end
+    local dropped = prune(burnState) + prune(potState) + prune(healState) + prune(cureState)
+                  + prune(DI.state) + prune(rezReady) + prune(tributeState) + prune(COTH.state)
+                  + prune(counts)
+
+    if #peers > 0 then
+        bring_up_group(peers)   -- pings first; only launches on toons that do not answer
+        for _, nm in ipairs(peers) do
+            peer_cmdf(nm, '/at_ping %s', myName)                              -- make sure they know the driver
+            peer_cmdf(nm, '/at_rezauto %s', rezAuto and 'on' or 'off')
+            peer_cmdf(nm, '/at_diauto %s', DI.auto and 'on' or 'off')
+            peer_cmdf(nm, '/at_resync')                                       -- forget change-detection, report all
+        end
+    end
+    log('[sync] %d peer(s) resynced%s', #peers,
+        dropped > 0 and string.format(', %d stale entr(ies) dropped', dropped) or '')
+end
+
+-- Bring back a group member whose worker has stopped talking - a crash, a manual /lua stop, or a
+-- reload that did not take.
+-- Detection keys off the UNCONDITIONAL beacons rather than a flat timeout. /at_trib goes out every 15s
+-- from every worker no matter what, and the rez and DI heartbeats run at 5-6s idle when their toggles
+-- are on - so we know how long silence is actually meaningful, instead of guessing a minute.
+-- Two strikes before acting, because a client that is zoning answers nothing either and would
+-- otherwise look exactly like a crash.
+reviveAt     = {}   -- char -> gettime of the last relaunch attempt (cooldown)
+reviveStrike = {}   -- char -> consecutive failed pings
+function expected_gap()
+    local g = 15000                              -- tribute: unconditional, every worker
+    if rezAuto then g = math.min(g, 5000) end    -- rez heartbeat, idle cadence
+    if DI.auto then g = math.min(g, 6000) end    -- DI heartbeat, out-of-combat cadence
+    return g
+end
+function revive_check()
+    if not SHOW_UI then return end
+    local now, limit = mq.gettime(), expected_gap() * 2 + 3000
+    for _, nm in ipairs(group_members()) do
+        if nm:lower() ~= myName:lower() then
+            local last = 0
+            for _, t in ipairs({ burnState[nm], potState[nm], healState[nm], cureState[nm],
+                                 DI.state[nm], rezReady[nm], tributeState[nm] }) do
+                if type(t) == 'table' then
+                    if t.updated and t.updated > last then last = t.updated end
+                    for _, v in pairs(t) do
+                        if type(v) == 'table' and v.updated and v.updated > last then last = v.updated end
+                    end
+                end
+            end
+            if (now - last) <= limit then
+                reviveStrike[nm] = 0                      -- talking: clear any strikes
+            elseif (now - (reviveAt[nm] or 0)) > 120000 then
+                alive[nm:lower()] = nil
+                peer_cmdf(nm, '/at_ping %s', myName)
+                mq.delay(700)
+                mq.doevents()
+                if alive[nm:lower()] then
+                    reviveStrike[nm] = 0                  -- answered: alive, just had nothing to say
+                else
+                    reviveStrike[nm] = (reviveStrike[nm] or 0) + 1
+                    if reviveStrike[nm] >= 2 then
+                        reviveStrike[nm] = 0
+                        reviveAt[nm] = now
+                        peer_cmdf(nm, '/lua run adventuretime worker %s', myName)
+                        log('\\ay[sync] %s silent %ds and failed 2 pings - restarting its worker\\ax',
+                            nm, math.floor((now - last) / 1000))
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- The detailed burn table, lifted out of the Burns tab so BOTH windows can use it. It only ever
+-- existed inline there, which is why mini had to make do with the dot matrix - the detail was not
+-- missing, it was just welded to a tab. No behaviour change: this is the same code, moved.
+-- Both windows are sizeable now, so the table behaves the same in each: stretch to fill, capped so a
+-- single filtered column cannot span the screen. The old `clamp` argument distinguished the mini
+-- window back when it was AlwaysAutoResize; it no longer is, so the argument is gone.
+function draw_burn_table(filter)
+    -- Its OWN filter, not the tab's. Mini is where you sit on DPS all night; the tab is where you go
+    -- to look at everyone. Sharing one filter would make each view keep changing the other.
+    local flt = filter or burnFilter
+        if next(burnState) == nil then
+            ImGui.TextDisabled('waiting for reports...')
+        else
+            -- Driven by GROUP ORDER, not pairs(burnState) sorted alphabetically. Two reasons:
+            -- every other panel lists people in group order, and reading the same six names in a
+            -- different order here costs you when you are scanning in a hurry; and building from
+            -- burnState meant this was the one panel that could still show someone who had left,
+            -- until the prune caught up.
+            local chars = {}
+            for _, c in ipairs(ordered_members()) do
+                if burnState[c] and (flt == 'All' or role_of(burnClass[c]) == flt) then
+                    chars[#chars + 1] = c
+                end
+            end
+            if #chars == 0 then ImGui.TextDisabled('no ' .. flt .. ' characters reporting') end
+            -- Prefix strip only - NO character cap. The measured path below trims to whatever the
+            -- column actually is, so an 18-char cap just left the rest of the column blank while still
+            -- cutting the name. Without it the name fills the space, which means the column can be
+            -- narrower for the same amount of text.
+            local function short(nm) return (nm:gsub('^Draught of ', '')) end
+            local function shortCap(nm)   -- fallback path only; it cannot measure
+                nm = short(nm)
+                if #nm > 18 then return nm:sub(1, 17) .. '...' end
+                return nm
+            end
+            -- Seconds left on a report (-1 = permanently down, e.g. a disc with no timer read).
+            local remain_of, sort_rank = burn_remain, burn_rank
+            -- Name left, timer RIGHT-ALIGNED. The timer owns its space first and the name is trimmed
+            -- to whatever is left, so the number can never be clipped by the column edge. No 'ready'
+            -- text - green already says that; the right slot stays empty when something is up.
+            local function cell(st, it)
+                local r = remain_of(st)
+                local stamp, cr, cg, cb
+                if st.active then
+                    -- RUNNING NOW. Deliberately outside the warm yellow/orange/red cooldown ramp -
+                    -- active shows a countdown too, so colour alone had to carry the difference.
+                    -- The '>' marker is redundancy so it reads without relying on colour at all.
+                    cr, cg, cb = 0.35, 0.90, 1.00                          -- cyan
+                    local left = (st.dsecs or 0) - math.floor((mq.gettime() - st.updated) / 1000)
+                    if (st.dsecs or 0) > 0 and left > 0 then
+                        stamp = string.format('>%d:%02d', math.floor(left / 60), left % 60)
+                    else
+                        stamp = '>run'
+                    end
+                elseif r < 0 then
+                    stamp, cr, cg, cb = '-', 0.85, 0.35, 0.35
+                elseif r == 0 then
+                    stamp, cr, cg, cb = '', 0.36, 0.80, 0.46               -- green name, nothing on the right
+                else
+                    stamp = string.format('%d:%02d', math.floor(r / 60), r % 60)
+                    if r < 60 then       cr, cg, cb = 0.95, 0.85, 0.30     -- yellow: about to come up
+                    elseif r < 300 then  cr, cg, cb = 0.95, 0.62, 0.25     -- orange
+                    else                 cr, cg, cb = 0.85, 0.35, 0.35 end -- red: a long way out
+                end
+
+                -- Measure so the name gets exactly the leftover width. If this ImGui build doesn't
+                -- expose the measuring calls, fall back to the plain inline form.
+                local okMeasure, availW, stampW, startX = pcall(function()
+                    local aw = ImGui.GetContentRegionAvail()
+                    local sw = (stamp ~= '') and ImGui.CalcTextSize(stamp) or 0
+                    return aw, sw, ImGui.GetCursorPosX()
+                end)
+                if not okMeasure or not availW then
+                    ImGui.TextColored(cr, cg, cb, 1.0, shortCap(it) .. (stamp ~= '' and ('  ' .. stamp) or ''))
+                else
+                    local budget = availW - stampW - 10        -- 10px gutter between name and timer
+                    -- Trim BEFORE measuring. This measured the raw item name, so short()'s
+                    -- 'Draught of ' strip only ever applied in the fallback path below - which
+                    -- is why every draught still read 'Draught of Inferno ...' with the useful
+                    -- half cut off.
+                    local full = short(it)
+                    local nm = full
+                    local okT = pcall(function()
+                        while #nm > 4 and ImGui.CalcTextSize(nm) > budget do nm = nm:sub(1, #nm - 1) end
+                    end)
+                    if not okT then nm = shortCap(it) end
+                    if nm ~= full and #nm > 3 then nm = nm:sub(1, #nm - 3) .. '...' end
+                    ImGui.TextColored(cr, cg, cb, 1.0, nm)
+                    if stamp ~= '' then
+                        ImGui.SameLine()
+                        pcall(function() ImGui.SetCursorPosX(startX + availW - stampW) end)
+                        ImGui.TextColored(cr, cg, cb, 1.0, stamp)
+                    end
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then pcall(function() ImGui.SetTooltip(it) end) end   -- full name on hover
+            end
+            -- Each character's column flows independently: its own tier headings, its own items,
+            -- no blank padding to line up with whoever has the most. Columns size to content.
+            -- STRETCH only where there is a width to stretch into. In the mini window (AlwaysAutoResize)
+            -- there isn't: stretch columns collapse to their content minimum, the window sizes to that,
+            -- and the outer width never gets a say - which is why detailed burns came out no wider than
+            -- the dot matrix. Fixed columns give the window an actual number to grow to.
+            local tflags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
+                         + (ImGuiTableFlags.Resizable or 0)
+                         + (ImGuiTableFlags.SizingStretchSame or ImGuiTableFlags.SizingStretchProp or 0)
+            -- A per-column CEILING, not a target. 190 was a target, so the table stayed 1140 wide no
+            -- matter how far you dragged the window and the names stayed truncated. 400 is loose enough
+            -- that six columns will always take the whole window, while still stopping a single
+            -- filtered column from spanning the screen with its timer stranded at the far edge.
+            local wantW = #chars * 400
+            local okW, availW2 = pcall(function() return ImGui.GetContentRegionAvail() end)
+            if okW and availW2 and availW2 > 0 then wantW = math.min(wantW, availW2) end
+            local opened = false
+            if #chars > 0 then
+                -- The 5-argument form (with an outer size) is not in every ImGui binding, so try
+                -- it and fall back. pcall'd carefully: on success the table is ALREADY open, and
+                -- calling BeginTable a second time would open a second one we never end.
+                local ok, res = pcall(ImGui.BeginTable, '##burns', #chars, tflags, wantW, 0)
+                if ok then opened = res and true or false
+                else       opened = ImGui.BeginTable('##burns', #chars, tflags) end
+            end
+            if opened then
+                -- Equal real estate: every column the same width. (Weighting them by content
+                -- made the widths jump around as names changed, which read worse than a plain grid.)
+                for _, c in ipairs(chars) do
+                    local ok = pcall(function()
+                        ImGui.TableSetupColumn(c, (ImGuiTableColumnFlags.WidthStretch or 0), 1.0)
+                    end)
+                    if not ok then ImGui.TableSetupColumn(c) end
+                end
+                ImGui.TableHeadersRow()
+
+                -- rollup row
+                ImGui.TableNextRow()
+                for _, c in ipairs(chars) do
+                    ImGui.TableNextColumn()
+                    local rdy, tot = 0, 0
+                    for _, st in pairs(burnState[c]) do
+                        if (st.tier or 0) > 0 then
+                            tot = tot + 1
+                            if st.active or burn_remain(st) == 0 then rdy = rdy + 1 end
+                        end
+                    end
+                    local frac = (tot > 0) and (rdy / tot) or 0
+                    if frac >= 0.66 then      ImGui.TextColored(0.36, 0.80, 0.46, 1.0, string.format('%d/%d ready', rdy, tot))
+                    elseif frac >= 0.33 then  ImGui.TextColored(0.95, 0.62, 0.25, 1.0, string.format('%d/%d ready', rdy, tot))
+                    else                      ImGui.TextColored(0.85, 0.35, 0.35, 1.0, string.format('%d/%d ready', rdy, tot)) end
+                end
+
+                -- One row per tier, so the tier headings line up across every column and you can
+                -- scan sideways. Costs some blank space under short columns - that's the trade
+                -- against the free-flowing version, where nothing aligned.
+                for _, tinfo in ipairs(burn_tiers_present(chars)) do
+                    do
+                        -- ONE tier heading, in the first column only. It used to print in every
+                        -- column, so a six-character group showed '10minBurn' six times per tier
+                        -- - four tiers meant 24 repetitions of text that says nothing new.
+                        ImGui.TableNextRow()
+                        ImGui.TableNextColumn()
+                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, tinfo.label)
+                        ImGui.TableNextRow()
+                        for _, c in ipairs(chars) do
+                            ImGui.TableNextColumn()
+                            local its = {}
+                            for it, st in pairs(burnState[c]) do
+                                if (st.tier or 0) > 0 and (st.tkey or '?') == tinfo.key then its[#its + 1] = it end
+                            end
+                            table.sort(its, function(a, b)   -- INI order: a static list that doesn't
+                                local oa = burnState[c][a].ord or 0   -- reshuffle as timers tick
+                                local ob = burnState[c][b].ord or 0
+                                if oa ~= ob then return oa < ob end
+                                return a < b
+                            end)
+                            if #its == 0 then
+                                ImGui.TextDisabled('--')   -- nothing at this tier: hold the slot
+                            else
+                                for _, it in ipairs(its) do cell(burnState[c][it], it) end
+                            end
+                        end
+                    end
+                end
+                ImGui.EndTable()
+            end
+        end
+end
+
 local function render()
     if not windowOpen then return end
     if miniMode then   -- compact tribute-only window (its own ###id so it keeps its own small size/pos)
-        local show = ImGui.Begin('Tribute###advtime_mini', windowOpen,
-            (ImGuiWindowFlags.AlwaysAutoResize or 0) + (ImGuiWindowFlags.NoScrollbar or 0))
+        -- AlwaysAutoResize is right for the compact view, and WRONG once the detail burn table is on:
+        -- auto-resize will not grow past what the rest of the content wants, and ImGui clamps a table's
+        -- outer width to the available region - so the extra columns just got clipped off the edge.
+        -- With the table on, the window becomes resizable and scrollable so it can actually be dragged.
+        local mflags = (miniBurns and miniBurnTable)
+            and 0
+            or ((ImGuiWindowFlags.AlwaysAutoResize or 0) + (ImGuiWindowFlags.NoScrollbar or 0))
+        -- Fires once per session as well as on the toggle: if detail was ALREADY on at load, the toggle
+        -- never runs, and ImGui just restores the small size it remembered from when this was an
+        -- auto-resizing window. Two call signatures because bindings differ; a silent pcall failure here
+        -- is exactly why the first attempt did nothing.
+        if (miniBurns and miniBurnTable) and not miniSizedOnce then
+            miniSizedOnce = true; miniSizeWanted = true
+        end
+        if miniSizeWanted then
+            miniSizeWanted = false
+            local w, h = mini_table_size()
+            local okS = pcall(function() ImGui.SetNextWindowSize(w, h, ImGuiCond.Always or 1) end)
+            if not okS then pcall(function() ImGui.SetNextWindowSize(w, h) end) end
+        end
+        local show = ImGui.Begin('AdventureTime###advtime_mini', windowOpen, mflags)
         windowOpen = show
         if show then
-            if ImGui.SmallButton('Expand') then miniMode = false end
-            ImGui.SameLine()
-            if ImGui.SmallButton('Refresh') then tributeRequested = true end
-            ImGui.SameLine()
-            if ImGui.SmallButton('Burns') then miniBurns = not miniBurns end
-            ImGui.SameLine()
-            if ImGui.SmallButton('Rez') then miniRez = not miniRez end
+            if ImGui.SmallButton('Expand') then miniMode = false; save_settings() end
+            -- The Burns and Rez toggles that used to sit here are gone. They predated Settings owning
+            -- section visibility, covered only 2 of the 8 sections, and - the real problem - flipped
+            -- the flag WITHOUT saving, so anything set from here reverted on the next restart while
+            -- the same box in Settings persisted. One control per setting, and it saves.
             ImGui.Spacing()
             draw_tribute_mini()
             for _, k in ipairs(miniOrder) do
                 local sec = mini_section(k)
-                if sec and _G[sec.flag] and sec.draw then
+                if sec and sec.get and sec.get() and sec.draw then
                     ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                     sec.draw()
                 end
@@ -3686,11 +4768,9 @@ local function render()
     windowOpen = show
     if show then
         -- top strip: global controls + the tribute glance (always visible, above the tabs)
-        if ImGui.Button('Refresh', 70, 0) then refreshRequested = true end
+        if ImGui.Button('Counts', 70, 0) then refreshRequested = true end   -- the 80-query pass; not cheap
         ImGui.SameLine()
-        if ImGui.Button('Tribute', 70, 0) then tributeRequested = true end
-        ImGui.SameLine()
-        if ImGui.Button('Mini', 50, 0) then miniMode = true end
+        if ImGui.Button('Mini', 50, 0) then miniMode = true; save_settings() end
         ImGui.SameLine()
         if ImGui.Button('Tank XT', 70, 0) then xtankRequested = true end
         ImGui.SameLine()
@@ -3725,147 +4805,18 @@ local function render()
             end
             if showSec.burns and ImGui.BeginTabItem('Burns') then
                 local function fbtn(label, w)
-                    local active = (burnFilter == label); local pushed = false
-                    if active and ImGuiCol and ImGuiCol.Button then ImGui.PushStyleColor(ImGuiCol.Button, 0.20, 0.45, 0.70, 1.0); pushed = true end
+                    local active, pushed = (burnFilter == label), 0   -- count, so pop_state_button balances
+                    if active and ImGuiCol and ImGuiCol.Button then
+                        local ok = pcall(function() ImGui.PushStyleColor(ImGuiCol.Button, 0.20, 0.45, 0.70, 1.0) end)
+                        if ok then pushed = 1 end
+                    end
                     if ImGui.Button(label, w or 55, 0) then burnFilter = label end
-                    if pushed then ImGui.PopStyleColor() end
+                    pop_state_button(pushed)
                 end
                 fbtn('All'); ImGui.SameLine(); fbtn('Tank'); ImGui.SameLine(); fbtn('DPS'); ImGui.SameLine(); fbtn('Healer', 60)
-                ImGui.SameLine(); if ImGui.Button('Refresh', 70, 0) then burnRefreshRequested = true end
+                ImGui.SameLine(); if ImGui.Button('Reload INIs', 90, 0) then burnRefreshRequested = true end
                 ImGui.Spacing()
-                if next(burnState) == nil then
-                    ImGui.TextDisabled('waiting for reports...')
-                else
-                    local chars = {}
-                    for c in pairs(burnState) do
-                        if burnFilter == 'All' or role_of(burnClass[c]) == burnFilter then chars[#chars + 1] = c end
-                    end
-                    table.sort(chars)
-                    if #chars == 0 then ImGui.TextDisabled('no ' .. burnFilter .. ' characters reporting') end
-                    local function short(nm) if #nm > 18 then return nm:sub(1, 17) .. '...' end return nm end
-                    -- Seconds left on a report (-1 = permanently down, e.g. a disc with no timer read).
-                    local remain_of, sort_rank = burn_remain, burn_rank
-                    -- Name left, timer RIGHT-ALIGNED. The timer owns its space first and the name is trimmed
-                    -- to whatever is left, so the number can never be clipped by the column edge. No 'ready'
-                    -- text - green already says that; the right slot stays empty when something is up.
-                    local function cell(st, it)
-                        local r = remain_of(st)
-                        local stamp, cr, cg, cb
-                        if st.active then
-                            -- RUNNING NOW. Deliberately outside the warm yellow/orange/red cooldown ramp -
-                            -- active shows a countdown too, so colour alone had to carry the difference.
-                            -- The '>' marker is redundancy so it reads without relying on colour at all.
-                            cr, cg, cb = 0.35, 0.90, 1.00                          -- cyan
-                            local left = (st.dsecs or 0) - math.floor((mq.gettime() - st.updated) / 1000)
-                            if (st.dsecs or 0) > 0 and left > 0 then
-                                stamp = string.format('>%d:%02d', math.floor(left / 60), left % 60)
-                            else
-                                stamp = '>run'
-                            end
-                        elseif r < 0 then
-                            stamp, cr, cg, cb = '-', 0.85, 0.35, 0.35
-                        elseif r == 0 then
-                            stamp, cr, cg, cb = '', 0.36, 0.80, 0.46               -- green name, nothing on the right
-                        else
-                            stamp = string.format('%d:%02d', math.floor(r / 60), r % 60)
-                            if r < 60 then       cr, cg, cb = 0.95, 0.85, 0.30     -- yellow: about to come up
-                            elseif r < 300 then  cr, cg, cb = 0.95, 0.62, 0.25     -- orange
-                            else                 cr, cg, cb = 0.85, 0.35, 0.35 end -- red: a long way out
-                        end
-
-                        -- Measure so the name gets exactly the leftover width. If this ImGui build doesn't
-                        -- expose the measuring calls, fall back to the plain inline form.
-                        local okMeasure, availW, stampW, startX = pcall(function()
-                            local aw = ImGui.GetContentRegionAvail()
-                            local sw = (stamp ~= '') and ImGui.CalcTextSize(stamp) or 0
-                            return aw, sw, ImGui.GetCursorPosX()
-                        end)
-                        if not okMeasure or not availW then
-                            ImGui.TextColored(cr, cg, cb, 1.0, short(it) .. (stamp ~= '' and ('  ' .. stamp) or ''))
-                        else
-                            local budget = availW - stampW - 10        -- 10px gutter between name and timer
-                            local nm = it
-                            local okT = pcall(function()
-                                while #nm > 4 and ImGui.CalcTextSize(nm) > budget do nm = nm:sub(1, #nm - 1) end
-                            end)
-                            if not okT then nm = short(it) end
-                            if nm ~= it and #nm > 3 then nm = nm:sub(1, #nm - 3) .. '...' end
-                            ImGui.TextColored(cr, cg, cb, 1.0, nm)
-                            if stamp ~= '' then
-                                ImGui.SameLine()
-                                pcall(function() ImGui.SetCursorPosX(startX + availW - stampW) end)
-                                ImGui.TextColored(cr, cg, cb, 1.0, stamp)
-                            end
-                        end
-                        if ImGui.IsItemHovered and ImGui.IsItemHovered() then pcall(function() ImGui.SetTooltip(it) end) end   -- full name on hover
-                    end
-                    -- Each character's column flows independently: its own tier headings, its own items,
-                    -- no blank padding to line up with whoever has the most. Columns size to content.
-                    local tflags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
-                                 + (ImGuiTableFlags.SizingStretchSame or ImGuiTableFlags.SizingStretchProp or 0) + (ImGuiTableFlags.Resizable or 0)
-                    if #chars > 0 and ImGui.BeginTable('##burns', #chars, tflags) then
-                        -- Equal real estate: every column the same width. (Weighting them by content
-                        -- made the widths jump around as names changed, which read worse than a plain grid.)
-                        for _, c in ipairs(chars) do
-                            local ok = pcall(function()
-                                ImGui.TableSetupColumn(c, (ImGuiTableColumnFlags.WidthStretch or 0), 1.0)
-                            end)
-                            if not ok then ImGui.TableSetupColumn(c) end
-                        end
-                        ImGui.TableHeadersRow()
-
-                        -- rollup row
-                        ImGui.TableNextRow()
-                        for _, c in ipairs(chars) do
-                            ImGui.TableNextColumn()
-                            local rdy, tot = 0, 0
-                            for _, st in pairs(burnState[c]) do
-                                if (st.tier or 0) > 0 then
-                                    tot = tot + 1
-                                    if st.active or burn_remain(st) == 0 then rdy = rdy + 1 end
-                                end
-                            end
-                            local frac = (tot > 0) and (rdy / tot) or 0
-                            if frac >= 0.66 then      ImGui.TextColored(0.36, 0.80, 0.46, 1.0, string.format('%d/%d ready', rdy, tot))
-                            elseif frac >= 0.33 then  ImGui.TextColored(0.95, 0.62, 0.25, 1.0, string.format('%d/%d ready', rdy, tot))
-                            else                      ImGui.TextColored(0.85, 0.35, 0.35, 1.0, string.format('%d/%d ready', rdy, tot)) end
-                        end
-
-                        -- One row per tier, so the tier headings line up across every column and you can
-                        -- scan sideways. Costs some blank space under short columns - that's the trade
-                        -- against the free-flowing version, where nothing aligned.
-                        for _, tinfo in ipairs(burn_tiers_present(chars)) do
-                            do
-                                ImGui.TableNextRow()
-                                for i, c in ipairs(chars) do
-                                    ImGui.TableNextColumn()
-                                    if i == 1 then ImGui.TextColored(0.85, 0.72, 0.35, 1.0, tinfo.label)
-                                    else           ImGui.TextColored(0.45, 0.40, 0.25, 1.0, tinfo.label) end
-                                end
-                                ImGui.TableNextRow()
-                                for _, c in ipairs(chars) do
-                                    ImGui.TableNextColumn()
-                                    local its = {}
-                                    for it, st in pairs(burnState[c]) do
-                                        if (st.tier or 0) > 0 and (st.tkey or '?') == tinfo.key then its[#its + 1] = it end
-                                    end
-                                    table.sort(its, function(a, b)   -- INI order: a static list that doesn't
-                                        local oa = burnState[c][a].ord or 0   -- reshuffle as timers tick
-                                        local ob = burnState[c][b].ord or 0
-                                        if oa ~= ob then return oa < ob end
-                                        return a < b
-                                    end)
-                                    if #its == 0 then
-                                        ImGui.TextDisabled('--')   -- nothing at this tier: hold the slot
-                                    else
-                                        for _, it in ipairs(its) do cell(burnState[c][it], it) end
-                                    end
-                                end
-                            end
-                        end
-                        ImGui.EndTable()
-                    end
-                end
+                draw_burn_table()
                 ImGui.EndTabItem()
             end
             if showSec.rez and ImGui.BeginTabItem('Rez') then
@@ -3893,22 +4844,10 @@ local function render()
                 chk('burns',   'Burns tab')
                 chk('rez',     'Rez tab')
                 chk('misc',    'Misc tab')
-                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Automation')
-                do
-                    local a, b = rezAuto, DI.auto
-                    rezAuto = ImGui.Checkbox('Auto-Rez', rezAuto)
-                    DI.auto = ImGui.Checkbox('Auto-DI staff', DI.auto)
-                    if a ~= rezAuto or b ~= DI.auto then
-                        dirty = true
-                        for _, nm in ipairs(group_members()) do
-                            if nm:lower() ~= myName:lower() then
-                                if a ~= rezAuto then peer_cmdf(nm, '/at_rezauto %s', rezAuto and 'on' or 'off') end
-                                if b ~= DI.auto then peer_cmdf(nm, '/at_diauto %s', DI.auto and 'on' or 'off') end
-                            end
-                        end
-                    end
-                end
+                -- Auto-Rez and Auto-DI used to be duplicated here. They live on the Rez tab beside the
+                -- thing they control, with live ON/OFF state and the picker/tank context around them -
+                -- two controls for one flag, under two different names, is just a way to be unsure
+                -- which one you last changed.
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Mini window')
                 do
@@ -3927,10 +4866,46 @@ local function render()
                                 dirty = true
                             end
                             ImGui.SameLine()
-                            local was = _G[sec.flag] and true or false
+                            local was = sec.get() and true or false
                             local now = ImGui.Checkbox(sec.label .. '##at_sec_' .. k, was)
-                            if now ~= was then _G[sec.flag] = now; dirty = true end
+                            if now ~= was then sec.set(now); dirty = true end
+                            if k == 'burns' and miniBurns then
+                                ImGui.SameLine()
+                                local wasT = miniBurnTable and true or false
+                                local nowT = ImGui.Checkbox('full detail##at_burntbl', wasT)
+                                if nowT ~= wasT then
+                                    miniBurnTable = nowT
+                                    -- One-shot: give the window a usable size the moment detail goes on,
+                                    -- rather than leaving it at whatever the compact view had shrunk to.
+                                    if nowT then miniSizeWanted = true end
+                                    dirty = true
+                                end
+                            end
                         end
+                    end
+                end
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+
+                -- Character order: who reads left-to-right in the burn views.
+                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Character order')
+                ImGui.TextDisabled('Left to right in the burn views.')
+                do
+                    local ord = ordered_members()
+                    for i, nm in ipairs(ord) do
+                        if ImGui.SmallButton('^##at_cu_' .. nm) and i > 1 then
+                            ord[i], ord[i - 1] = ord[i - 1], ord[i]
+                            charOrder = ord; dirty = true
+                        end
+                        ImGui.SameLine()
+                        if ImGui.SmallButton('v##at_cd_' .. nm) and i < #ord then
+                            ord[i], ord[i + 1] = ord[i + 1], ord[i]
+                            charOrder = ord; dirty = true
+                        end
+                        ImGui.SameLine()
+                        ImGui.Text(string.format('%d. %s', i, nm))
+                    end
+                    if #ord > 1 and ImGui.SmallButton('Reset to group order##at_cord') then
+                        charOrder = {}; dirty = true
                     end
                 end
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
@@ -4119,10 +5094,41 @@ while running do
     -- Group changed since the last look? Re-test. A peer on ANOTHER machine can drop off DanNet without
     -- leaving the in-game group, and nothing else in here would ever notice - the reports just stop.
     do
-        local gk = table.concat(group_members(), ',')
+        local now = group_members()
+        local gk = table.concat(now, ',')
         if gk ~= lastGroupKey then
-            lastGroupKey = gk
+            local firstLook = (lastGroupKey == nil)
+            -- Shut down the worker on anyone who LEFT. Pruning their entries was not enough: they were
+            -- still running, still knew the driver name, and their next report put everything straight
+            -- back. Ending the script is the honest fix - a worker that is not in the group has nothing
+            -- to report to us. Sent by /dex, not /dgge, because they are no longer in the group to
+            -- broadcast to. They come back automatically on rejoin via bring_up_group.
+            if not firstLook and SHOW_UI then
+                local stillHere = {}
+                for _, m in ipairs(now) do stillHere[m:lower()] = true end
+                for _, m in ipairs(lastGroupList) do
+                    if not stillHere[m:lower()] and m:lower() ~= myName:lower() then
+                        peer_cmdf(m, '/at_close')
+                        log('[sync] %s left the group - closing its worker', m)
+                    end
+                end
+            end
+            lastGroupKey  = gk
+            lastGroupList = now
             if peerCheckAt == 0 then peerCheckAt = mq.gettime() + 8000 end
+            -- Not on the first look: startup already brings the group up, and doing it twice would
+            -- fire a second round of pings and launches for no reason.
+            if not firstLook and SHOW_UI then resyncAt = mq.gettime() + 3000 end
+        end
+        if resyncAt > 0 and mq.gettime() >= resyncAt then
+            resyncAt = 0
+            pcall(resync_group)
+        end
+        -- Crash watch every 5s. The per-character gates inside (a silence limit derived from the
+        -- beacons, two failed pings, a 2 minute cooldown) are what stop this becoming a launch loop.
+        if SHOW_UI and (mq.gettime() - lastRevive) > 5000 then
+            lastRevive = mq.gettime()
+            pcall(revive_check)
         end
     end
     if giveRequested and not distributing then
@@ -4276,9 +5282,29 @@ while running do
                 end
             end
         end
+        for _, me2 in ipairs(MAGIC_CLICKS) do   -- magic protection: only owners report
+            local have, secs, up, dsecs = magic_state(me2)
+            local k = have .. '/' .. secs .. '/' .. up .. '/' .. dsecs
+            -- Never announce that I do NOT have something. To the driver a missing entry and a "have=0"
+            -- entry mean the same thing - no button - so the only report worth sending is one that
+            -- follows an earlier yes, telling it to take the button away again.
+            if have == 0 and magicLast[me2.key] == nil then magicLast[me2.key] = k end
+            if magicLast[me2.key] ~= k then
+                magicLast[me2.key] = k
+                if SHOW_UI then
+                    magicState[myName] = magicState[myName] or {}
+                    magicState[myName][me2.key] = { have = have, secs = secs, up = up, dsecs = dsecs,
+                                                    updated = mq.gettime() }
+                elseif driverName then
+                    peer_cmdf(driverName, '/at_magicstate %s %s %d %d %d %d', myName, me2.key,
+                              have, secs, up, dsecs)
+                end
+            end
+        end
         for _, ce in ipairs(CURE_CLICKS) do   -- cures: only owners ever report, so silence means "not mine"
             local have, secs = cure_state(ce.name)
             local k = have .. '/' .. secs
+            if have == 0 and cureLast[ce.key] == nil then cureLast[ce.key] = k end   -- see magic, above
             if cureLast[ce.key] ~= k then
                 cureLast[ce.key] = k
                 if SHOW_UI then
@@ -4340,15 +5366,18 @@ while running do
         -- 6000 not 20000: the cleric-DG hold only trusts a report < 8000ms old. A cleric that has
         -- not taken aggro is not COMBAT-flagged, so it would sit on the slow tick and read as
         -- stale - and the staff would fire early believing no DG source is left.
-        if (mq.gettime() - DI.lastPush) > (ic and 2000 or 6000) then
-        DI.lastPush = mq.gettime()
         local a, b, c, d = di_read_self()
-        DI.state[myName] = { staff = a, emeralds = b, dgReady = c, saveUp = d, updated = mq.gettime() }
-        -- Heartbeat, not push-on-change: with change-only pushes a stable toon never re-announces, so
-        -- everyone else's table holds only themselves - and then everyone thinks they're first. That is
-        -- exactly the dogpile the rez baton was built to stop. Out of combat it drops to a 20s keepalive
-        -- and snaps back to 2s the instant combat starts.
-        peer_bcast('/at_di %s %d %d %d %d', myName, a, b, c, d)
+        -- ON CHANGE, plus a keepalive. Peers count the staff timer down themselves now (di_peer_staff),
+        -- so the only things worth sending are the discontinuities - the staff came up or went down, an
+        -- emerald was spent, DG became available, a save landed. The keepalive is not for freshness; it
+        -- is so a dropped message heals and a peer that has never heard of me learns I exist.
+        -- Buckets on the staff timer, not raw seconds: a ticking countdown changes every second and
+        -- would defeat the whole point. Emeralds and the flags are sent raw - they only move on an event.
+        local key = string.format('%d/%d/%d/%d', (a == 0) and 0 or 1, b, c, d)
+        if key ~= DI.key or (mq.gettime() - DI.lastPush) > (ic and 4000 or 20000) then
+            DI.key, DI.lastPush = key, mq.gettime()
+            DI.state[myName] = { staff = a, emeralds = b, dgReady = c, saveUp = d, updated = mq.gettime() }
+            peer_bcast('/at_di %s %d %d %d %d', myName, a, b, c, d)
         end
     end
     if DI.auto and not distributing and (mq.gettime() - DI.lastPoll) > 1000 then
@@ -4359,15 +5388,6 @@ while running do
             log('\\ar[di] disabled after an error: %s\\ax', tostring(err))
         end
     end
-    if rezAuto and not distributing then   -- (held during a counts/give pass so we never drown its /dquery replies)
-        local rezBox = false
-        pcall(function() rezBox = (mq.TLO.Window('ConfirmationDialogBox').Open() == true) end)
-        if rezBox and (mq.gettime() - lastRezDoneBcast) > 2000 then
-            lastRezDoneBcast = mq.gettime()
-            rezDone[myName:lower()] = mq.gettime() + 15000
-            peer_bcast('/at_rezdone %s', myName)
-        end
-    end
     -- Adaptive heartbeat. These two 2s broadcasts were ~93% of idle DanNet traffic, and BOTH are only
     -- ever consumed during an event: di_tick early-returns unless in combat, and the rez baton only
     -- matters once a corpse exists. So run fast during the event and slow between - but force an
@@ -4375,18 +5395,24 @@ while running do
     -- the heartbeat was added to prevent. Slow is a keepalive, not silence: a toon that stopped
     -- talking entirely could not be told apart from one whose script died.
     if rezAuto and not distributing then
-        local ev = rez_event_now()
-        if ev ~= HB.rezFast then HB.rezFast = ev; lastRezReadyPoll = 0 end   -- edge -> push now
-        -- 5000 not 10000: the picker treats a report >= 6000ms old as dead-or-stale (deadStale),
-        -- so the idle cadence has to stay UNDER that window or every living toon reads stale.
-        if (mq.gettime() - lastRezReadyPoll) > (ev and 2000 or 5000) then
-        lastRezReadyPoll = mq.gettime()                 -- on-change-only made stable-but-alive toons look stale -> baton skipped them
+        -- ON CHANGE, plus a slow keepalive. This used to be a flat 2-5s heartbeat because the baton read
+        -- the raw cooldown number; now that peers count it down themselves (rez_peer_secs), the only
+        -- things worth sending are the discontinuities - a clicky got used, one came up, I zoned, I died.
+        -- The keepalive is not for freshness, it is so a DROPPED message heals and so a peer that has
+        -- never heard of me learns I exist.
         local cr, tk = my_rez_secs(CROWN_ITEM), my_rez_secs(TOKEN_ITEM)
         local dead = false; pcall(function() dead = (mq.TLO.Me.Dead() == true) end)
         local zone = 0; pcall(function() zone = tonumber(mq.TLO.Zone.ID()) or 0 end)
         local al = dead and 0 or 1
-        rezReady[myName] = { crown = cr, token = tk, alive = (al == 1), zone = zone, updated = mq.gettime() }
-        peer_bcast('/at_rezready %s %d %d %d %d', myName, cr, tk, al, zone)
+        -- Buckets, not raw seconds: a ticking countdown changes every second and would defeat the whole
+        -- point. What the baton cares about is ready-or-not, so that is what triggers a send.
+        local key = string.format('%d/%d/%d/%d', (cr == 0) and 0 or 1, (tk == 0) and 0 or 1, al, zone)
+        local due = (mq.gettime() - lastRezReadyPoll) > 20000
+        if key ~= rezReadyKey or due then
+            rezReadyKey = key
+            lastRezReadyPoll = mq.gettime()
+            rezReady[myName] = { crown = cr, token = tk, alive = (al == 1), zone = zone, updated = mq.gettime() }
+            peer_bcast('/at_rezready %s %d %d %d %d', myName, cr, tk, al, zone)
         end
     end
     if distributing then
@@ -4395,8 +5421,13 @@ while running do
         wasDistributing = false           -- hold the picker ~4s so peers re-report before staleness is trusted
         rezHoldUntil = mq.gettime() + 4000   -- (otherwise 'stale' reads as 'crashed' and several toons fire at once)
     end
-    if not distributing and mq.gettime() >= rezHoldUntil and (mq.gettime() - lastRezPoll) > 1000 then
-        lastRezPoll = mq.gettime(); rez_tick()
+    -- 250ms while a corpse is in the zone, 1000ms otherwise. Everything in the rez path is a state
+    -- machine stepped by this tick - detect, claim, handshake, fire - so at 1000ms even a perfect rez
+    -- cost 3-4 seconds in tick granularity alone. rez_event_now() is the SAME cheap SpawnCount the
+    -- heartbeat already runs, throttled to once a second, so the fast rate costs nothing when idle.
+    if not distributing and mq.gettime() >= rezHoldUntil
+       and (mq.gettime() - lastRezPoll) > (rez_event_now() and 250 or 1000) then
+        lastRezPoll = mq.gettime(); rez_announce_ready(); rez_autoaccept(); rez_tick()
     end
     accept_incoming()
     mq.doevents()   -- pump raid-watch events
