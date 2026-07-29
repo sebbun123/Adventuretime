@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-dgspell-2026-07-28'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-sayplain-2026-07-28'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -5366,17 +5366,6 @@ local function render()
         if ImGui.Button('Tank XT', 70, 0) then xtankRequested = true end
         ImGui.SameLine()
         do local prev = autoXTank; autoXTank = ImGui.Checkbox('Auto', autoXTank); if autoXTank and not prev then xtankAutoRequested = true end end
-        ImGui.SameLine()
-        -- Announce roster changes to the raid. Saved on toggle so it survives a restart without
-        -- needing anything else to trigger a save.
-        do
-            local prev = xtankAnnounce
-            xtankAnnounce = ImGui.Checkbox('Say', xtankAnnounce)
-            if xtankAnnounce ~= prev then save_settings() end
-        end
-        if ImGui.IsItemHovered() then
-            ImGui.SetTooltip('/rsay the tank list to the raid whenever it changes.\nThe log line happens either way.')
-        end
         if #statusNames == 0 then ImGui.SameLine(); ImGui.TextDisabled('reading counts...') end
         if showSec.tribute then ImGui.Spacing(); draw_tribute_grid() end
 
@@ -5446,6 +5435,14 @@ local function render()
                 chk('burns',   'Burns tab')
                 chk('rez',     'Rez tab')
                 chk('misc',    'Misc tab')
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Raid chat')
+                ImGui.Spacing()
+                do
+                    local prev = xtankAnnounce
+                    xtankAnnounce = ImGui.Checkbox('/rsay XTarget tank swaps', xtankAnnounce)
+                    if xtankAnnounce ~= prev then save_settings() end
+                end
                 -- Auto-Rez and Auto-DI used to be duplicated here. They live on the Rez tab beside the
                 -- thing they control, with live ON/OFF state and the picker/tank context around them -
                 -- two controls for one flag, under two different names, is just a way to be unsure
