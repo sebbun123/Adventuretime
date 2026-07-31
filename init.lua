@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-strikefair-2026-07-31'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-potretry-2026-07-31'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -174,6 +174,34 @@ potLast  = {}
 -- is carried. If a tier is held but its timer is down we STOP rather than dropping to the lower one -
 -- I and II share one recast, so the lesser tier is on cooldown too and queuecasting it just burns a
 -- slot in the queue for a cast that cannot fire.
+-- DRAUGHTS GET THE SAME TREATMENT AS THE STAFF. pot_drink used to fire and log "[pot] <name>" in the same
+-- breath, claiming a success nobody had checked - the exact habit that made the DI logs disagree with the
+-- fight for a whole night. And these go out via /queuecast, which QUEUES behind whatever that toon is
+-- already casting, so a draught genuinely can sit and never happen.
+-- Confirmation is free: pot_state already reports both the buff being up and the item going on cooldown,
+-- and either one proves it went.
+POT_RETRY_AFTER = 4000     -- generous, because queuecast waits its turn
+POT_RETRY_MAX   = 3
+potPending      = nil      -- { base, nm, at, tries }
+
+function pot_retry_tick()
+    if not potPending then return end
+    local _, up, secs = pot_state(potPending.base)
+    if up == 1 or (secs or 0) > 0 then
+        log('[pot] %s landed', potPending.nm)
+        potPending = nil; return
+    end
+    local age = mq.gettime() - potPending.at
+    if age < POT_RETRY_AFTER * potPending.tries then return end
+    if potPending.tries >= POT_RETRY_MAX then
+        log('\\ay[pot] %s never went off after %d tries\\ax', potPending.nm, potPending.tries)
+        potPending = nil; return
+    end
+    potPending.tries = potPending.tries + 1
+    log('[pot] no sign of %s - retry %d of %d', potPending.nm, potPending.tries, POT_RETRY_MAX)
+    pcall(function() mq.cmdf('/queuecast me "%s"', potPending.nm) end)
+end
+
 function pot_drink(base)
     for _, tier in ipairs({ 'II', 'I' }) do
         local nm = base .. ' ' .. tier
@@ -187,6 +215,7 @@ function pot_drink(base)
         if have > 0 then
             if ready == 0 then
                 mq.cmdf('/queuecast me "%s"', nm)
+                potPending = { base = base, nm = nm, at = mq.gettime(), tries = 1 }
                 return true, nm
             end
             return false, nm   -- held but on cooldown; the other tier shares that timer
@@ -1248,6 +1277,10 @@ local function write_e3_path(dir)
     fh:close()
 end
 
+-- Declared HERE, not down with the other display state: parse_burns() runs at line ~1367 during startup,
+-- long before that block executes, so a later declaration left this nil and the first burn line threw.
+burnRaw = {}      -- raw [Burn] lines from my E3 ini, kept for their cast specs
+
 local function parse_burns()
     -- The server TLO is NOT reliable for this: it returns 'Lazarus' on one machine and 'Project
     -- Lazarus' on another, and E3 names the file after the short form. Trusting it blindly meant
@@ -1329,6 +1362,11 @@ local function parse_burns()
         if sec == 'burn' then
             local key, val = line:match('^%s*([^;=%[][^=]-)%s*=%s*(.+)')
             if key and val then
+                -- KEEP THE RAW LINE. The parser below strips everything after the first '/' because it
+                -- only wants the name - but the discarded half is E3's own cast spec, written by E3, for
+                -- entries that demonstrably fire. When we needed the syntax for a discipline there was
+                -- nowhere to look it up; it was sitting in this file the whole time. /atburnraw prints it.
+                burnRaw[#burnRaw + 1] = key .. ' = ' .. val:gsub('[\r\n]', '')
                 local r  = rank_for(key)
                 local nm = val:match('^([^/\r\n]+)')
                 if nm then nm = nm:gsub('%s+$', '') end
@@ -1463,6 +1501,7 @@ local function save_settings()
             f:write('miniDI=' .. (miniDI and '1' or '0') .. '\n')
             f:write('miniCombos=' .. (miniCombos and '1' or '0') .. '\n')
             f:write('miniCures=' .. (miniCures and '1' or '0') .. '\n')
+            f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
@@ -1500,6 +1539,7 @@ local function load_settings()
             if k == 'miniDI'    then miniDI    = (v == '1' or v:lower() == 'true') end
             if k == 'miniCombos' then miniCombos = (v == '1' or v:lower() == 'true') end
             if k == 'miniCures' then miniCures  = (v == '1' or v:lower() == 'true') end
+            if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
             if k == 'miniBurnTable' then miniBurnTable = (v == '1' or v:lower() == 'true') end
@@ -1850,6 +1890,13 @@ DI = {
     -- taking the staff's cooldown, so "emeralds moved" reads identically to success and turned blocked
     -- casts into false LANDED verdicts.
     MIN_EMERALDS = 10,
+    -- Retry an apparently-dropped cast this often, and this many times total, before calling it a nocast.
+    -- TWELVE seconds, not eight. The staff has a 3s cast time, and the save then has to appear on the tank
+    -- and be broadcast back - observed landings run 3.6s, 3.8s, 3.9s, 5.0s, 5.7s and 8.0s. At eight the
+    -- retry would have fired at the exact moment that last one landed, spending a second charge on a cast
+    -- that was already working. The margin has to clear the SLOWEST success seen, not the average.
+    RETRY_AFTER = 12000,
+    RETRY_MAX   = 3,
     -- TESTING SWITCH. With the cleric ladder working, the tank is almost always covered and the staff chain
     -- barely runs - which makes it the least exercised part of the system. Turning the ladder off forces
     -- every save to come from a staff. Persisted, because testing means reloading constantly, and shouted
@@ -1920,6 +1967,8 @@ DI = {
     -- after firing did not just start; the staff was on cooldown and the pre-check misread it as ready.
     -- Without this, 'staff timer > 0' called Stylin's declined command a landing after 1.2s, at 1459s
     -- remaining - a reuse already 300s into counting down rather than a fresh one.
+    -- The staff's cast time is 3s (the rez crowns are 1s), so nothing can possibly have landed sooner -
+    -- which is exactly why a non-zero staff timer before this point means the cast never left the ground.
     MIN_FLIGHT = 3000,
     auto    = false,
     state   = {},     -- name -> { staff, emeralds, dgReady, saveUp, updated }
@@ -2178,14 +2227,28 @@ function di_baton_pass(order, why)
     for i, nm in ipairs(order) do if nm:lower() == (DI.baton or ''):lower() then at = i; break end end
     at = at or 0
     local now = mq.gettime()
-    for step = 1, #order do
-        local cand = order[((at - 1 + step) % #order) + 1]
-        if cand:lower() ~= (DI.baton or ''):lower() then
-            local st = DI.state[cand]
-            local fresh = st and (now - (st.updated or 0)) < 30000
-            -- Unknown counts as a candidate: better to hand it to someone we cannot see than to park it.
-            if (not fresh) or (di_peer_staff(st) == 0 and (st.emeralds or 0) >= DI.MIN_EMERALDS) then
-                di_baton_set(cand, why); return true
+    -- TWO PASSES, and the order matters. This used to accept a peer with NO fresh report as a candidate,
+    -- on the reasoning that handing it to someone we cannot see beats parking it. That is backwards: a
+    -- silent peer is the one toon we have positive evidence ISN'T answering. On 2026-07-31 Khulian's
+    -- worker died at 14:28:28 - the sync layer had already logged "silent 18s and failed 2 pings" - and
+    -- the baton was handed to it anyway, with reports 15-28s stale, and the chain stopped there.
+    -- So: look for someone we can actually see and who can actually fire. Only if nobody qualifies do we
+    -- consider the ones we cannot see, because a silent peer is still better than nobody.
+    for _, wantFresh in ipairs({ true, false }) do
+        for step = 1, #order do
+            local cand = order[((at - 1 + step) % #order) + 1]
+            if cand:lower() ~= (DI.baton or ''):lower() then
+                local st = DI.state[cand]
+                local age = st and (now - (st.updated or 0)) or math.huge
+                if wantFresh then
+                    if age < 15000 and di_peer_staff(st) == 0 and (st.emeralds or 0) >= DI.MIN_EMERALDS then
+                        di_baton_set(cand, why); return true
+                    end
+                elseif age >= 15000 then
+                    rezlog('[di] handing the baton to %s despite a %s report - nobody fresher can fire',
+                           cand, (age == math.huge) and 'missing' or string.format('%.0fs old', age / 1000))
+                    di_baton_set(cand, why); return true
+                end
             end
         end
     end
@@ -2607,11 +2670,15 @@ local function di_tick()
     rezlog('[di] target check: %s', di_target_desc(tid, tank))
     rezlog('[di] FIRING /nowcast me "%s" %d', spec, tid)
     pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
-    pcall(function() mq.cmdf('/gsay DI staff on %s', tank) end)
+    -- NOT ANNOUNCED HERE. Saying "DI staff on X" at fire time claims something we do not know yet: the
+    -- cast may be interrupted, dropped or refused. Announcing it anyway is how a log ends up disagreeing
+    -- with what actually happened, which is exactly the thing that makes an issue report useless.
+    -- The /gsay now happens at the verdict - see di_check_landed.
     -- Remember what we had, so the next tick can tell whether the cast actually happened. E3 declines
     -- silently when CheckFor|Divine Guardian,Divine Intervention finds the tank already has a save -
     -- so from here it looks identical to a successful cast, and the trigger simply fires again.
-    DI.watch = { at = now, em = em, tank = tank,
+    DI.watch = { at = now, em = em, tank = tank, tries = 1,
+                 cmd = string.format('/nowcast me "%s" %d', spec, tid),
                  saveWas = (DI.state[tank] or {}).saveName }   -- so a NEW one is attributable to this cast
     -- From this moment my staff counts as spent, whatever TimerReady claims. Set alongside the watch so
     -- that even a verdict which goes wrong cannot hand me back a staff I have already fired.
@@ -2667,7 +2734,24 @@ function di_check_landed()
     elseif (st or 0) > 0                     then verdict = 'stale'
     elseif blocked                           then verdict = 'blocked'
     elseif age >= DI.WATCH_MAX               then verdict = 'nocast'
-    else return end                         -- still in flight - E3 may be holding it behind a heal
+    else
+        -- RETRY BEFORE GIVING UP. A cast can be interrupted - the caster moves, gets stunned, gets hit
+        -- mid-cast - and one dropped command should not cost the full watch and a strike. The rez has
+        -- done this for ages ("retry 2 /nowcast me Call of the Wild") and the staff never learned it.
+        -- Only fires while NOTHING has happened: a landing, a block or a real cooldown all resolve above,
+        -- so reaching here means the command went nowhere at all.
+        local due = DI.RETRY_AFTER * (w.tries or 1)
+        if (w.tries or 1) < DI.RETRY_MAX and age >= due then
+            -- Stop if the tank got covered meanwhile - somebody else's cast landed and this is no longer
+            -- needed. Retrying into that just spends a charge for a refusal.
+            local ts2 = DI.state[w.tank or '']
+            if ts2 and (ts2.saveUp or 0) == 1 then return end
+            w.tries = (w.tries or 1) + 1
+            rezlog('[di] no sign of that cast after %.0fs - retry %d of %d', age / 1000, w.tries, DI.RETRY_MAX)
+            pcall(function() mq.cmd(w.cmd) end)
+        end
+        return                              -- still in flight - E3 may be holding it behind a heal
+    end
     DI.watch = nil
     local spent = (w.em or 0) - em        -- reported only; nothing branches on it
     -- THE VERDICT DECIDES WHETHER THE ASSUMPTION SURVIVES. assumeSpentUntil is set optimistically at fire
@@ -2676,6 +2760,12 @@ function di_check_landed()
     -- bench a toon for the full reuse.
     if verdict == 'landed' then
         DI.noCastStrikes = 0
+        -- Announce it NOW, because now it is true. Includes the retry count when it took more than one
+        -- attempt, so the group sees the cast was fought for rather than clean.
+        pcall(function()
+            if (w.tries or 1) > 1 then mq.cmdf('/gsay DI staff on %s (took %d tries)', w.tank, w.tries)
+            else                       mq.cmdf('/gsay DI staff on %s', w.tank) end
+        end)
         -- THE POINT OF THE WHOLE THING. My staff is now spent for its full reuse, which is the one fact
         -- about myself I can establish reliably - so hand the turn on rather than making five other toons
         -- work it out from a timer that lies.
@@ -2730,6 +2820,9 @@ function di_check_landed()
             return
         end
         DI.noCastStrikes = (DI.noCastStrikes or 0) + 1
+        pcall(function()
+            mq.cmdf('/gsay DI staff interrupted %dx on %s, passing to the next caster', w.tries or 1, w.tank)
+        end)
         rezlog('\\ay[di] the staff did NOT go off in %ds - no block message, staff still ready. E3 dropped it. (strike %d)\\ax',
                math.floor(DI.WATCH_MAX / 1000), DI.noCastStrikes)
         if DI.noCastStrikes >= 2 and not DI.cannotFire then
@@ -3689,6 +3782,20 @@ pcall(function()
                                saveName = nm, updated = mq.gettime() }
         end
     end)
+    mq.bind('/at_arcane', function() arc_click() end)
+    -- Print my own [Burn] lines exactly as E3 wrote them. This is how to find the correct cast spec for
+    -- any kind of thing - disc, AA, item, song - instead of guessing at tokens.
+    mq.bind('/atburnraw', function()
+        if #burnRaw == 0 then log('[burns] no raw lines captured (ini not found or no [Burn] section)'); return end
+        log('[burns] %d raw [Burn] line(s) from my ini:', #burnRaw)
+        for _, l in ipairs(burnRaw) do log('   %s', l) end
+    end)
+    mq.bind('/at_arcstate', function(char, have, secs, up)
+        if char then
+            arcState[char] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
+                               up = tonumber(up) or 0, updated = mq.gettime() }
+        end
+    end)
     mq.bind('/at_potstate', function(char, key, carries, up, secs, dsecs)
         if not char or not key then return end
         potState[char] = potState[char] or {}
@@ -3876,7 +3983,7 @@ pcall(function()
         local base = pot_base_for(key)
         if not base then return end
         local ok, nm = pot_drink(base)
-        if ok then log('[pot] %s', nm)
+        if ok then log('[pot] %s sent', nm)      -- "landed" only once pot_retry_tick has seen it
         elseif nm then log('[pot] %s on cooldown', nm)
         else log('[pot] no %s carried', base) end
     end)
@@ -4534,6 +4641,8 @@ miniPots        = false   -- show the group draught buttons in the mini window
 miniClicks      = false   -- show the per-class MGB/group click buttons in the mini window
 miniCombos      = false   -- show the combo buttons in the mini window
 miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the mini window
+miniArcane      = false   -- show the Arcane Reprisal row in the mini window
+arcLast         = nil     -- my last-pushed arcane state, for change detection
 miniMagic       = false   -- show the magic protection clicky buttons in the mini window
 miniBurnTable   = false   -- burns section: false = dot matrix, true = the full detail table
 -- Who appears first, left to right. Separate from rezPriority on purpose: that is who gets RESSED
@@ -5419,7 +5528,10 @@ function have_thing(name)
         function() return tlo_true(mq.TLO.FindItem('=' .. name)()) end,
         function() return (tonumber(mq.TLO.Me.AltAbility(name).Rank()) or 0) > 0 end,
         function() return tlo_true(mq.TLO.Me.Book(name)()) end,
-        function() return tlo_true(mq.TLO.Me.CombatAbility(name)()) end,
+        -- A DISCIPLINE REPORTS ITS INDEX, not true/false. This was wrapped in tlo_true, which only accepts
+        -- 1 or TRUE - so every disc that was not sitting at index 1 read as not-owned. Arcane Reprisal was
+        -- invisible on all six toons because of this line.
+        function() return (tonumber(mq.TLO.Me.CombatAbility(name)()) or 0) > 0 end,
         function() return tlo_true(mq.TLO.Me.Ability(name)()) end,
         function() return tlo_true(mq.TLO.Me.Gem(name)()) end,
     }
@@ -5994,6 +6106,133 @@ function draw_pot_buttons()
 end
 
 -- Mini: CoTH gather on its own row. Same toggle the Misc tab uses, so pressing either is the same act.
+-- ===== ARCANE REPRISAL =====
+-- A melee discipline that answers casters. Presented exactly like the magic-protection clickies: one
+-- button per character that actually has it, coloured by state, and clicking fires it on that toon.
+-- Detection goes through the ability INDEX. Me.CombatAbility[name] returns where the disc sits in the
+-- list, not whether you have it - see the note in have_thing, where wrapping it in tlo_true made every
+-- disc past index 1 invisible.
+ARCANE = 'Arcane Reprisal'
+arcState = {}     -- char -> { have, secs, up, updated }
+
+-- have (0/1), seconds until ready (0 = now), running (0/1)
+function arc_state()
+    local idx = 0
+    pcall(function() idx = tonumber(mq.TLO.Me.CombatAbility(ARCANE)()) or 0 end)
+    if idx <= 0 then return 0, -1, 0 end
+    local rdy = false
+    pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(ARCANE)()) end)
+    local secs = 0
+    if not rdy then
+        pcall(function() secs = math.floor(tonumber(mq.TLO.Me.CombatAbilityTimer(ARCANE).TotalSeconds()) or 0) end)
+        if secs <= 0 then secs = 1 end          -- not ready but no timer: show cooling, never "ready"
+    end
+    local up = false
+    pcall(function() up = (tostring(mq.TLO.Me.ActiveDisc.Name() or '') == ARCANE) end)
+    return 1, secs, up and 1 or 0
+end
+
+-- Fire it. Confirmed working form: /nowcast <name> "Arcane Reprisal", and it needs an NPC target.
+-- The caster's OWN target is not good enough - a healer or a bard is usually targeting a groupmate, and
+-- the log showed exactly that: "target Stylin". So the mob is resolved locally, on the toon about to
+-- cast, and passed as a trailing id the same way the rez passes a corpse and the DI staff passes the tank.
+-- Resolved on the CASTER rather than on whoever clicked, so the reading is fresh and local either way.
+-- Fire it. That is the whole thing: /nowcast <name> "Arcane Reprisal", confirmed working by hand.
+-- No target resolution, no id, no retargeting. This only ever gets used while the melee are already
+-- swinging at the mob, so the caster is on it by definition - and an earlier version that hunted through
+-- xtargets and juggled targets was solving a problem that only exists out of combat, where you would not
+-- be pressing this button anyway.
+-- The target is still logged, because if it ever does fail that is the first thing worth seeing.
+-- THE GAME'S OWN COMMAND, unquoted: /disc Arcane Reprisal. Confirmed working 2026-07-31.
+-- This bypasses E3 entirely, which is why it works where nothing else did - no cast spec to parse, no
+-- CastType token to guess at, no argument order to get wrong, and it uses whatever the character already
+-- has targeted. Every failure tonight came from routing a discipline through machinery built for items
+-- and spells: CastType|Disc (a token I invented), a trailing target id (proven for items, never a disc),
+-- and 'me' versus the character name as arg 1.
+-- NO QUOTES around the name. The client takes the rest of the line as-is, so quoting makes it hunt for a
+-- disc literally called "Arcane Reprisal" with the quote marks - which is almost certainly why an earlier
+-- attempt at /disc "..." did nothing and sent this off down the E3 path for another four builds.
+ARC_CMD = '/disc %s'
+
+-- Retry state for the disc. Same reasoning as the staff: a melee disc can be interrupted or land on a
+-- swing that never connects, and one press should mean "get this up", not "send one command and hope".
+-- Driven from the MAIN LOOP, never from the button handler - arc_click is called straight out of an ImGui
+-- callback, and anything that yields in there is the documented hard-crash path.
+-- Arcane Reprisal is INSTANT, so if it has not gone off in a second and a half it did not go off. The
+-- staff waits 12s because it has a 3s cast plus a save that must appear on the tank and be relayed back;
+-- none of that applies here, and matching the staff's spacing made a failed press take 9s to notice.
+ARC_RETRY_AFTER = 1500
+ARC_RETRY_MAX   = 3
+arcPending      = nil     -- { at, tries }
+
+function arc_retry_tick()
+    if not arcPending then return end
+    local have, secs, up = arc_state()
+    -- Up, or on cooldown: it went off. Either way we are done.
+    if up == 1 or (have == 1 and (secs or 0) > 0) then
+        rezlog('[arcane] %s is up', ARCANE)
+        arcPending = nil; return
+    end
+    local age = mq.gettime() - arcPending.at
+    if age < ARC_RETRY_AFTER * arcPending.tries then return end
+    if arcPending.tries >= ARC_RETRY_MAX then
+        -- Same rule as the staff: say what actually happened, not what we attempted.
+        pcall(function() mq.cmdf('/gsay %s interrupted %dx - could not get it up', ARCANE, arcPending.tries) end)
+        rezlog('\\ay[arcane] %s did not go off after %d tries - giving up\\ax', ARCANE, arcPending.tries)
+        arcPending = nil; return
+    end
+    arcPending.tries = arcPending.tries + 1
+    rezlog('[arcane] no sign of it - retry %d of %d', arcPending.tries, ARC_RETRY_MAX)
+    pcall(function() mq.cmdf(ARC_CMD, ARCANE) end)
+end
+
+function arc_click()
+    local tnm, dist = '', -1
+    pcall(function() tnm  = tostring(mq.TLO.Target.CleanName() or '') end)
+    pcall(function() dist = math.floor(tonumber(mq.TLO.Target.Distance()) or -1) end)
+    local cmd = string.format(ARC_CMD, ARCANE)
+    -- Distance is logged because range is now a known failure mode rather than a guess.
+    log('[arcane] %s   (on %s%s)', cmd, (tnm ~= '' and tnm) or 'no target',
+        (dist >= 0) and string.format(' @%dm', dist) or '')
+    pcall(function() mq.cmd(cmd) end)
+    arcPending = { at = mq.gettime(), tries = 1 }   -- the main loop watches it from here
+end
+
+function draw_arcane_buttons()
+    local btns = {}
+    for _, nm in ipairs(group_members()) do
+        local st = arcState[nm]
+        if st and st.have == 1 then btns[#btns + 1] = { nm = nm, st = st } end
+    end
+    if #btns == 0 then ImGui.TextDisabled('nobody has ' .. ARCANE); return end
+    ImGui.TextColored(0.85, 0.72, 0.35, 1.0, ARCANE)
+    for _, b in ipairs(btns) do
+        ImGui.SameLine()
+        local age = math.floor((mq.gettime() - (b.st.updated or 0)) / 1000)
+        local r   = b.st.secs or -1
+        if r > 0 then r = math.max(0, r - age) end
+        local cr, cg, cb, tip
+        if b.st.up == 1 then
+            cr, cg, cb, tip = 0.35, 0.90, 1.00, 'running now'
+        elseif r <= 0 then
+            cr, cg, cb, tip = 0.36, 0.80, 0.46, 'ready'
+        else
+            cr, cg, cb = 0.85, 0.35, 0.35
+            tip = string.format('cooling, %d:%02d', math.floor(r / 60), r % 60)
+        end
+        local pushed = push_state_button(cr, cg, cb)
+        if ImGui.SmallButton(b.nm .. '##at_arc_' .. b.nm) then
+            if b.nm:lower() == myName:lower() then arc_click()
+            else peer_cmdf(b.nm, '/at_arcane') end
+        end
+        pop_state_button(pushed)
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(string.format('%s - %s\n  %s', b.nm, ARCANE, tip)) end)
+        end
+    end
+    ImGui.Spacing()
+end
+
 function draw_coth_mini()
     if COTH.active then
         if ImGui.SmallButton('Stop gather##at_coth_mini') then coth_set(false) end
@@ -6047,6 +6286,8 @@ MINI_SECTIONS = {
       get = function() return miniMagic end,  set = function(v) miniMagic = v end },
     { key = 'coth',   label = 'CoTH Group button',     draw = draw_coth_mini,
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
+    { key = 'arcane', label = 'Arcane Reprisal',        draw = draw_arcane_buttons,
+      get = function() return miniArcane end, set = function(v) miniArcane = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
 function mini_section(key)
@@ -6799,6 +7040,8 @@ while running do
         -- of DI because DI.watch could never be cleared. Rate-limited so a persistent fault says so once a
         -- minute instead of flooding, and it keeps running rather than disabling itself - a broken verdict
         -- is bad, but a DI system that quietly stops is exactly what we could not see.
+        pcall(arc_retry_tick)
+        pcall(pot_retry_tick)
         do
             local ok, err = pcall(di_check_landed)
             if not ok and (mq.gettime() - (DI.lastCheckErr or 0)) > 60000 then
@@ -7026,6 +7269,19 @@ while running do
                 end
             end
         end
+        do
+            local have, secs, up = arc_state()
+            local k = string.format('%d/%d/%d', have, secs, up)
+            if arcLast ~= k then                     -- change-detected, exactly like the pots and cures
+                if SHOW_UI then
+                    arcState[myName] = { have = have, secs = secs, up = up, updated = mq.gettime() }
+                    arcLast = k
+                elseif driverName then
+                    peer_cmdf(driverName, '/at_arcstate %s %d %d %d', myName, have, secs, up)
+                    arcLast = k
+                end
+            end
+        end
         for _, gp in ipairs(GROUP_POTS) do
             local carries, up, secs, dsecs = pot_state(gp.base)
             local k = string.format('%d/%d/%d/%d', carries, up, secs, dsecs)
@@ -7119,7 +7375,16 @@ while running do
             -- ON THE EDGE ONLY. This branch runs on every poll while the staff is down, so an unconditional
             -- pass here fired once per poll for as long as the cooldown lasted - which, once the baton had
             -- gone round the ring and come back, never stopped.
-            if DI.baton and DI.baton:lower() == myName:lower() and not DI.saidStaffDown then
+            -- NOT WHILE MY OWN CAST IS STILL UNDECIDED. Passing the baton the instant the staff goes down
+            -- hands the turn to the next toon before anyone knows whether this cast worked, and the
+            -- /at_difired park that should hold them back is a network hop behind. On 2026-07-31 Lunafeet
+            -- fired at 14:18:00.334, passed the baton at .687, and Sebbun committed at .902 - 0.6s later,
+            -- into the same emergency. Lunafeet's landed; Sebbun's was refused.
+            -- Holding until the verdict costs nothing now: it resolves in 3-5s since the tank started
+            -- naming its own save, and every verdict path already passes the baton on its way out.
+            if DI.watch then
+                -- undecided; the verdict will pass it
+            elseif DI.baton and DI.baton:lower() == myName:lower() and not DI.saidStaffDown then
                 DI.saidStaffDown = true
                 di_baton_pass(di_order(), string.format('%s staff is down (%ds)', myName, a))
             end
@@ -7286,5 +7551,8 @@ pcall(function() mq.unbind('/at_rezdone') end)
 pcall(function() mq.unbind('/at_rezorder') end)
 pcall(function() mq.unbind('/at_rezorder?') end)
 pcall(function() mq.unbind('/at_bags') end)
+pcall(function() mq.unbind('/at_arcstate') end)
+pcall(function() mq.unbind('/at_arcane') end)
+pcall(function() mq.unbind('/atburnraw') end)
 pcall(function() mq.cmd('/e3p off') end)   -- always hand our toon back to E3 on the way out
 if SHOW_UI then mq.imgui.destroy(scriptName) end
