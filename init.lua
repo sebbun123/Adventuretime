@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-potretry-2026-07-31'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-minicloseall-2026-07-31'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -1502,6 +1502,7 @@ local function save_settings()
             f:write('miniCombos=' .. (miniCombos and '1' or '0') .. '\n')
             f:write('miniCures=' .. (miniCures and '1' or '0') .. '\n')
             f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
+            f:write('miniPhantom=' .. (miniPhantom and '1' or '0') .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
@@ -1540,6 +1541,7 @@ local function load_settings()
             if k == 'miniCombos' then miniCombos = (v == '1' or v:lower() == 'true') end
             if k == 'miniCures' then miniCures  = (v == '1' or v:lower() == 'true') end
             if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
+            if k == 'miniPhantom' then miniPhantom = (v == '1' or v:lower() == 'true') end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
             if k == 'miniBurnTable' then miniBurnTable = (v == '1' or v:lower() == 'true') end
@@ -3783,6 +3785,23 @@ pcall(function()
         end
     end)
     mq.bind('/at_arcane', function() arc_click() end)
+    -- The queue is mirrored on every toon so the driver can draw it and the holder can work it.
+    mq.bind('/at_pwadd', function(id, nm)
+        id = tonumber(id); if not id or pw_find(id) then return end
+        pwQueue[#pwQueue + 1] = { id = id, name = (nm or '?'):gsub('_', ' '), oor = false }
+    end)
+    mq.bind('/at_pwdel', function(id)
+        local i = pw_find(tonumber(id) or 0); if i then table.remove(pwQueue, i) end
+    end)
+    mq.bind('/at_pwclear', function() pwQueue = {} end)
+    mq.bind('/at_pwmark', function(id, st)
+        local _, e = pw_find(tonumber(id) or 0)
+        if e then e.state, e.oor = st, false end
+    end)
+    mq.bind('/at_pwoor', function(id, v)
+        local _, e = pw_find(tonumber(id) or 0); if e then e.oor = (v == '1') end
+    end)
+    mq.bind('/at_pwhave', function(who) if who and who ~= '' then pwState[who] = true end end)
     -- Print my own [Burn] lines exactly as E3 wrote them. This is how to find the correct cast spec for
     -- any kind of thing - disc, AA, item, song - instead of guessing at tokens.
     mq.bind('/atburnraw', function()
@@ -4642,6 +4661,7 @@ miniClicks      = false   -- show the per-class MGB/group click buttons in the m
 miniCombos      = false   -- show the combo buttons in the mini window
 miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the mini window
 miniArcane      = false   -- show the Arcane Reprisal row in the mini window
+miniPhantom     = false   -- show the Phantom Whispers queue in the mini window
 arcLast         = nil     -- my last-pushed arcane state, for change detection
 miniMagic       = false   -- show the magic protection clicky buttons in the mini window
 miniBurnTable   = false   -- burns section: false = dot matrix, true = the full detail table
@@ -6198,6 +6218,229 @@ function arc_click()
     arcPending = { at = mq.gettime(), tries = 1 }   -- the main loop watches it from here
 end
 
+-- ===== PHANTOM WHISPERS =====
+-- A queue rather than a button: the driver clicks a mob to enqueue it, and whoever holds the disc works
+-- down the list in order, one at a time, waiting out the 10s recast between casts.
+-- WHO CASTS IT is decided by who OWNS it, not by class or name - only the monk has this disc, so "has it"
+-- and "is the monk" are the same test, and the ownership version keeps working if a second one shows up.
+-- OUT OF RANGE STALLS, it does not skip. The queue is an explicit instruction from a person, and quietly
+-- reordering it would mean the mob you clicked first is not the one that gets hit first.
+PHANTOM      = 'Phantom Whispers'
+PW_RECAST    = 10000     -- disc recast; do not even look at the queue inside this
+-- RANGE IS ASKED FOR, NOT GUESSED. This started as a flat 50 that turned out to be far too short, which
+-- is the same mistake as every hardcoded number in this file - the client knows the answer, so ask it.
+-- Mirrors rez_range(), which resolves the clicky's reach from Spell.MyRange and caches it. MyRange rather
+-- than Range because it accounts for range-extension focus; a base number would under-report and stall
+-- the queue on mobs that are comfortably reachable.
+PW_RANGE_FALLBACK = 200  -- only if the TLO gives nothing: the standard cast range, same as DI_MAX_DIST
+pwRangeCache = nil
+function pw_range()
+    if pwRangeCache then return pwRangeCache end
+    local r = 0
+    pcall(function() r = tonumber(mq.TLO.Spell(PHANTOM).MyRange()) or 0 end)
+    if r <= 0 then pcall(function() r = tonumber(mq.TLO.Spell(PHANTOM).Range()) or 0 end) end
+    if r > 0 then
+        pwRangeCache = r
+        rezlog('[pw] cast range resolved to %d from the disc', r)
+        return r
+    end
+    return PW_RANGE_FALLBACK   -- not readable yet; assume the usual and ask again next time
+end
+PW_VERIFY_MS = 2000      -- how long to watch for the debuff before calling a cast lost
+PW_RETRY_MAX = 3
+-- ENTRIES ARE MARKED, NOT REMOVED. A queue that empties as it works gives you nothing to look at: by the
+-- time you glance over, the evidence of what happened is gone. Each mob stays put and changes colour -
+-- grey waiting, red out of range, green landed, amber gave up - so the whole sweep is visible at once,
+-- and the list only clears a few seconds after the LAST one resolves.
+pwQueue = {}             -- { { id, name, oor, state } }  state: nil | 'done' | 'failed'
+pwDoneAt = nil           -- when everything finished, for the linger before clearing
+-- How long the finished list stays up, and it depends on how much there was to watch. A single mob
+-- resolves in one cast - by the time you look up it is already over - so that gets the longer hold.
+-- A long queue you have been watching fill in as it goes, and does not need it.
+PW_LINGER     = 5000
+PW_LINGER_ONE = 10000
+pwCast  = nil            -- the attempt in flight: { id, at, tries, prevTarget }
+pwLast  = 0              -- when I last got one to land, for the recast gate
+pwState = {}             -- char -> true if that toon owns the disc (so the UI can name the holder)
+
+function pw_have()
+    local idx = 0
+    pcall(function() idx = tonumber(mq.TLO.Me.CombatAbility(PHANTOM)()) or 0 end)
+    return idx > 0
+end
+
+function pw_find(id)
+    for i, e in ipairs(pwQueue) do if e.id == id then return i, e end end
+    return nil
+end
+
+-- Is the debuff actually on the mob? Only readable while it is targeted, which it is during a cast.
+function pw_on_mob()
+    local up = false
+    pcall(function() up = (tonumber(mq.TLO.Target.Buff(PHANTOM).ID()) or 0) > 0 end)
+    return up
+end
+
+function pw_spawn_ok(id)
+    local ty, hp = '', 0
+    pcall(function() ty = tostring(mq.TLO.Spawn(id).Type() or '') end)
+    pcall(function() hp = tonumber(mq.TLO.Spawn(id).PctHPs()) or 0 end)
+    return ty == 'NPC' and hp > 0
+end
+
+function pw_mark(id, state, why)
+    local _, e = pw_find(id)
+    if not e or e.state then return end
+    e.state, e.oor = state, false
+    rezlog('[pw] %s - %s', e.name or ('id ' .. id), why)
+    pcall(function() peer_bcast('/at_pwmark %d %s', id, state) end)
+end
+
+-- Runs on EVERY toon; returns immediately on anyone without the disc. Main loop only - it targets and
+-- yields, neither of which belongs anywhere near an ImGui callback.
+function pw_tick()
+    if not pw_have() then return end
+
+    if pwCast then
+        local age = mq.gettime() - pwCast.at
+        if pw_on_mob() then
+            local _, e = pw_find(pwCast.id)
+            rezlog('[pw] landed on %s%s', (e and e.name) or ('id ' .. pwCast.id),
+                   (pwCast.tries > 1) and string.format(' (took %d tries)', pwCast.tries) or '')
+            pw_mark(pwCast.id, 'done', 'landed')
+            if pwCast.prevTarget and pwCast.prevTarget > 0 then
+                pcall(function() mq.cmdf('/target id %d', pwCast.prevTarget) end)
+            end
+            pwLast, pwCast = mq.gettime(), nil
+            return
+        end
+        if age < PW_VERIFY_MS then return end
+        if pwCast.tries < PW_RETRY_MAX then
+            pwCast.tries = pwCast.tries + 1
+            pwCast.at = mq.gettime()
+            rezlog('[pw] no sign of it on %s - retry %d of %d', pwCast.name or '?', pwCast.tries, PW_RETRY_MAX)
+            pcall(function() mq.cmdf('/disc %s', PHANTOM) end)
+            return
+        end
+        rezlog('\\ay[pw] gave up on %s after %d tries\\ax', pwCast.name or '?', pwCast.tries)
+        pw_mark(pwCast.id, 'failed', 'could not land it')
+        if pwCast.prevTarget and pwCast.prevTarget > 0 then
+            pcall(function() mq.cmdf('/target id %d', pwCast.prevTarget) end)
+        end
+        pwLast, pwCast = mq.gettime(), nil
+        return
+    end
+
+    if #pwQueue == 0 then return end
+    if (mq.gettime() - pwLast) < PW_RECAST then return end
+    local rdy = false
+    pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(PHANTOM)()) end)
+    if not rdy then return end
+
+    local e
+    for _, q in ipairs(pwQueue) do if not q.state then e = q; break end end
+    if not e then return end          -- everything resolved; the UI handles the linger and clear
+    if not pw_spawn_ok(e.id) then pw_mark(e.id, 'failed', 'dead or gone'); return end
+
+    local dist = 9999
+    pcall(function() dist = math.floor(tonumber(mq.TLO.Spawn(e.id).Distance()) or 9999) end)
+    local reach = pw_range()
+    if dist > reach then
+        if not e.oor then
+            e.oor = true
+            pcall(function() peer_bcast('/at_pwoor %d 1', e.id) end)
+            rezlog('[pw] %s is %dm away (reach %d) - holding until we are closer', e.name, dist, reach)
+        end
+        return                      -- STALL, deliberately. Do not reorder someone's list behind their back.
+    end
+    if e.oor then
+        e.oor = false
+        pcall(function() peer_bcast('/at_pwoor %d 0', e.id) end)
+    end
+
+    local prev = 0
+    pcall(function() prev = tonumber(mq.TLO.Target.ID()) or 0 end)
+    pcall(function() mq.cmdf('/target id %d', e.id) end)
+    mq.delay(250)
+    rezlog('[pw] %s on %s @%dm', PHANTOM, e.name, dist)
+    pcall(function() mq.cmdf('/disc %s', PHANTOM) end)
+    pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev }
+end
+
+function draw_phantom()
+    local holder = nil
+    for _, nm in ipairs(group_members()) do
+        if pwState[nm] then holder = nm; break end
+    end
+    if ImGui.Button('Phantom Whispers', 150, 0) then
+        local id, nm, ty, hp = 0, '', '', 0
+        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
+        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
+        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
+        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
+        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
+            log('\\ay[pw] target an NPC first\\ax')
+        elseif pw_find(id) then
+            log('[pw] %s is already queued', nm)
+        else
+            pwQueue[#pwQueue + 1] = { id = id, name = nm, oor = false }
+            log('[pw] queued %s (%d in the list)', nm, #pwQueue)
+            pcall(function() peer_bcast('/at_pwadd %d %s', id, nm:gsub(' ', '_')) end)
+        end
+    end
+    -- Always present, not just when the list has something in it: a control that appears and disappears
+    -- is one you have to hunt for, and it moves everything below it when it does.
+    ImGui.SameLine()
+    if ImGui.SmallButton('Clear list##pwclear') then
+        pwQueue, pwDoneAt = {}, nil
+        pcall(function() peer_bcast('/at_pwclear') end)
+        log('[pw] queue cleared')
+    end
+    if #pwQueue == 0 then return end
+    local pending = 0
+    for i, e in ipairs(pwQueue) do
+        if not e.state then pending = pending + 1 end
+        ImGui.Text(string.format('%d.', i)); ImGui.SameLine()
+        local label, tip
+        if e.state == 'done' then
+            ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (on)')
+            tip = e.name .. '\n' .. PHANTOM .. ' is on it'
+        elseif e.state == 'failed' then
+            ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
+            tip = e.name .. '\ngave up on this one - dead, gone, or it would not land'
+        elseif e.oor then
+            ImGui.TextColored(0.90, 0.35, 0.35, 1.0, e.name .. '  (oor)')
+            tip = e.name .. '\nout of range - ' .. (holder or 'the holder') .. ' is holding until it is closer'
+        else
+            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, e.name)
+            tip = e.name .. '\nwaiting its turn'
+        end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(tip) end)
+        end
+        ImGui.SameLine()
+        if ImGui.SmallButton('x##pwdel' .. i) then
+            pcall(function() peer_bcast('/at_pwdel %d', e.id) end)
+            table.remove(pwQueue, i)
+            break
+        end
+    end
+    -- All resolved: hold the finished list up briefly so the sweep is actually visible, then tidy.
+    if pending == 0 and #pwQueue > 0 then
+        pwDoneAt = pwDoneAt or mq.gettime()
+        local hold = (#pwQueue == 1) and PW_LINGER_ONE or PW_LINGER
+        local left = math.max(0, hold - (mq.gettime() - pwDoneAt))
+        ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
+        if left <= 0 then
+            pwQueue, pwDoneAt = {}, nil
+            pcall(function() peer_bcast('/at_pwclear') end)
+        end
+    else
+        pwDoneAt = nil
+    end
+    ImGui.Spacing()
+end
+
 function draw_arcane_buttons()
     local btns = {}
     for _, nm in ipairs(group_members()) do
@@ -6288,6 +6531,8 @@ MINI_SECTIONS = {
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
     { key = 'arcane', label = 'Arcane Reprisal',        draw = draw_arcane_buttons,
       get = function() return miniArcane end, set = function(v) miniArcane = v end },
+    { key = 'phantom', label = 'Phantom Whispers',      draw = draw_phantom,
+      get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
 function mini_section(key)
@@ -6613,6 +6858,13 @@ local function render()
         windowOpen = show
         if show then
             if ImGui.SmallButton('Expand') then miniMode = false; save_settings() end
+            ImGui.SameLine()
+            -- The same Close all that sits at the bottom of the expanded window, put where it can be
+            -- reached without expanding first. It sets the flag and the MAIN LOOP does the work - the
+            -- broadcast and exit must not happen inside an ImGui callback.
+            -- Deliberately NOT a new /at_close bind: that name is already the group shutdown, and binding
+            -- it again here would have silently replaced it with something that only hides a window.
+            if ImGui.SmallButton('Close all##miniclose') then closeAllRequested = true end
             -- The Burns and Rez toggles that used to sit here are gone. They predated Settings owning
             -- section visibility, covered only 2 of the 8 sections, and - the real problem - flipped
             -- the flag WITHOUT saving, so anything set from here reverted on the next restart while
@@ -7042,6 +7294,13 @@ while running do
         -- is bad, but a DI system that quietly stops is exactly what we could not see.
         pcall(arc_retry_tick)
         pcall(pot_retry_tick)
+        pcall(pw_tick)
+        if not pwSaidHave and pw_have() then
+            pwSaidHave = true
+            pwState[myName] = true
+            pcall(function() peer_bcast('/at_pwhave %s', myName) end)
+            log('[pw] I have %s - I will work the queue', PHANTOM)
+        end
         do
             local ok, err = pcall(di_check_landed)
             if not ok and (mq.gettime() - (DI.lastCheckErr or 0)) > 60000 then
@@ -7553,6 +7812,12 @@ pcall(function() mq.unbind('/at_rezorder?') end)
 pcall(function() mq.unbind('/at_bags') end)
 pcall(function() mq.unbind('/at_arcstate') end)
 pcall(function() mq.unbind('/at_arcane') end)
+pcall(function() mq.unbind('/at_pwhave') end)
+pcall(function() mq.unbind('/at_pwoor') end)
+pcall(function() mq.unbind('/at_pwmark') end)
+pcall(function() mq.unbind('/at_pwclear') end)
+pcall(function() mq.unbind('/at_pwdel') end)
+pcall(function() mq.unbind('/at_pwadd') end)
 pcall(function() mq.unbind('/atburnraw') end)
 pcall(function() mq.cmd('/e3p off') end)   -- always hand our toon back to E3 on the way out
 if SHOW_UI then mq.imgui.destroy(scriptName) end
