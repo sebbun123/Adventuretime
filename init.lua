@@ -44,7 +44,14 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-rezgate-2026-08-01'   -- bump on every change; prints on startup
+-- VERSION vs BUILD_TAG. They answer different questions and both are worth having:
+--   VERSION   what release this is. Moves rarely, and means something to a person - "am I on 1.0 or
+--             1.1" is a question about features.
+--   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
+--             my edit land" cost a round trip more than once before TSL had one.
+-- Shown together in the log header and the title bar, so a screenshot answers both.
+VERSION = '1.0'
+local BUILD_TAG = 'at-1.0-2026-08-02'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -95,8 +102,8 @@ do
     local fh = io.open(LOG_FILE_PATH, 'w')   -- rewrite: kept prior sessions, then this one
     if fh then
         if prior ~= '' then fh:write(prior) end
-        fh:write(string.format('=== AdventureTime log (%s) - started %s [build %s] ===\n',
-            who, os.date('%Y-%m-%d %H:%M:%S'), BUILD_TAG))
+        fh:write(string.format('=== AdventureTime %s log (%s) - started %s [build %s] ===\n',
+            VERSION, who, os.date('%Y-%m-%d %H:%M:%S'), BUILD_TAG))
         fh:close()
     else
         LOG_FILE_PATH = nil
@@ -178,6 +185,24 @@ for _, base in ipairs(DRAUGHTS) do
 end
 ITEMS[#ITEMS + 1] = 'Orb of Shadows'
 ITEMS[#ITEMS + 1] = 'Emerald'
+ITEMS[#ITEMS + 1] = 'Ruby'
+-- DIAMOND COIN IS DELIBERATELY NOT IN THIS LIST. It is handled on its own row with its own button,
+-- because it behaves differently from everything else here: it exists half in bags and half in a
+-- currency tab, needs converting before it can be moved, and is wanted occasionally rather than kept
+-- topped up. Folding that into the shared Give out made the common case carry the odd one's baggage -
+-- six extra queries on every refresh, a currency read nobody asked for, and a conversion step in the
+-- middle of a routine that otherwise just moves things.
+-- ITEMS drives the counts pass, the grid and the planner, so leaving it out keeps all three simple.
+ALT_ITEMS = { 'Diamond Coin' }
+
+-- Everything a REFRESH should read. Give out still walks ITEMS on its own, so a general hand-out never
+-- disturbs the alt items - but "what has everyone got" means all of it.
+function all_items()
+    local t = {}
+    for _, it in ipairs(ITEMS) do t[#t + 1] = it end
+    for _, it in ipairs(ALT_ITEMS) do t[#t + 1] = it end
+    return t
+end
 
 -- ---------------------------------------------------------------------------
 -- Group draught buttons. One press = every group member drinks the BEST tier it personally holds.
@@ -279,6 +304,12 @@ function class_key(c)
     return CLASS_SHORT[c] or c
 end
 local function is_mana(item) return item:find('Clear Mind', 1, true) ~= nil end
+-- Rubies are a cleric reagent - nobody else consumes them, so they are greyed everywhere else exactly
+-- as endurance draughts are on casters and Clear Mind is on pure melee. Same mechanism, one more table:
+-- the grid should say "this toon will never use these" rather than showing a red shortfall against a
+-- target that does not apply to them.
+local WANTS_RUBY = { CLR = true }
+local function is_ruby(item) return item == 'Ruby' end
 
 -- Encode/decode an item name for passing over the peer command channel (names have spaces).
 local function enc(name) return (tostring(name):gsub(' ', '_')) end
@@ -289,6 +320,9 @@ local function dec(name) return (tostring(name):gsub('_', ' ')) end
 -- ---------------------------------------------------------------------------
 local target = {}   -- itemName -> target qty per character
 for _, it in ipairs(ITEMS) do target[it] = 0 end
+-- Alt items are not in ITEMS - they are handled separately - but they still need a target to be typed
+-- into and saved, so the quantity survives a reload like every other row's does.
+for _, it in ipairs(ALT_ITEMS) do target[it] = 0 end
 
 local SETTINGS_PATH
 do
@@ -317,6 +351,7 @@ local function save_targets()
     if not fh then return end
     fh:write('; AdventureTime per-character target quantities\n')
     for _, it in ipairs(ITEMS) do fh:write(string.format('%s=%d\n', enc(it), target[it] or 0)) end
+    for _, it in ipairs(ALT_ITEMS) do fh:write(string.format('%s=%d\n', enc(it), target[it] or 0)) end
     fh:close()
 end
 
@@ -501,6 +536,157 @@ local peerClass = {}   -- peerlower -> class ShortName; static per character, so
 -- item we fire its next one, while other peers are still on earlier items. So a jittery/slow peer no
 -- longer gates every item-sweep; total time is bounded by the busiest single peer, not the sum of
 -- per-item worst cases. A fire and its read are always a poll-tick apart, so we never read a stale slot.
+-- ALT CURRENCY BALANCES, per peer. Deliberately separate from query_all_counts: that pass exists to
+-- move 90 item queries without flooding DanNet, with adaptive pacing and a re-fire sweep. This is one
+-- query per peer for one currency, so all of that machinery would be overhead.
+-- Currency is NOT an item - it lives in the inventory window's Alt. Currency tab and FindItemCount
+-- cannot see it - so it needs its own read, and this is the one that makes the Withdraw column mean
+-- something rather than showing zero for everybody.
+altCounts = {}   -- [peerLower][currencyName] = balance
+-- MY OWN balance, read the way the probe established: off the currency LIST, column 1 is the name and
+-- column 2 is the count. Me.AltCurrency was the obvious guess and is not what was verified - the probe
+-- dumped "row 3: col1=\"Diamond Coin\" col2=\"4271\"" and that is the reading to trust.
+-- Needs the inventory window open on the Alt. Currency tab; the rows only populate on that page.
+-- Put the inventory window back if WE opened it. Only closes what we opened - a window the player had
+-- up stays up.
+-- ANNOUNCE MY OWN BALANCE AND COUNT. Pushed by whoever just did something, rather than waited for by
+-- the driver on a timer it has to guess. Every timed guess tonight has been wrong in one direction or
+-- the other, and this one was wrong in the worst way: the board showed a number that had been correct
+-- a minute earlier, which reads exactly like a number that is correct now.
+-- The toon that converted or reclaimed knows the moment it finishes; it just has to say so.
+function altcur_announce(name)
+    local bal = altcur_balance(name)
+    local bags = 0
+    pcall(function() bags = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+    pcall(function()
+        peer_bcast('/at_altbal %s %s %d', myName, name:gsub(' ', '_'), bal or -1)
+    end)
+    pcall(function()
+        peer_bcast('/at_altbags %s %s %d', myName, name:gsub(' ', '_'), bags)
+    end)
+end
+
+altcurCloseAfter = false
+function altcur_done()
+    if not altcurCloseAfter then return end
+    altcurCloseAfter = false
+    pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end)
+end
+
+-- SCAN THE COLUMNS, do not assume which one holds what. The name is not necessarily in column 1 - the
+-- first column may be an icon or blank - and the count is not necessarily column 2. Assuming 1 and 2
+-- is why this read "not listed" for every currency while the list plainly had 10 rows in it.
+-- The July probe got this right by design: it walked columns 1..6 and reported only the non-empty ones.
+-- Matches on CONTAINS rather than equals, because a row label may carry a count or padding with it.
+function altcur_balance(name)
+    -- NO WINDOW-OPEN GATE. This used to refuse to read unless InventoryWindow was open, on the strength
+    -- of a note that "the rows only populate on that page". The log disproved it in passing:
+    --     window open: false
+    --     currency list rows: 10
+    -- The list is there whether the window is shown or not. The gate was the entire reason peers
+    -- reported "shut" - they could have answered all along.
+    -- If a client really does return nothing, opening the window is tried below rather than assumed.
+    -- A CLOSED WINDOW READS, BUT IT READS STALE. The earlier conclusion was half right: the list does
+    -- return rows with the window shut, which is why balances appeared at all - but the values are
+    -- whatever they were when it was last shown. Lunafeet converted 7,000 coins and her row still read
+    -- 12,481, because nothing had refreshed the closed window's copy.
+    -- So the window is opened for the read every time, and put straight back if we opened it. A few
+    -- hundred milliseconds per character, against a number that is otherwise quietly wrong.
+    local wasOpen = false
+    pcall(function() wasOpen = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+    if not wasOpen then
+        pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
+        mq.delay(600, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
+        altcurCloseAfter = true
+        mq.delay(200)   -- let the list populate before reading it
+    end
+    local rows = 0
+    pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
+    local want = name:lower()
+    for i = 1, rows do
+        local cells, hit = {}, false
+        for c = 1, 6 do
+            local v = ''
+            pcall(function() v = tostring(mq.TLO.Window(ALTCUR_LIST).List(i, c)() or '') end)
+            cells[c] = v
+            if v ~= '' and v:lower():find(want, 1, true) then hit = true end
+        end
+        if hit then
+            -- The balance is the first column in this row that is purely a number. Taking "the next
+            -- column" would break the moment the layout differs by one.
+            for c = 1, 6 do
+                local v = (cells[c] or ''):gsub('[%s,]', '')
+                if v ~= '' and v:match('^%d+$') then altcur_done(); return tonumber(v) end
+            end
+            altcur_done()
+            return 0   -- listed, but no numeric column found: they have a row and no balance
+        end
+    end
+    altcur_done()
+    return nil   -- not listed at all
+end
+
+-- Balances across the group. A peer can only read its own list, and only with that window open - so
+-- this asks each peer to report rather than trying to read their client from here.
+function query_alt_currency(peers, name)
+    altCounts[myName:lower()] = altCounts[myName:lower()] or {}
+    altCounts[myName:lower()][name] = altcur_balance(name)
+
+    -- RE-FIRE THE ONES THAT DO NOT ANSWER. This fired once per peer with no spacing and no retry, while
+    -- the item counts beside it get three re-fires and an adaptive gap - so a single dropped message left
+    -- a permanent "?" against a character that was perfectly reachable. Two of six missed on 2026-08-02.
+    -- Cheap to do properly: this is one query per peer, not ninety, so a flat gap and three rounds is
+    -- plenty without any of the counts pass's pacing machinery.
+    local waiting = {}
+    for _, p in ipairs(peers) do
+        if p:lower() ~= myName:lower() then
+            waiting[#waiting + 1] = p
+            altCounts[p:lower()] = altCounts[p:lower()] or {}
+            altCounts[p:lower()][name] = nil   -- clear, so a stale value cannot look like a fresh answer
+        end
+    end
+
+    for round = 1, 3 do
+        if #waiting == 0 then break end
+        for _, p in ipairs(waiting) do
+            pcall(function() peer_cmdf(p, '/at_altrep %s %s', name:gsub(' ', '_'), myName) end)
+            mq.delay(60)   -- spacing: bunched fires are what DanNet drops
+        end
+        -- Give them a moment, pumping events so replies actually land.
+        local deadline = mq.gettime() + 900
+        while mq.gettime() < deadline do
+            mq.doevents(); mq.delay(50)
+            local still = {}
+            for _, p in ipairs(waiting) do
+                if (altCounts[p:lower()] or {})[name] == nil then still[#still + 1] = p end
+            end
+            waiting = still
+            if #waiting == 0 then break end
+        end
+        if #waiting > 0 and round < 3 then
+            log('[currency] no answer from %s - re-asking (round %d)', table.concat(waiting, ', '), round + 1)
+        end
+    end
+    if #waiting > 0 then
+        log('\\ay[currency] %s never answered - shown as ?\\ax', table.concat(waiting, ', '))
+    end
+end
+
+-- Who should do the withdrawing: whoever holds the most, so one pull covers the request more often.
+-- Returns name and balance, or nil when nobody has any.
+function alt_richest(name)
+    local best, bestN = nil, 0
+    for peer, t in pairs(altCounts) do
+        local n = (t or {})[name]
+        -- type check, not just truthiness: 'shut' is a string and comparing it with > would throw.
+        if type(n) == 'number' and n > bestN then best, bestN = peer, n end
+    end
+    return best, bestN
+end
+
+-- NOTE: this REPLACES the counts table, it does not merge into it. Anything not in `items` is gone
+-- afterwards - so this is a full-refresh call and a partial list will blank every other row on the
+-- board. Pass all_items() unless you genuinely want everything else discarded.
 local function query_all_counts(peers, items)
     counts = { [myName:lower()] = { __got = true, __class = mq.TLO.Me.Class.ShortName() or '?' } }
     for _, it in ipairs(items) do counts[myName:lower()][it] = my_count(it) end
@@ -1584,7 +1770,7 @@ local function save_settings()
             f:write('rezAccept=' .. (rezAccept and '1' or '0') .. '\n')
             f:write('rezCotw=' .. (rezCotw and '1' or '0') .. '\n')
             f:write('diLadderOff=' .. (DI.ladderOff and '1' or '0') .. '\n')
-            for _, k in ipairs({ 'tribute', 'pots', 'burns', 'rez', 'misc' }) do
+            for _, k in ipairs({ 'tribute', 'pots', 'burns', 'rez' }) do
                 f:write('show_' .. k .. '=' .. (showSec[k] and '1' or '0') .. '\n')
             end
             f:write('diAuto=' .. (DI.auto and '1' or '0') .. '\n')
@@ -1594,10 +1780,12 @@ local function save_settings()
             f:write('miniCures=' .. (miniCures and '1' or '0') .. '\n')
             f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
             f:write('miniPhantom=' .. (miniPhantom and '1' or '0') .. '\n')
+            f:write('miniPlacate=' .. (miniPlacate and '1' or '0') .. '\n')
+            f:write('epGem=' .. tostring(epGem or 8) .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
-            f:write('miniBurnTable=' .. (miniBurnTable and '1' or '0') .. '\n')
+            f:write('miniBurnView=' .. tostring(miniBurnView) .. '\n')
             f:write('charOrder=' .. table.concat(charOrder, ',') .. '\n')
             f:write('miniBurnFilter=' .. tostring(miniBurnFilter) .. '\n')
             f:write('miniBurns=' .. (miniBurns and '1' or '0') .. '\n')
@@ -1633,9 +1821,14 @@ local function load_settings()
             if k == 'miniCures' then miniCures  = (v == '1' or v:lower() == 'true') end
             if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
             if k == 'miniPhantom' then miniPhantom = (v == '1' or v:lower() == 'true') end
+            if k == 'miniPlacate' then miniPlacate = (v == '1' or v:lower() == 'true') end
+            if k == 'epGem' then epGem = math.max(1, math.min(12, tonumber(v) or 8)) end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
-            if k == 'miniBurnTable' then miniBurnTable = (v == '1' or v:lower() == 'true') end
+            -- Migration: old files carry miniBurnTable, new ones miniBurnView. Reading both means an
+            -- upgrade keeps whichever view was in use rather than silently resetting it.
+            if k == 'miniBurnTable' then miniBurnView = (v == '1' or v:lower() == 'true') and 2 or 1 end
+            if k == 'miniBurnView' then miniBurnView = math.max(0, math.min(2, tonumber(v) or 1)) end
             if k == 'xtankAnnounce' then xtankAnnounce = (v == '1' or v:lower() == 'true') end
             if k == 'xtankPinned' then
                 xtankPinned = {}
@@ -1809,68 +2002,6 @@ function coth_set(on, anchor)
         COTH.active and (' - gathering on ' .. anchor) or '')
 end
 
-function draw_misc_tab()
-    ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Call of the Hero')
-    ImGui.TextDisabled('Gathers the group. Emblem holders are pulled first - each one becomes another')
-    ImGui.TextDisabled('summoner, so it cascades instead of one toon casting five times.')
-    ImGui.Spacing()
-    if COTH.active then
-        if ImGui.Button('Stop gather', 110, 0) then coth_set(false) end
-    else
-        if ImGui.Button('CoTH Group', 110, 0) then coth_set(true) end
-    end
-    ImGui.SameLine()
-    if ImGui.Button('Resync group', 110, 0) then resync_group() end
-    ImGui.SameLine()
-    if COTH.active then
-        ImGui.TextColored(0.36, 0.80, 0.46, 1, 'gathering on ' .. (coth_anchor() or '?'))
-    else
-        ImGui.TextDisabled('idle')
-    end
-    ImGui.Spacing()
-    -- No table. A gather is automatic and over in seconds, so nobody sits reading six rows of distances
-    -- while it runs - and when idle nothing reports at all, which made it six rows of '?' saying
-    -- nothing. What actually matters is a stalled gather and WHY, so: one line, detail on hover.
-    if not COTH.active and next(COTH.state) == nil then
-        ImGui.TextDisabled('Positions are only reported while a gather is running.')
-    else
-        local here, total, rows = 0, 0, {}
-        for _, nm in ipairs(group_members()) do
-            total = total + 1
-            local st = COTH.state[nm]
-            local why
-            if coth_gathered(nm) then
-                here = here + 1
-            elseif not st then
-                why = 'no report'
-            elseif (st.dist or -1) < 0 then
-                why = 'position unknown'
-            elseif st.dist <= COTH.RANGE and (st.los or 0) == 0 then
-                why = string.format('%d away, no line of sight', st.dist)
-            else
-                why = string.format('%d away', st.dist)
-            end
-            local em = st and st.emblem or -1
-            if em > 0 then
-                why = (why and (why .. ', ') or '') .. string.format('emblem %d:%02d', math.floor(em / 60), em % 60)
-            end
-            if why then rows[#rows + 1] = nm .. '  ' .. why end
-        end
-        local cr, cg, cb
-        if here >= total then   cr, cg, cb = 0.36, 0.80, 0.46
-        elseif here > 0 then    cr, cg, cb = 0.95, 0.85, 0.30
-        else                    cr, cg, cb = 0.85, 0.35, 0.35 end
-        ImGui.TextColored(cr, cg, cb, 1.0, string.format('%d/%d gathered', here, total))
-        if #rows > 0 then
-            ImGui.SameLine()
-            ImGui.TextDisabled('(hover for who)')
-            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                pcall(function() ImGui.SetTooltip(table.concat(rows, '\n')) end)
-            end
-        end
-    end
-    if COTH.dbg ~= '' then ImGui.Spacing(); ImGui.TextColored(0.55, 0.70, 0.80, 1.0, COTH.dbg) end
-end
 
 local function coth_tick()
     if not COTH.active then return end
@@ -3947,6 +4078,148 @@ pcall(function()
         local i = pw_find(tonumber(id) or 0); if i then table.remove(pwQueue, i) end
     end)
     mq.bind('/at_pwclear', function() pwQueue = {} end)
+    mq.bind('/at_epadd', function(id, nm)
+        id = tonumber(id); if not id or ep_find(id) then return end
+        epQueue[#epQueue + 1] = { id = id, name = (nm or '?'):gsub('_', ' '), oor = false }
+    end)
+    mq.bind('/at_epdel', function(id)
+        local i = ep_find(tonumber(id) or 0); if i then table.remove(epQueue, i) end
+    end)
+    mq.bind('/at_epclear', function() epQueue, epDoneAt = {}, nil end)
+    mq.bind('/at_epmark', function(id, st)
+        local _, e = ep_find(tonumber(id) or 0)
+        if e then e.state, e.oor = st, false end
+    end)
+    mq.bind('/at_ephave', function(who) if who and who ~= '' then epState[who] = true end end)
+    mq.bind('/at_epgem', function(n)
+        local g = math.max(1, math.min(12, math.floor(tonumber(n) or 8)))
+        if g ~= epGem then
+            epGem = g
+            epSaidGem, epMemAt = nil, nil   -- new gem: re-check and allow a fresh mem attempt
+            save_settings()
+            log('[placate] gem set to %d by the driver%s', g,
+                ep_is_enchanter() and (' (' .. (ep_spell() or 'that gem is empty') .. ')') or '')
+        end
+    end)
+    -- Manual escape hatch. If a run is abandoned with the weapons off - a crash, a zone, a stop - this
+    -- puts them back without waiting for the backstop.
+    mq.bind('/atregear', function() ep_restore('asked by hand') end)
+    -- What each slot actually reads. If a strip ever quietly does nothing again, this says why in one
+    -- line instead of by inference - the same trick that settled the DI staff timer.
+    mq.bind('/atplacatetest', function(n) epTestWant = tonumber(n) or 10 end)
+    -- IS IT AN ITEM OR A CURRENCY? The give-out counts things with FindItemCount, which only sees
+    -- inventory. Alt currency lives in its own tab and is read off the currency LIST, so if Diamond Coin
+    -- is currency then no amount of item-counting will ever find it - which is the likely reason this
+    -- was started once and never finished.
+    -- Prints both readings side by side so the answer is data rather than assumption.
+    -- Pull currency out as items so the give-out can distribute it. Runs from the MAIN LOOP, not here:
+    -- it drives windows and delays for seconds.
+    mq.bind('/atpull', function(a, b)
+        local qty = tonumber(b) or tonumber(a)
+        local nm  = tonumber(a) and 'Diamond Coin' or (a or 'Diamond Coin')
+        if a and not tonumber(a) and b then nm = a end
+        altPullWant = { name = nm:gsub('_', ' '), qty = qty or 20 }
+    end)
+    -- A peer reporting its own currency balance. It has to be read locally - the list only exists on
+    -- that client, and only when its inventory is open on the Alt. Currency tab.
+    mq.bind('/at_altrep', function(nm, asker)
+        if not nm or not asker then return end
+        local name = nm:gsub('_', ' ')
+        local bal = altcur_balance(name)
+        pcall(function()
+            peer_cmdf(asker, '/at_altbal %s %s %d', myName, nm, bal or -1)
+        end)
+    end)
+    mq.bind('/at_altbags', function(who, nm, v)
+        if not who or not nm then return end
+        local name = nm:gsub('_', ' ')
+        counts[who:lower()] = counts[who:lower()] or {}
+        counts[who:lower()][name] = tonumber(v) or 0
+        statusCounts[who:lower()] = counts[who:lower()]
+    end)
+    mq.bind('/at_altbal', function(who, nm, v)
+        if not who or not nm then return end
+        local name = nm:gsub('_', ' ')
+        altCounts[who:lower()] = altCounts[who:lower()] or {}
+        local n = tonumber(v)
+        -- THREE OUTCOMES, not two. -1 means the peer answered but could not read its own list - almost
+        -- always an inventory window that is shut or not on the Alt. Currency tab. That is a different
+        -- thing from never answering, and the difference is actionable: one needs a window opened, the
+        -- other needs the query re-firing. Storing both as nil made them indistinguishable.
+        altCounts[who:lower()][name] = (n and n >= 0) and n or 'shut'
+    end)
+    mq.bind('/attribprobe', function() trib_probe() end)
+    mq.bind('/attribute', function(a, b)
+        local qty = tonumber(b) or tonumber(a) or 0
+        local nm  = (a and not tonumber(a)) and a:gsub('_', ' ') or 'Diamond Coin'
+        if qty <= 0 then log('[tribute] /attribute [item] <qty>'); return end
+        tribWant = { item = nm, qty = qty }
+    end)
+    mq.bind('/attab', function()
+        log('[altcur] looking for the Alt. Currency tab...')
+        altcurTabFound = nil
+        local wasOpen = false
+        pcall(function() wasOpen = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+        if not wasOpen then
+            pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
+            mq.delay(600, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
+        end
+        mq.delay(400)   -- a freshly opened window needs a beat before the list is readable
+        local t = altcur_find_tab('Diamond Coin')
+        if not t then log('[altcur] tab not identified - see the line above for why') end
+        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+    end)
+    -- No quantity argument: Reclaim converts every stack of the item in one press.
+    mq.bind('/atreclaim', function(a)
+        local nm = (a and a ~= '') and a:gsub('_', ' ') or 'Diamond Coin'
+        altReclaimWant = { name = nm }
+    end)
+    mq.bind('/atcurrency', function()
+        log('[currency] item counts vs alt-currency balances:')
+        log('   window open: %s  (not required - the list reads either way)',
+            tostring(mq.TLO.Window(ALTCUR_WND).Open()))
+        local rows = 0
+        pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
+        log('   currency list rows: %d  (0 = inventory closed, or not on the Alt. Currency tab)', rows)
+        -- EVERY row, and every column that has anything in it. The previous version printed a row only
+        -- when column 1 was non-empty, so a list whose names live in column 2 printed nothing at all -
+        -- which is exactly what happened: 10 rows reported and not one shown.
+        for i = 1, math.min(rows, 20) do
+            local cells = {}
+            for c = 1, 6 do
+                local v = ''
+                pcall(function() v = tostring(mq.TLO.Window(ALTCUR_LIST).List(i, c)() or '') end)
+                if v ~= '' then cells[#cells + 1] = string.format('col%d="%s"', c, v) end
+            end
+            log('     row %-2d  %s', i, (#cells > 0) and table.concat(cells, '  ') or '(all columns empty)')
+        end
+        for _, nm in ipairs({ 'Diamond Coin', 'Ruby', 'Emerald', 'Orb of Shadows' }) do
+            local items = 0
+            pcall(function() items = tonumber(mq.TLO.FindItemCount('=' .. nm)()) or 0 end)
+            log('   %-16s bags=%-6d list=%s', nm, items, tostring(altcur_balance(nm) or 'not listed'))
+        end
+    end)
+    mq.bind('/atslots', function()
+        for _, sl in ipairs({ 'mainhand', 'offhand', 'ranged', 'primary', 'secondary', 'range' }) do
+            local nm = 'n/a'
+            pcall(function() nm = tostring(mq.TLO.Me.Inventory(sl).Name() or 'EMPTY') end)
+            log('  Inventory[%-10s] = %s', sl, nm)
+        end
+    end)
+    -- Set the gem from anywhere without the window, and report it when asked with no argument. The
+    -- broadcast means it does not matter which toon you type it on.
+    mq.bind('/atplacategem', function(n)
+        local g = tonumber(n)
+        if not g then
+            log('[placate] gem is %d%s', epGem or 8,
+                ep_is_enchanter() and (' - ' .. (ep_spell() or 'that gem is empty')) or '')
+            return
+        end
+        g = math.max(1, math.min(12, math.floor(g)))
+        epGem = g; save_settings()
+        pcall(function() peer_bcast('/at_epgem %d', g) end)
+        log('[placate] gem set to %d for the group', g)
+    end)
     mq.bind('/at_pwmark', function(id, st)
         local _, e = pw_find(tonumber(id) or 0)
         if e then e.state, e.oor = st, false end
@@ -4411,6 +4684,24 @@ pcall(function()
     -- 2026-07-30 that caught an unrelated heal of Nityrc's blocked by the shaman's Transcendental Torpor
     -- and reported it as the STAFF being blocked, because the only other test was timing. The spell is
     -- captured now and has to be one of the saves the staff actually casts before it counts.
+    -- THE GAME SAYS SO WHEN A MOB CANNOT BE PLACATED AT ALL. Retrying an immune mob is three casts and
+    -- three cast times spent proving something the first message already told us - and worse, it looks
+    -- exactly like a resist, which IS worth retrying. This tells the two apart.
+    -- Marks whichever queue currently has a cast in flight; both use the same "did it land" question.
+    mq.event('at_ep_immune', 'Your target looks unaffected#*#', function()
+        if epCast then
+            rezlog('[placate] %s is immune - not retrying', epCast.name)
+            ep_mark(epCast.id, 'immune', 'immune to placate')
+            epCast = nil
+        elseif pwCast then
+            rezlog('[pw] %s is immune - not retrying', pwCast.name or '?')
+            pw_mark(pwCast.id, 'immune', 'immune to it')
+            if pwCast.prevTarget and pwCast.prevTarget > 0 then
+                pcall(function() mq.cmdf('/target id %d', pwCast.prevTarget) end)
+            end
+            pwLast, pwCast = mq.gettime(), nil
+        end
+    end)
     mq.event('at_di_blocked', 'Your #1# did not take hold on #2#.#*#', function(line, spell, who)
         local sp = tostring(spell or ''):lower()
         local mine = false
@@ -4506,12 +4797,19 @@ end
 -- the start AND end of a trade returns each bag to its original open/closed state - and in between the
 -- normally-closed bags are OPEN, so the quantity split pops without a right-click per pickup.
 local function toggle_all_bags()
+    -- FIRE THEM ALL, THEN SETTLE ONCE. This waited 50ms after every bag, so ten bags cost 500ms of
+    -- nothing before the 300ms settle even started - and the settle is what actually matters, since the
+    -- windows come up asynchronously regardless of how the commands were spaced.
+    -- Reading Container() per bag is cheap; it is only the delays that were expensive.
+    local opened = 0
     for b = 1, 10 do
         if (mq.TLO.Me.Inventory('pack' .. b).Container() or 0) > 0 then
-            mq.cmdf('/itemnotify pack%d rightmouseup', b); mq.delay(50)
+            mq.cmdf('/itemnotify pack%d rightmouseup', b)
+            opened = opened + 1
         end
     end
-    mq.delay(300)   -- let the container windows settle
+    -- One settle, scaled a little by how many actually went out rather than a flat number.
+    if opened > 0 then mq.delay(250 + opened * 20) end
 end
 pcall(function() mq.bind('/at_bags', function() toggle_all_bags() end) end)
 
@@ -4798,9 +5096,27 @@ miniCombos      = false   -- show the combo buttons in the mini window
 miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the mini window
 miniArcane      = false   -- show the Arcane Reprisal row in the mini window
 miniPhantom     = false   -- show the Phantom Whispers queue in the mini window
+miniPlacate     = false   -- show the enchanter Placate queue in the mini window
+epState         = {}      -- char -> true when that toon is the enchanter working the queue
+epLast          = 0
+epSaidGem       = nil     -- last gem contents we spoke about, so it is said once not every tick
+epMemAt         = nil     -- when we last issued a /memspell, so we do not stack attempts
+epPrevTarget    = 0       -- the caller's target when the run started; put back when the queue finishes
+epTestWant      = nil     -- set by /atplacatetest; the MAIN LOOP runs the soak, not the bind callback
+altPullWant     = nil     -- set by /atpull; the MAIN LOOP does the window driving
+altWithdrawAllWant = nil  -- set by Withdraw All; the MAIN LOOP asks EVERY holder
+altReclaimAllWant  = nil  -- set by Reclaim All; asks every holder to push items back to currency
+altReclaimWant     = nil  -- set by /atreclaim on this toon
+altcurTabFound  = nil     -- the Alt. Currency tab index once proven, so the search runs once
+tribWant        = nil     -- set by the Tribute button; the MAIN LOOP navs and donates
+tribGroupWant   = nil     -- set by Trib group; the MAIN LOOP fans it out to everyone holding some
+tribBagsOpen    = false   -- so cleanup only closes bags this routine actually opened
+dcGiveWant      = nil     -- set by the Diamond Coin Give button; the MAIN LOOP runs it
+altCurRefresh   = nil     -- when to re-read balances after a withdraw
 arcLast         = nil     -- my last-pushed arcane state, for change detection
 miniMagic       = false   -- show the magic protection clicky buttons in the mini window
-miniBurnTable   = false   -- burns section: false = dot matrix, true = the full detail table
+miniBurnView    = 1       -- burns section: 0 = compact, 1 = tier matrix, 2 = full detail table
+miniBurnTable   = false   -- LEGACY, kept only so an old settings file can be migrated below
 -- Who appears first, left to right. Separate from rezPriority on purpose: that is who gets RESSED
 -- first, which is a different question from who you want to read first. Empty = plain group order.
 charOrder       = {}
@@ -4886,6 +5202,9 @@ local function give_out()
         local ck = class_key(c)
         if ck and is_endurance(item) and not WANTS_ENDURANCE[ck] then return 0 end
         if ck and is_mana(item) and not WANTS_MANA[ck] then return 0 end
+        -- The PLANNER, not just the display. Greying a cell without this would be cosmetic - the give-out
+        -- would still walk rubies out to five characters who cannot use them.
+        if ck and is_ruby(item) and not WANTS_RUBY[ck] then return 0 end
         return target[item] or 0
     end
 
@@ -5063,6 +5382,8 @@ local COL_I    = { 0.45, 0.70, 0.96 }
 local COL_II   = { 0.96, 0.62, 0.28 }
 local COL_ORB  = { 0.74, 0.55, 0.96 }
 local COL_EM   = { 0.50, 0.86, 0.50 }
+local COL_RUBY = { 0.90, 0.35, 0.42 }   -- ruby red
+local COL_DC   = { 0.62, 0.82, 0.95 }   -- diamond pale blue
 
 -- Grouped item lists (organized by tier).
 local LIST_I, LIST_II = {}, {}
@@ -5073,7 +5394,12 @@ end
 
 local function short_name(n) return (n:sub(1, 7)) end   -- 7: 'Sunetoo' fits, 5 gave 'Sunet'
 
-local function render_group(label, color, items)
+-- `altCurrency` draws one extra row INSIDE this table for a currency of the same name. It has to be in
+-- the table or it cannot line up: the balances belong under the same per-character columns as the item
+-- counts, and a line drawn after EndTable is just text floating under a grid at whatever width it likes.
+-- That is what "Alt Currency: Sebb 168 Nity 100 ..." was - correct numbers, no relationship to the
+-- columns above them.
+local function render_group(label, color, items, altCurrency)
     if label then ImGui.TextColored(color[1], color[2], color[3], 1.0, label) end
     -- A COUNT, not a flag. pop_state_button pops n colours, and a boolean here short-circuits to a
     -- no-op - which would leave this table-border push on the stack every frame.
@@ -5085,13 +5411,22 @@ local function render_group(label, color, items)
         if ok then pushed = 1 end
     end
     local statusOn = #statusNames > 0   -- shown by default once counts are read
-    local nCols = statusOn and (2 + #statusNames) or 2   -- name + [one per toon] + target
+    -- One more column for the group TOTAL. Free: it is a sum of numbers already fetched, so no extra
+    -- query and no extra network - the counts pass is unchanged.
+    local nCols = statusOn and (3 + #statusNames) or 2   -- name + [one per toon] + total + target
     if ImGui.BeginTable('##grp_' .. (label or items[1]), nCols, (ImGuiTableFlags.BordersOuter or 0) + (ImGuiTableFlags.SizingFixedFit or 0)) then
         ImGui.TableSetupColumn('##n', ImGuiTableColumnFlags.WidthFixed or 0, 150)
         if statusOn then
             for _, nm in ipairs(statusNames) do ImGui.TableSetupColumn(short_name(nm), ImGuiTableColumnFlags.WidthFixed or 0, 56) end
+            ImGui.TableSetupColumn('all', ImGuiTableColumnFlags.WidthFixed or 0, 56)
         end
-        ImGui.TableSetupColumn('##e', ImGuiTableColumnFlags.WidthFixed or 0, 60)
+        -- The last column holds a target box on item rows, but a quantity field AND two buttons on a
+        -- currency row. At 60px those overlap into the "| |" mess - so widen it when there is a currency
+        -- row to draw, and leave it alone otherwise.
+        -- 172 fitted a quantity box and two buttons. It now carries five controls - qty, Get, All,
+        -- Me, Group - and ImGui truncates rather than wrapping, so the column has to be sized for what
+        -- is actually in it. Measured roughly: 56 field + four small buttons + spacing.
+        ImGui.TableSetupColumn('##e', ImGuiTableColumnFlags.WidthFixed or 0, altCurrency and 330 or 60)
         if statusOn then ImGui.TableHeadersRow() end
         for _, it in ipairs(items) do
             ImGui.TableNextRow()
@@ -5115,7 +5450,9 @@ local function render_group(label, color, items)
                         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                             pcall(function() ImGui.SetTooltip(nm .. ': count timed out - skipped by Give out') end)
                         end
-                    elseif ck and ((is_endurance(it) and not WANTS_ENDURANCE[ck]) or (is_mana(it) and not WANTS_MANA[ck])) then
+                    elseif ck and ((is_endurance(it) and not WANTS_ENDURANCE[ck])
+                                or (is_mana(it) and not WANTS_MANA[ck])
+                                or (is_ruby(it) and not WANTS_RUBY[ck])) then
                         ImGui.TextDisabled(tostring(n))   -- holds this many but won't use them (grey = not needed)
                     elseif n >= tgt then
                         ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(n))
@@ -5123,12 +5460,169 @@ local function render_group(label, color, items)
                         ImGui.TextColored(0.93, 0.42, 0.42, 1.0, tostring(n))
                     end
                 end
+                -- GROUP TOTAL. Sums only what was actually read: a toon whose count timed out is
+                -- excluded and the figure is marked with a + so it reads as "at least this many"
+                -- rather than a number that quietly understates what the group is holding.
+                local total, missing = 0, 0
+                for _, nm2 in ipairs(statusNames) do
+                    local sc2 = statusCounts[nm2:lower()]
+                    if sc2 and sc2.__unknown and sc2.__unknown[it] then missing = missing + 1
+                    else total = total + ((sc2 and sc2[it]) or 0) end
+                end
+                ImGui.TableNextColumn()
+                -- The group target counts only characters that can actually use the item, so a
+                -- cleric-only reagent does not read as a shortfall against six people's worth.
+                local users = 0
+                for _, nm3 in ipairs(statusNames) do
+                    local ck3 = class_key((statusCounts[nm3:lower()] or {}).__class)
+                    local skip = ck3 and ((is_endurance(it) and not WANTS_ENDURANCE[ck3])
+                                       or (is_mana(it) and not WANTS_MANA[ck3])
+                                       or (is_ruby(it) and not WANTS_RUBY[ck3]))
+                    if not skip then users = users + 1 end
+                end
+                -- WANTED IS PER USER, NOT PER CHARACTER. Rubies are cleric-only, so a target of 500 with
+                -- one cleric needs 500 across the group - not 3000 because there happen to be six of you.
+                -- The same rule that greys the cells and stops the planner handing them out decides this.
+                local wanted = tgt * users
+                if missing > 0 then
+                    -- Incomplete: cannot honestly call it either way, so neither green nor red.
+                    ImGui.TextColored(0.95, 0.85, 0.30, 1.0, string.format('%d+', total))
+                elseif wanted <= 0 then
+                    -- No target set, or nobody in the group uses it. Nothing to be short OF.
+                    ImGui.TextDisabled(tostring(total))
+                elseif total >= wanted then
+                    ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(total))
+                else
+                    ImGui.TextColored(0.93, 0.42, 0.42, 1.0, tostring(total))
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(string.format(
+                        '%s\n%d across the group%s\n%s',
+                        display_name(it), total,
+                        (missing > 0) and string.format('\n%d toon(s) did not report - the real total is higher', missing) or '',
+                        (users == 0) and 'nobody in the group uses this'
+                          or (tgt <= 0) and 'no target set'
+                          or string.format('need %d (%d each x %d who use it) - %s',
+                                           wanted, tgt, users,
+                                           (total >= wanted) and 'enough' or string.format('short %d', wanted - total))
+                        )) end)
+                end
             end
             ImGui.TableNextColumn()
             ImGui.SetNextItemWidth(-1)
+            -- Narrower when a Give button shares the cell, so the two do not fight for width.
+            ImGui.SetNextItemWidth((altCurrency == it) and 70 or -1)
             local v = ImGui.InputInt('##t_' .. it, target[it] or 0, 0)   -- step 0 -> no +/- buttons
             v = math.max(0, math.floor(tonumber(v) or 0))
             if v ~= target[it] then target[it] = v; save_targets() end
+            -- GIVE SITS NEXT TO THE NUMBER IT USES. It was on the currency row, one line below and
+            -- beside a DIFFERENT quantity box - so which number it would hand out was a guess. The
+            -- target is the per-character amount, so the button belongs against it.
+            if altCurrency == it then
+                local q = target[it] or 0
+                ImGui.SameLine()
+                if ImGui.SmallButton('Give##dcgive_' .. it) then
+                    dcGiveWant = { item = it, currency = altCurrency }
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(string.format(
+                        'Will give %d %s to each character,\nand pull from Alt Currency if short.', q, it)) end)
+                end
+                -- TRIBUTE READS THE SAME BOX. It used to mean "all of it", sitting on the row below
+                -- next to Withdraw All - so the obvious reading was that it would donate every coin the
+                -- group owned. That is a bad thing to be one misread away from. Bound to the quantity,
+                -- on the same line as the number, it can only ever spend what is typed there.
+                ImGui.SameLine()
+                ImGui.TextDisabled('Tribute:')
+                ImGui.SameLine()
+                if ImGui.SmallButton('Me##trib_' .. it) then
+                    tribWant = { item = it, qty = q }
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(string.format(
+                        'Will walk to a tribute master and donate %d %s.\nYou are holding %d.',
+                        q, it, (counts[myName:lower()] or {})[it] or 0)) end)
+                end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Group##tribg_' .. it) then
+                    tribGroupWant = { item = it, qty = q }
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(string.format(
+                        'Every character walks to its own tribute master\nand donates up to %d %s of its own.', q, it)) end)
+                end
+            end
+        end
+
+        -- The currency row: same columns, so a character's balance sits directly under their count.
+        if altCurrency and statusOn then
+            ImGui.TableNextRow()
+            ImGui.TableNextColumn()
+            ImGui.TextColored(0.62, 0.82, 0.95, 1.0, 'in Alt Currency')
+            local total, unknown = 0, 0
+            for _, nm in ipairs(statusNames) do
+                ImGui.TableNextColumn()
+                local bal = (altCounts[nm:lower()] or {})[altCurrency]
+                if bal == nil then
+                    unknown = unknown + 1
+                    ImGui.TextDisabled('?')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(nm .. '\nnever answered - press Counts again') end)
+                    end
+                elseif bal == 'shut' then
+                    unknown = unknown + 1
+                    ImGui.TextColored(0.90, 0.72, 0.35, 1.0, 'shut')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(nm ..
+                            '\nanswered, but could not read its currency list') end)
+                    end
+                elseif bal > 0 then
+                    total = total + bal
+                    ImGui.TextColored(0.62, 0.82, 0.95, 1.0, tostring(bal))
+                else
+                    ImGui.TextDisabled('0')
+                end
+            end
+            ImGui.TableNextColumn()
+            if unknown > 0 then ImGui.TextColored(0.95, 0.85, 0.30, 1.0, string.format('%d+', total))
+            else                ImGui.TextColored(0.62, 0.82, 0.95, 1.0, tostring(total)) end
+            ImGui.TableNextColumn()
+            -- WITHDRAW ALL, no quantity box. There is nothing to decide: converting a balance you are
+            -- not using costs nothing and the alternative was a second number sitting next to a
+            -- different one, with no way to tell which button read which.
+            local anyBal = false
+            for _, nm in ipairs(statusNames) do
+                local b2 = (altCounts[nm:lower()] or {})[altCurrency]
+                if type(b2) == 'number' and b2 > 0 then anyBal = true; break end
+            end
+            if anyBal then
+                if ImGui.SmallButton('Withdraw All##altwall_' .. altCurrency) then
+                    altWithdrawAllWant = { name = altCurrency }
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(
+                        'Will withdraw all ' .. altCurrency .. ' from Alt Currency,\non every character that has any.') end)
+                end
+            else
+                ImGui.TextDisabled('nothing to withdraw')
+            end
+            -- The other direction. Anyone holding the ITEM can push it back into currency, which is a
+            -- different set of characters from the ones holding a balance - hence its own check.
+            local anyItem = false
+            for _, nm in ipairs(statusNames) do
+                if ((counts[nm:lower()] or {})[altCurrency] or 0) > 0 then anyItem = true; break end
+            end
+            if anyItem then
+                ImGui.SameLine()
+                if ImGui.SmallButton('Reclaim All##altrec_' .. altCurrency) then
+                    altReclaimAllWant = { name = altCurrency }
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(
+                        'Will put all ' .. altCurrency .. ' in bags back into Alt Currency,\non every character holding any.') end)
+                end
+            end
+
         end
         ImGui.EndTable()
     end
@@ -5363,6 +5857,109 @@ function burn_colour(st)
     if r < 60 then return 0.95, 0.85, 0.30 end
     if r < 300 then return 0.95, 0.62, 0.25 end
     return 0.85, 0.35, 0.35
+end
+
+-- THE THIRD VIEW: ONE DOT PER TIER, not one per item. That is where the size goes - the other two
+-- views both draw every burn as its own glyph, so transposing the grid changed the shape and not the
+-- width. Six characters at five glyphs each is the same table either way round.
+--
+--             Khul 18/18  Luna 15/17  Sune 9/9  Styl 17/17
+--   5min      *           -           *         *
+--   10min     *           *           *         *
+--   15min     *           *           *         *
+--
+-- Each cell is a single dot whose colour is that tier's state for that character, and the header
+-- carries the ready count. That is the "quick glance" question answered - is this tier up for this
+-- toon - and the item-level detail is what the other two views are for. Hover names the items.
+-- Roughly a third the width, because a column now needs room for one glyph rather than six.
+function draw_burn_compact()
+    local chars = {}
+    for _, c in ipairs(ordered_members()) do
+        if burnState[c] then chars[#chars + 1] = c end
+    end
+    if #chars == 0 then ImGui.TextDisabled('no burn reports yet'); return end
+    local tiers = burn_tiers_present(chars)
+    if #tiers == 0 then ImGui.TextDisabled('no burns configured'); return end
+
+    local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
+                + (ImGuiTableFlags.SizingFixedFit or 0)
+    if not ImGui.BeginTable('##burncompact', 1 + #chars, flags) then return end
+    ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, 58)
+    for _ = 1, #chars do ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, 46) end
+
+    ImGui.TableNextRow()
+    ImGui.TableNextColumn()
+    for _, c in ipairs(chars) do
+        ImGui.TableNextColumn()
+        local total, ready = 0, 0
+        for _, st in pairs(burnState[c] or {}) do
+            if (st.tier or 0) > 0 then
+                total = total + 1
+                if st.active or burn_remain(st) == 0 then ready = ready + 1 end
+            end
+        end
+        -- NAME ONLY. The 18/18 totals were the least useful number on the row: nobody acts on "how many
+        -- burns does this character own", and every cell below already says what is up per tier.
+        ImGui.TextColored(0.80, 0.80, 0.80, 1.0, c:sub(1, 4))
+        local _ = ready + total   -- counted above; kept for the hover, not shown here
+    end
+
+    for _, t in ipairs(tiers) do
+        ImGui.TableNextRow()
+        ImGui.TableNextColumn()
+        -- 'minBurn' on every label is noise when the column is only ever burns.
+        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, (t.label:gsub('[Bb]urns?$', ''):gsub('%s+$', '')))
+        for _, c in ipairs(chars) do
+            ImGui.TableNextColumn()
+            local n, up, soon, names = 0, 0, false, {}
+            for it, st in pairs(burnState[c] or {}) do
+                if (st.tier or 0) > 0 and (st.tkey or '?') == t.key then
+                    n = n + 1
+                    local r = burn_remain(st)
+                    if st.active or r == 0 then up = up + 1
+                    elseif r > 0 and r < 60 then soon = true end
+                    names[#names + 1] = it
+                end
+            end
+            if n == 0 then
+                ImGui.TextDisabled('-')
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(c .. ' has nothing at ' .. t.label) end)
+                end
+            else
+                -- ONE PLAIN DOT PER BURN, each coloured by its own state. Not the FontAwesome icons the
+                -- other views use - those carry the item KIND, which is detail this view is deliberately
+                -- dropping, and they are three or four times the width of a bullet. Not "3/5" either:
+                -- five dots with two of them red says the same thing and reads without parsing.
+                -- ONE TOOLTIP FOR THE WHOLE CELL, attached to every dot in it. A bullet is a tiny hover
+                -- target and there is no point making them bigger - the size is the feature - so instead
+                -- each dot answers for the cell. Hovering anywhere in the run gives the same full list,
+                -- which makes the effective target the whole group of dots rather than one of them.
+                -- Built once per cell rather than per dot: same string, and it is not free to assemble.
+                table.sort(names)
+                local lines = { c .. '  ' .. t.label }
+                for _, it in ipairs(names) do
+                    local st = burnState[c][it]
+                    local r = burn_remain(st)
+                    if st.active then      lines[#lines + 1] = '  ' .. it .. '  (running)'
+                    elseif r == 0 then     lines[#lines + 1] = '  ' .. it .. '  ready'
+                    elseif r < 0 then      lines[#lines + 1] = '  ' .. it
+                    else lines[#lines + 1] = string.format('  %s  %d:%02d', it, math.floor(r / 60), r % 60) end
+                end
+                local tip = table.concat(lines, '\n')
+                for i, it in ipairs(names) do
+                    local st = burnState[c][it]
+                    local cr, cg, cb = burn_colour(st)
+                    if i > 1 then ImGui.SameLine(0, 2) end
+                    ImGui.TextColored(cr, cg, cb, 1.0, '\226\128\162')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(tip) end)
+                    end
+                end
+            end
+        end
+    end
+    ImGui.EndTable()
 end
 
 -- Compact burn view: one row per character, one dot per burn item, colour carries the whole state.
@@ -6332,6 +6929,1227 @@ function arc_click()
     arcPending = { at = mq.gettime(), tries = 1 }   -- the main loop watches it from here
 end
 
+-- ===== ALT CURRENCY -> ITEMS =====
+-- Diamond Coins live in the inventory window's Alt. Currency tab, not in bags, so FindItemCount will
+-- never see them and the give-out cannot distribute them until they are pulled out as items.
+-- The control names below were established by driving the window by hand with a probe on 2026-07-29;
+-- they are not guesses: IW_AltCurr_PointList holds one row per currency, and Create Item is what turns
+-- a balance into a stack on the cursor. Pressing Create opens QuantityWnd defaulted to the maximum.
+-- The quantity idiom is LazCraft's accept_qty_window - the DIRECT TLO setter, not /invoke SetText,
+-- which took ~400ms to commit there and produced an every-other-round failure.
+-- Control names came out of EQUI_Inventory.xml and were all confirmed to resolve in game.
+ALTCUR_WND     = 'InventoryWindow'
+ALTCUR_LIST_C  = 'IW_AltCurr_PointList'            -- control name ALONE, for /notify
+ALTCUR_CREATE_C= 'IW_AltCurr_CreateItemButton'
+ALTCUR_LIST    = 'InventoryWindow/IW_AltCurr_PointList'   -- slash-joined, for Window() READS only
+-- /notify TAKES THE WINDOW AND THE CONTROL AS SEPARATE ARGUMENTS. Slash-joining them is accepted
+-- silently and does nothing - "list select not found" was exactly this, found and fixed on 2026-07-29
+-- and reintroduced here by writing the command from memory instead of from that session.
+--     right: /notify InventoryWindow IW_AltCurr_PointList listselect 3
+--     wrong: /notify InventoryWindow/IW_AltCurr_PointList listselect 3
+-- Window() reads are the opposite - they want the slash-joined path. Hence two constants.
+
+-- Which row in the currency list is this currency? Returns nil when the tab is not showing it, which
+-- is also what a closed inventory window looks like - the caller says so rather than pressing blindly.
+function altcur_row(name)
+    local rows = 0
+    pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
+    if rows <= 0 then return nil, 0 end
+    local want = name:lower()
+    for i = 1, rows do
+        for col = 1, 6 do
+            local txt = ''
+            pcall(function() txt = tostring(mq.TLO.Window(ALTCUR_LIST).List(i, col)() or '') end)
+            -- CONTAINS, not equals - matching altcur_balance. These two had drifted: the balance reader
+            -- used find() and this used ==, so a cell carrying any padding or a suffix read fine in the
+            -- display and returned "no such row" to the pull. /attab exited silently on exactly that.
+            if txt ~= '' and txt:lower():find(want, 1, true) then return i, rows end
+        end
+    end
+    return nil, rows
+end
+
+-- Pull `qty` of a currency out as items. Returns how many actually landed.
+-- The tab index for Alt. Currency inside the inventory window. A guess that is easy to correct rather
+-- than a value dug out of the XML: the pull below VERIFIES by checking the Create button became enabled,
+-- and says so when it did not, so a wrong number here is one obvious log line and a one-digit fix.
+ALTCUR_TAB = 4
+
+-- FIND THE TAB RATHER THAN GUESS IT. Index 4 turned out to be Shrouds, and the next guess would have
+-- been another coin flip. The test is exact and needs no XML: select a currency row, then ask whether
+-- Create Item became ENABLED - it only does when the row is on the page that is actually showing.
+-- Caches the answer, so this runs once and every later pull goes straight there.
+function altcur_find_tab(name)
+    if altcurTabFound then
+        log('[altcur] already know the tab: %d', altcurTabFound)
+        return altcurTabFound
+    end
+    local row, rows = altcur_row(name)
+    if not row then
+        -- Say WHY. This returned nil in silence, which from the outside is indistinguishable from the
+        -- command not being registered at all - and that is exactly how it looked.
+        log('\\ay[altcur] cannot find "%s" in the currency list (%d row(s) read) - run /atcurrency to see '
+            .. 'what is actually there\\ax', name, rows or 0)
+        return nil
+    end
+    log('[altcur] %s is row %d of %d - trying tabs 1-10...', name, row, rows or 0)
+    for t = 1, 10 do
+        pcall(function() mq.cmdf('/notify %s IW_Subwindows tabselect %d', ALTCUR_WND, t) end)
+        mq.delay(250)
+        pcall(function() mq.cmdf('/notify %s %s listselect %d', ALTCUR_WND, ALTCUR_LIST_C, row) end)
+        mq.delay(250)
+        local ok = false
+        pcall(function() ok = (mq.TLO.Window(ALTCUR_WND .. '/' .. ALTCUR_CREATE_C).Enabled() == true) end)
+        if ok then
+            altcurTabFound = t
+            ALTCUR_TAB = t
+            log('\\ag[altcur] Alt. Currency is tab %d\\ax', t)
+            return t
+        end
+    end
+    log('\\ay[altcur] no tab index 1-10 enabled Create Item - the tab control may not be IW_Subwindows\\ax')
+    return nil
+end
+
+-- The reverse of a pull, and far simpler than one: select the currency row, press Reclaim, and the
+-- game converts EVERY stack of that item in bags back into currency in a single action.
+-- Nothing is picked up and there is no quantity - which is why this takes no qty argument. The first
+-- version looped, picked each stack onto the cursor and pressed Reclaim per stack; that was modelled on
+-- the pull, and the pull needs a loop only because Create hands back one stack at a time. Reclaim does
+-- not work that way.
+ALTCUR_RECLAIM_C = 'IW_AltCurr_ReclaimButton'
+function altcur_reclaim(name)
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        log('\\ay[altcur] something is on the cursor - clear it before reclaiming\\ax'); return 0
+    end
+    local before = 0
+    pcall(function() before = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+    if before <= 0 then log('\\ay[altcur] no %s in bags to reclaim\\ax', name); return 0 end
+
+    local wasOpen = false
+    pcall(function() wasOpen = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+    if not wasOpen then
+        pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
+        mq.delay(600, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
+    end
+    if not mq.TLO.Window(ALTCUR_WND).Open() then
+        log('\\ay[altcur] could not open the inventory\\ax'); return 0
+    end
+    pcall(function() mq.cmdf('/notify %s IW_Subwindows tabselect %d', ALTCUR_WND, ALTCUR_TAB) end)
+    mq.delay(400)
+    if not altcurTabFound then altcur_find_tab(name) end
+
+    local row, rows = altcur_row(name)
+    if not row then
+        log('\\ay[altcur] %s is not in the currency list (%d rows) - cannot reclaim\\ax', name, rows or 0)
+        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+        return 0
+    end
+    pcall(function() mq.cmdf('/notify %s %s listselect %d', ALTCUR_WND, ALTCUR_LIST_C, row) end)
+    mq.delay(400)
+
+    pcall(function() mq.cmdf('/notify %s %s leftmouseup', ALTCUR_WND, ALTCUR_RECLAIM_C) end)
+    -- One action, so wait on the COUNT dropping rather than on a cursor that never fills.
+    mq.delay(4000, function()
+        return (tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0) < before
+    end)
+    mq.delay(400)
+
+    if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+    local left = 0
+    pcall(function() left = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+    local gone = before - left
+    altcur_announce(name)
+    if gone > 0 then
+        log('\\ag[altcur] reclaimed %d %s back into currency%s\\ax', gone, name,
+            (left > 0) and string.format(' (%d still in bags)', left) or '')
+    else
+        log('\\ay[altcur] Reclaim took nothing - %s still reads %d in bags\\ax', name, left)
+    end
+    return gone
+end
+
+altcurStuck = false
+function altcur_pull(name, qty)
+    qty = math.max(1, math.floor(tonumber(qty) or 1))
+    -- Do not start a new pull with the last one still on the cursor.
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        log('\\ay[altcur] something is already on the cursor - clear it before converting more\\ax')
+        return 0
+    end
+
+    -- OPEN THE WINDOW AND SHOW THE TAB. Reading the list works with the window shut, which is why the
+    -- balances display fine - but pressing a button on a hidden page does not, so the pull needs the
+    -- window up and the Alt. Currency page showing where the reads did not.
+    -- Whatever we open here is closed again at the end unless it was already open.
+    local wasOpen = false
+    pcall(function() wasOpen = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+    if not wasOpen then
+        pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
+        mq.delay(600, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
+    end
+    if not mq.TLO.Window(ALTCUR_WND).Open() then
+        log('\\ay[altcur] could not open the inventory window\\ax')
+        return 0
+    end
+    -- Try the known-good tab first; if it has never been established, go and find it.
+    pcall(function() mq.cmdf('/notify %s IW_Subwindows tabselect %d', ALTCUR_WND, ALTCUR_TAB) end)
+    mq.delay(400)
+    if not altcurTabFound then altcur_find_tab(name) end
+
+    local row, rows = altcur_row(name)
+    if not row then
+        log('\\ay[altcur] %s is not in the currency list (%d row(s) visible) - is the Alt. Currency tab showing?\\ax',
+            name, rows)
+        return 0
+    end
+
+    local before = 0
+    pcall(function() before = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+
+    -- ONE PRESS GIVES ONE STACK. Create Item converts up to a single stack per press, so asking for 1879
+    -- and pressing once returns 200 and stops - which is exactly what happened. Everything below the
+    -- select is therefore a LOOP: press, take the stack, stow it, press again, until we have what was
+    -- asked for or something says stop.
+    -- Bounded so a misread balance cannot spin forever. 40 was short of a real conversion - 10,234 coins
+    -- at 200 a stack is 52 rounds, so it stopped at 8,000 and wanted a second press. Rounds are ~1s and
+    -- every one of them logs, so a high ceiling costs nothing when it is not needed.
+    local rounds = 0
+    while rounds < 120 do
+        rounds = rounds + 1
+        local have = 0
+        pcall(function() have = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+        local stillWant = qty - (have - before)
+        if stillWant <= 0 then break end
+
+    pcall(function() mq.cmdf('/notify %s %s listselect %d', ALTCUR_WND, ALTCUR_LIST_C, row) end)
+    mq.delay(400)
+    -- The Create button only enables once a row on the VISIBLE page is selected, so this doubles as the
+    -- check that the tab is actually showing - which is the thing ALTCUR_TAB is guessing at.
+    local canCreate = false
+    pcall(function() canCreate = (mq.TLO.Window(ALTCUR_WND .. '/' .. ALTCUR_CREATE_C).Enabled() == true) end)
+    if not canCreate then
+        log('\\ay[altcur] Create Item is not enabled after selecting %s - the Alt. Currency tab is probably '
+            .. 'not showing (ALTCUR_TAB is %d; try another index)\\ax', name, ALTCUR_TAB)
+    end
+    pcall(function() mq.cmdf('/notify %s %s leftmouseup', ALTCUR_WND, ALTCUR_CREATE_C) end)
+    mq.delay(1200, function() return mq.TLO.Window('QuantityWnd').Open() end)
+
+    if mq.TLO.Window('QuantityWnd').Open() then
+        -- QUANTITY, THE WAY LAZCRAFT DOES IT. This used to set the field once, wait 500ms, and press
+        -- Accept regardless - so when the field had not taken, it accepted whatever the dialog was
+        -- defaulted to. That is the intermittent behaviour: most rounds fine, the occasional one wrong.
+        -- LazCraft's hand-off loop is the hardened version and it does three things this did not:
+        --   * RE-ISSUES the SetText every ~320ms until the field actually reads the number back
+        --   * polls at 40ms, so it commits as soon as it takes rather than waiting out a fixed delay
+        --   * on failure presses ESC, never the Cancel button - Cancel PULLS THE STACK, which is how a
+        --     "cancelled" round would still leave coins on the cursor
+        -- ASK FOR WHAT THE DIALOG CAN ACTUALLY GIVE. It opens defaulted to the maximum it will allow -
+        -- one stack - and CLAMPS anything larger. Asking for 10234 therefore leaves the field reading
+        -- 200, and a verify loop that insists on seeing 10234 backs out of a round that was working
+        -- perfectly. The previous build got away with it only because it accepted without checking.
+        -- The default IS the cap, so read it rather than hardcoding a stack size that varies by item.
+        local capTxt = ''
+        pcall(function() capTxt = tostring(mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') end)
+        local cap = tonumber((capTxt:gsub('[^%d]', ''))) or 0
+        local askFor = (cap > 0) and math.min(stillWant, cap) or stillWant
+        local wantS, set = tostring(askFor), false
+        pcall(function() mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', askFor) end)
+        local qDeadline, ticks = mq.gettime() + 1200, 0
+        repeat
+            if (mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') == wantS then set = true; break end
+            mq.delay(40); ticks = ticks + 1
+            if ticks % 8 == 0 then
+                pcall(function() mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', askFor) end)
+            end
+        until mq.gettime() > qDeadline
+
+        if not set then
+            log('\\ay[altcur] could not set the quantity to %d (cap %d, reads %s) - backing out of this round\\ax',
+                askFor, cap, tostring(mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text()))
+            mq.cmd('/keypress esc')   -- NOT Cancel: Cancel pulls the stack onto the cursor
+            mq.delay(400, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+            break
+        end
+        mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+        mq.delay(1500, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+        if mq.TLO.Window('QuantityWnd').Open() then
+            log('\\ay[altcur] the quantity window did not close - backing out\\ax')
+            mq.cmd('/keypress esc')
+            mq.delay(400, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+            break
+        end
+    end
+
+    -- STOW IT, AND STOP IF IT WILL NOT GO. A full inventory means the pulled stack sits on the cursor,
+    -- and the next thing that touches the cursor - a trade, a click, anything - either loses it or
+    -- refuses to work. Converting more on top of that would be strictly worse.
+    -- Checked properly rather than assumed: clear_cursor tries, then we look.
+    -- WAIT FOR THE COINS TO ACTUALLY REACH THE CURSOR BEFORE STOWING THEM. /autoinventory is exactly
+    -- right for this - it drops into the first free bag slot, which is all a stack of coins needs - but
+    -- it does nothing at all if the cursor is still empty when it fires.
+    -- That was the bug: a 600ms wait, then stow regardless. The coins arrived a moment later, found an
+    -- empty-handed /autoinventory had already been and gone, and sat there - so the check right after
+    -- saw a full cursor and called it "bags are full" on a character with plenty of room.
+    -- So: wait for the item BY NAME, up to 3s, and only then stow.
+    local landedOnCursor = false
+    local deadline = mq.gettime() + 3000
+    while mq.gettime() < deadline do
+        local cn = ''
+        pcall(function() cn = tostring(mq.TLO.Cursor.Name() or '') end)
+        if cn ~= '' and cn:lower():find(name:lower(), 1, true) then landedOnCursor = true; break end
+        mq.delay(50)
+    end
+    if not landedOnCursor then
+        -- Nothing came. Could be an exhausted balance or a refused Create; either way there is nothing
+        -- to stow and nothing to call stuck.
+        local cn = ''
+        pcall(function() cn = tostring(mq.TLO.Cursor.Name() or '') end)
+        if cn ~= '' then
+            log('\\ay[altcur] something else is on the cursor (%s) - stopping\\ax', cn)
+            altcurStuck = true
+            if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+            local sofar = 0
+            pcall(function() sofar = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+            return math.max(0, sofar - before)
+        end
+        break   -- no coins appeared: end the loop, the round-yield check below reports it
+    end
+
+    local held = ''
+    pcall(function() held = tostring(mq.TLO.Cursor.Name() or '') end)
+    -- RETRY THE STOW. On 2026-08-02 fifteen rounds stowed cleanly at ~1.1s each and the sixteenth did
+    -- not, on a character with plenty of free bags - so a single /autoinventory that does not take is
+    -- not evidence of anything except that it did not take. Three attempts with a wait between.
+    -- A BEAT BEFORE STOWING, AND A SHORTER WAIT AFTER. The log shows the shape exactly: the first
+    -- /autoinventory missed on 25 of 52 rounds, and the second - about 400ms later - worked every time.
+    -- That is not a full bag, it is firing the instant the coins appear, before the client is ready to
+    -- move them. So: settle first, which should stop most of the misses happening at all.
+    -- And when one does miss, 1500ms is far too long to find out. A stow that works, works quickly; the
+    -- long wait only ever delayed the retry that was going to fix it. Four short attempts instead of
+    -- three long ones is both faster on failure and more forgiving.
+    mq.delay(150)
+    for attempt = 1, 4 do
+        mq.cmd('/autoinventory')
+        mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        if (mq.TLO.Cursor.ID() or 0) == 0 then break end
+        if attempt < 4 then
+            log('[altcur]   stow did not take - retry %d of 4', attempt + 1)
+            mq.delay(250)
+        end
+    end
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        -- COUNT THE FREE SLOTS rather than claim the bags are full. They were not, the last time this
+        -- said so, and a message that asserts the wrong cause sends the next hour in the wrong direction.
+        local free = 0
+        for b = 1, 10 do
+            local slots = 0
+            pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
+            for sl = 1, slots do
+                local occupied = true
+                pcall(function()
+                    occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
+                end)
+                if not occupied then free = free + 1 end
+            end
+        end
+        log('\\ar[altcur] %s will not leave the cursor after 3 tries (%d free bag slot(s)). STOPPING.\\ax',
+            (held ~= '') and held or name, free)
+        if free > 0 then
+            log('\\ar[altcur] there IS room, so this is not a full-bags problem - the stow is being refused.\\ax')
+        end
+        -- PUT IT BACK rather than leave it dangling. Reclaim is the reverse of Create - it pushes a
+        -- stack from the cursor back into the currency tab - and a stack left on the cursor blocks
+        -- every later trade, click and pickup on that character until a person notices. Better to
+        -- return it and stop cleanly than to stop holding something.
+        pcall(function() mq.cmdf('/notify %s IW_AltCurr_ReclaimButton leftmouseup', ALTCUR_WND) end)
+        mq.delay(1200, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        if (mq.TLO.Cursor.ID() or 0) == 0 then
+            log('[altcur] put the stuck stack back into currency - cursor is clear')
+        else
+            log('\\ar[altcur] could not reclaim it either - %s is still on the cursor, clear it by hand\\ax',
+                (held ~= '') and held or name)
+        end
+        altcurStuck = true
+        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+        -- Report what DID land, not zero. Earlier rounds may have stowed several stacks fine, and
+        -- claiming nothing happened would send the caller looking for a problem it does not have.
+        local sofar = 0
+        pcall(function() sofar = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+        local landed = math.max(0, sofar - before)
+        if landed > 0 then log('[altcur] %d %s did land before the bags filled', landed, name) end
+        return landed
+    end
+    altcurStuck = false
+
+        -- A round that produced nothing means the currency is exhausted, or Create refused. Either way
+        -- pressing again will not help.
+        local now = 0
+        pcall(function() now = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+        if now <= have then
+            if rounds == 1 then log('\\ay[altcur] the first press produced nothing\\ax')
+            else log('[altcur] nothing more to convert after %d round(s)', rounds) end
+            break
+        end
+        log('[altcur]   round %d: +%d (%d of %d)', rounds, now - have, now - before, qty)
+    end
+
+    local after = 0
+    pcall(function() after = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
+    if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+
+    local got = after - before
+    altcur_announce(name)
+    if got > 0 then log('\\ag[altcur] pulled %d %s (now %d in bags)\\ax', got, name, after)
+    else          log('\\ay[altcur] pulled nothing - %s still reads %d in bags\\ax', name, after) end
+    return got
+end
+
+-- ===== TRIBUTE =====
+-- Walk to a tribute master and donate a set number of Diamond Coins. Nothing else - it never touches
+-- anything not named here, because a routine that donates "what it finds" next to a bank of consumables
+-- is one mis-set filter away from feeding somebody's draughts to a favour counter.
+--
+-- WHAT IS KNOWN vs GUESSED, stated plainly because it decides where to look when it misbehaves:
+--   known   - the nav, the spawn search, and the donate quantity flow (same QuantityWnd loop the
+--             currency pull uses, which is now proven)
+--   guessed - the NPC name pattern and the window control names. Both are printed by /attribprobe, so
+--             one run replaces the guesses with facts rather than another round of me inventing them.
+TRIB_NPC_HINTS = { 'Tribute Master', 'tribute' }
+TRIB_WND       = 'TributeMasterWnd'
+TRIB_DONATE_C  = 'TMW_DonateButton'
+
+-- Nearest NPC whose name looks like a tribute master. Returns id, name, distance.
+function trib_find_npc()
+    for _, hint in ipairs(TRIB_NPC_HINTS) do
+        local id, nm, d = 0, '', -1
+        pcall(function() id = tonumber(mq.TLO.Spawn('npc ' .. hint).ID()) or 0 end)
+        if id > 0 then
+            pcall(function() nm = tostring(mq.TLO.Spawn(id).CleanName() or '') end)
+            pcall(function() d  = math.floor(tonumber(mq.TLO.Spawn(id).Distance()) or -1) end)
+            return id, nm, d
+        end
+    end
+    return nil
+end
+
+-- Dump whatever the tribute window exposes, so the donate step can be written against real controls.
+function trib_probe()
+    log('[tribute] window %s open: %s', TRIB_WND, tostring(mq.TLO.Window(TRIB_WND).Open()))
+    -- Wider net, and the cursor state reported alongside - because "Donate is disabled" means nothing
+    -- on its own. The first probe ran with an empty cursor, which is exactly when it SHOULD be disabled,
+    -- so it told us the button exists and nothing about whether holding a coin is enough.
+    local cur = ''
+    pcall(function() cur = tostring(mq.TLO.Cursor.Name() or '') end)
+    log('   cursor holds: %s', (cur ~= '') and cur or '(empty)')
+    for _, c in ipairs({ TRIB_DONATE_C, 'TMW_DonateButton', 'TMW_TributeList', 'TMW_ItemList',
+                         'TMW_CurrentTribute', 'TMW_Value', 'TMW_ActivateButton',
+                         'TMW_TributeSlot', 'TMW_ItemSlot', 'TMW_Slot1', 'TMW_TributePool',
+                         'TMW_MyTribute', 'TMW_TributeValue', 'TMW_PointsLabel', 'TMW_Tier',
+                         'TMW_Benefit', 'TMW_ItemWnd', 'TMW_DonateItemSlot' }) do
+        local exists, txt, en = 'no', '', 'n/a'
+        pcall(function()
+            if mq.TLO.Window(TRIB_WND .. '/' .. c)() ~= nil then exists = 'yes' end
+        end)
+        pcall(function() txt = tostring(mq.TLO.Window(TRIB_WND .. '/' .. c).Text() or '') end)
+        pcall(function() en = tostring(mq.TLO.Window(TRIB_WND .. '/' .. c).Enabled()) end)
+        log('   %-22s exists=%-3s enabled=%-5s text="%s"', c, exists, en, txt)
+    end
+    local id, nm, d = trib_find_npc()
+    log('   nearest tribute NPC: %s', id and string.format('%s (%dm)', nm, d) or 'none found')
+    log('   NOTE: run this again holding a %s on the cursor. If Donate becomes enabled, pressing it is '
+        .. 'all that is needed; if it stays disabled, the item has to go into a slot first and one of '
+        .. 'the slot names above will have appeared.', 'Diamond Coin')
+end
+
+-- Walk there and open it. Split out so the donate can assume it is standing in front of one.
+function trib_reach()
+    local id, nm, d = trib_find_npc()
+    if not id then
+        log('\\ay[tribute] no tribute master in this zone (looked for: %s)\\ax',
+            table.concat(TRIB_NPC_HINTS, ', '))
+        return nil
+    end
+    log('[tribute] %s is %dm away - heading over', nm, d)
+    pcall(function() mq.cmdf('/nav id %d distance=15', id) end)
+    mq.delay(1000)
+    local deadline = mq.gettime() + 30000
+    while mq.gettime() < deadline do
+        local nav = false
+        pcall(function() nav = (tostring(mq.TLO.Navigation.Active()) == 'TRUE') end)
+        if not nav then break end
+        mq.delay(200)
+    end
+    pcall(function() mq.cmdf('/target id %d', id) end)
+    mq.delay(600, function() return (tonumber(mq.TLO.Target.ID()) or 0) == id end)
+    -- Right-clicking the NPC is what opens the tribute window, the same way a merchant opens.
+    pcall(function() mq.cmd('/click right target') end)
+    mq.delay(2500, function() return mq.TLO.Window(TRIB_WND).Open() end)
+    if not mq.TLO.Window(TRIB_WND).Open() then
+        log('\\ay[tribute] %s did not open a %s - run /attribprobe here to see what did open\\ax',
+            nm, TRIB_WND)
+        return nil
+    end
+    return id, nm
+end
+
+-- Donate `qty` of one named item. Deliberately takes the name: this never scans inventory for
+-- "things worth donating", so nothing can be fed to the favour counter by accident.
+--
+-- IT WORKS LIKE SELLING, not like moving an item. With the tribute window open, left-clicking a stack
+-- in a bag SELECTS it - it does not go to the cursor - and Donate then acts on the selection. The first
+-- version picked the item up first, which is why the probe kept showing a disabled Donate and an item
+-- stuck in hand: the button was never going to act on something the window did not consider selected.
+-- Close what we opened: the tribute window and the bags. Safe to call more than once.
+function trib_cleanup()
+    if tribBagsOpen then
+        tribBagsOpen = false
+        toggle_all_bags()
+    end
+    if mq.TLO.Window(TRIB_WND).Open() then
+        pcall(function() mq.TLO.Window(TRIB_WND).DoClose() end)
+        mq.delay(500, function() return not mq.TLO.Window(TRIB_WND).Open() end)
+        if mq.TLO.Window(TRIB_WND).Open() then
+            -- Some vendor-style windows ignore DoClose; escape closes them.
+            mq.cmd('/keypress esc')
+            mq.delay(400, function() return not mq.TLO.Window(TRIB_WND).Open() end)
+        end
+    end
+    clear_cursor()
+end
+
+function trib_donate(item, qty)
+    qty = math.max(1, math.floor(tonumber(qty) or 1))
+    local have = 0
+    pcall(function() have = tonumber(mq.TLO.FindItemCount('=' .. item)()) or 0 end)
+    if have <= 0 then log('\\ay[tribute] no %s in bags\\ax', item); return 0 end
+    qty = math.min(qty, have)
+
+    if not mq.TLO.Window(TRIB_WND).Open() then
+        if not trib_reach() then return 0 end
+    end
+    -- Bags open once up front so a slot click lands on the item rather than the bag.
+    toggle_all_bags()
+    tribBagsOpen = true
+
+    local before = have
+    local rounds = 0
+    while rounds < 120 do
+        rounds = rounds + 1
+        local now = 0
+        pcall(function() now = tonumber(mq.TLO.FindItemCount('=' .. item)()) or 0 end)
+        local done = before - now
+        if done >= qty then break end
+
+        local bag, sl = nil, nil
+        for b2 = 1, 10 do
+            local slots = 0
+            pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b2).Container()) or 0 end)
+            for i = 1, slots do
+                local nm = ''
+                pcall(function() nm = tostring(mq.TLO.Me.Inventory('pack' .. b2).Item(i).Name() or '') end)
+                if nm:lower() == item:lower() then bag, sl = b2, i; break end
+            end
+            if bag then break end
+        end
+        if not bag then log('[tribute] no more %s in bags after %d', item, done); break end
+
+        -- SELECT it. Nothing should reach the cursor; if something does, the window is not treating
+        -- this as a selection and pressing Donate would be the wrong move.
+        -- RE-READ THE SLOT IMMEDIATELY BEFORE CLICKING IT, and refuse if it is not what we scanned.
+        -- The scan above walks the bags, but a donate a moment earlier may not have landed in the
+        -- client's inventory yet - so the scan can return a slot that USED to hold coins. Clicking it
+        -- then selects whatever is there now, and Donate spends it. That is how a tribute run ate items
+        -- it was never asked to touch.
+        -- One extra read per round, and it is the difference between donating coins and donating
+        -- somebody's draughts.
+        local confirm = ''
+        pcall(function() confirm = tostring(mq.TLO.Me.Inventory('pack' .. bag).Item(sl).Name() or '') end)
+        if confirm:lower() ~= item:lower() then
+            log('\\ar[tribute] pack%d slot %d now holds "%s", not %s - NOT clicking it. Stopping.\\ax',
+                bag, sl, (confirm ~= '') and confirm or 'nothing', item)
+            break
+        end
+        mq.cmdf('/itemnotify in pack%d %d leftmouseup', bag, sl)
+        -- WAIT FOR DONATE TO ENABLE, do not sleep a fixed 500ms and then test. Coins stack to 200, so a
+        -- request for 400 is two stacks and 453 is three - and the second selection is where a flat wait
+        -- bites: if the button had not re-enabled yet the loop called it a refusal and stopped after one
+        -- stack. Same mistake as the currency stow: a delay standing in for knowing.
+        local can = false
+        local dl = mq.gettime() + 2000
+        while mq.gettime() < dl do
+            pcall(function() can = (mq.TLO.Window(TRIB_WND .. '/' .. TRIB_DONATE_C).Enabled() == true) end)
+            if can or (mq.TLO.Cursor.ID() or 0) ~= 0 then break end
+            mq.delay(50)
+        end
+        if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+            log('\\ay[tribute] the click picked %s up instead of selecting it - putting it back and '
+                .. 'stopping\\ax', item)
+            clear_cursor()
+            break   -- falls through to trib_cleanup below
+        end
+
+        if not can then
+            log('\\ay[tribute] Donate did not enable within 2s of selecting %s (stack %d) - stopping\\ax',
+                item, rounds)
+            break
+        end
+
+        mq.cmdf('/notify %s %s leftmouseup', TRIB_WND, TRIB_DONATE_C)
+        -- A quantity dialog may follow; if it does, drive it with the loop that is proven elsewhere.
+        mq.delay(800, function()
+            return mq.TLO.Window('QuantityWnd').Open()
+                or (tonumber(mq.TLO.FindItemCount('=' .. item)()) or 0) < now
+        end)
+        if mq.TLO.Window('QuantityWnd').Open() then
+            local capTxt = ''
+            pcall(function() capTxt = tostring(mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') end)
+            local cap = tonumber((capTxt:gsub('[^%d]', ''))) or 0
+            local ask = (cap > 0) and math.min(qty - done, cap) or (qty - done)
+            local wantS, set = tostring(ask), false
+            pcall(function() mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', ask) end)
+            local dl, ticks = mq.gettime() + 1200, 0
+            repeat
+                if (mq.TLO.Window('QuantityWnd/QTYW_SliderInput').Text() or '') == wantS then set = true; break end
+                mq.delay(40); ticks = ticks + 1
+                if ticks % 8 == 0 then
+                    pcall(function() mq.cmdf('/invoke ${Window[QuantityWnd/QTYW_SliderInput].SetText[%d]}', ask) end)
+                end
+            until mq.gettime() > dl
+            if not set then
+                log('\\ay[tribute] could not set the quantity - stopping\\ax')
+                mq.cmd('/keypress esc'); break        -- ESC, never Cancel
+            end
+            mq.cmd('/notify QuantityWnd QTYW_Accept_Button leftmouseup')
+            mq.delay(1200, function() return not mq.TLO.Window('QuantityWnd').Open() end)
+        end
+
+        -- WAIT FOR THE COUNT TO ACTUALLY DROP before scanning again. Reading it immediately is what let
+        -- the next round see stale bags. If it never drops, something other than our item was spent -
+        -- stop at once and say so loudly rather than going round again.
+        local after = now
+        local settle = mq.gettime() + 2500
+        while mq.gettime() < settle do
+            pcall(function() after = tonumber(mq.TLO.FindItemCount('=' .. item)()) or 0 end)
+            if after < now then break end
+            mq.delay(100)
+        end
+        if after >= now then
+            log('\\ar[tribute] pressed Donate but %s did not go down. Something else may have been '
+                .. 'donated. STOPPING immediately.\\ax', item)
+            break
+        end
+        mq.delay(400)   -- let the bags finish reshuffling before the next scan reads them
+        log('[tribute]   stack %d: donated %d (%d of %d)', rounds, now - after, before - after, qty)
+    end
+
+    -- TIDY UP. Leaving a tribute window open on a background toon blocks the next thing that wants a
+    -- window there, and leaving ten bags open is the same nuisance the currency pull already avoids.
+    -- Both are closed on EVERY exit above too, because the interesting paths are the ones that stop
+    -- early - a refused donate should not leave the character sitting in front of an open vendor.
+    trib_cleanup()
+    local left = 0
+    pcall(function() left = tonumber(mq.TLO.FindItemCount('=' .. item)()) or 0 end)
+    local gave = before - left
+    local favor = 0
+    pcall(function() favor = tonumber(mq.TLO.Me.CurrentFavor()) or 0 end)
+    pcall(function() altcur_announce(item) end)
+    log('\\ag[tribute] donated %d %s - favor now %d\\ax', gave, item, favor)
+    return gave
+end
+
+-- Give out ONE item, end to end, touching nothing else. Diamond Coin's own button runs this.
+-- Separate from give_out on purpose: that plans across every item, every character and a vendor buy
+-- list, and none of that applies here. This reads one item's counts, converts from currency if the
+-- group is short, and hands the surplus round. Six queries instead of ninety.
+function give_out_one(item, currency)
+    if distributing then log('[dc] busy - already distributing'); return end
+    distributing = true
+    local ok, err = pcall(function()
+        local roster = group_members()
+        if #roster <= 1 then log('\\ay[dc] no group members found\\ax'); return end
+        local peers = {}
+        for _, m in ipairs(roster) do if m:lower() ~= myName:lower() then peers[#peers + 1] = m end end
+
+        -- READS EVERYTHING, same as any other refresh. Reading just this one item saved ~96 queries
+        -- and about a second, at the cost of a second refresh path that could drift from the first -
+        -- and a stale grid everywhere else the moment you pressed it. Not a good trade for a second.
+        uiStatus = 'Reading counts...'
+        query_all_counts(peers, all_items())
+        if currency then query_alt_currency(roster, currency) end
+
+        local function held(w) return (counts[w:lower()] and counts[w:lower()][item]) or 0 end
+        local tgt = target[item] or 0
+        if tgt <= 0 then log('\\ay[dc] set a target quantity for %s first\\ax', item); return end
+
+        -- Convert from currency only if the group is actually short, and only the shortfall.
+        local need, have = tgt * #roster, 0
+        for _, m in ipairs(roster) do have = have + held(m) end
+        if currency and have < need then
+            local short = need - have
+            local who, most = alt_richest(currency)
+            if who and most > 0 then
+                local pull = math.min(short, most)
+                log('[dc] short %d - %s converting %d from currency', short, who, pull)
+                uiStatus = string.format('%s converting %d...', who, pull)
+                if who:lower() == myName:lower() then
+                    altcur_pull(currency, pull)
+                else
+                    pcall(function() peer_cmdf(who, '/atpull %s %d', currency:gsub(' ', '_'), pull) end)
+                    local deadline = mq.gettime() + math.min(180000, 6000 + math.ceil(pull / 200) * 2500)
+                    local want = held(who) + pull
+                    while mq.gettime() < deadline do
+                        mq.doevents(); mq.delay(500)
+                        local n = 0
+                        pcall(function()
+                            n = tonumber(mq.TLO.DanNet(who).Q('FindItemCount[=' .. item .. ']')()) or 0
+                        end)
+                        if n >= want then break end
+                    end
+                end
+                query_all_counts(peers, all_items())
+            else
+                log('[dc] nothing in currency either')
+            end
+        end
+
+        -- Hand it round: richest tops up whoever is short, exactly as give_out does for one item.
+        local richest, richestN = roster[1], -1
+        for _, m in ipairs(roster) do if held(m) > richestN then richest, richestN = m, held(m) end end
+        local surplus = math.max(0, richestN - tgt)
+        local moved, short = 0, {}
+        for _, m in ipairs(roster) do
+            if m:lower() ~= richest:lower() then
+                local gap = tgt - held(m)
+                if gap > 0 then
+                    local give = math.min(gap, surplus)
+                    if give > 0 then
+                        uiStatus = string.format('%s -> %s: %d %s', richest, m, give, item)
+                        -- do_give_bundle is what give_out uses: it handles the local case, the remote
+                        -- /at_give_multi handoff and the wait-for-done. Writing a second path here is
+                        -- how the two drift - I had already invented an /at_giveto that does not exist.
+                        do_give_bundle(richest, m, { [item] = give })
+                        surplus = surplus - give; moved = moved + give
+                    end
+                    if gap - give > 0 then short[#short + 1] = string.format('%s short %d', m, gap - give) end
+                end
+            end
+        end
+        if moved > 0 then log('\\ag[dc] moved %d %s\\ax', moved, item) end
+        if #short > 0 then log('\\ay[dc] still short: %s\\ax', table.concat(short, ', ')) end
+        uiStatus = string.format('%s: moved %d%s', item, moved,
+                                 (#short > 0) and (', ' .. #short .. ' short') or '')
+        altCurRefresh = mq.gettime() + 2000
+    end)
+    distributing = false
+    if not ok then log('\\ar[dc] %s\\ax', tostring(err)) end
+end
+
+-- ===== ENCHANTER PLACATE =====
+-- The caster-group counterpart to the phantom queue: click mobs, the enchanter works down the list.
+--
+-- ENCHANTERS ONLY, and by CLASS rather than by owning the spell. Several classes get a placate line,
+-- but only the enchanter has the problem below - gating on the spell would rope in a cleric or a druid
+-- who has one and does not need any of this.
+--
+-- WHY IT UNEQUIPS. An enchanter's weapon augments can proc while CASTING, and a proc on a mob you are
+-- trying to placate undoes the placate. So the primary, secondary and range slots come off before the
+-- first cast and go back on when the queue is finished.
+-- ONCE AROUND THE WHOLE QUEUE, not once per mob: stripping and re-equipping between every cast is three
+-- item swaps per mob for no benefit, and each swap is another chance to leave something on the cursor.
+--
+-- The save/restore is LazCraft's remember_slot / restore_saved_slots, which handles the awkward cases
+-- already - a slot that was legitimately empty, an item that will not seat, something stranded on the
+-- cursor. Copied rather than reinvented.
+-- MQ's INVENTORY SLOT NAMES, which are not the ones the game UI shows. It is mainhand/offhand/ranged,
+-- not primary/secondary/range - and Me.Inventory['primary'] does not error, it just resolves to nothing.
+-- So the strip read an empty name for every slot, decided there was nothing to take off, and recorded
+-- all three as "was empty" - which then made the restore a no-op as well. Silent both ways.
+-- LazCraft uses 'mainhand' and 'ammo' in its trophy swap; same naming.
+EP_SLOTS = { 'mainhand', 'offhand', 'ranged' }
+EP_STRIP_MAX = 180000    -- backstop: never stay stripped longer than this, whatever the queue is doing
+epGem      = 8           -- which gem holds placate; set in Settings
+epQueue    = {}          -- { { id, name, oor, state } }  state: nil | 'done' | 'failed'
+epSaved    = nil         -- slot -> original item name ('' = was empty). nil = not stripped.
+epStripAt  = 0
+epCast     = nil         -- { id, name, at, tries }
+epDoneAt   = nil
+EP_RECAST  = 1500        -- gap between casts; placate is quick, this is just breathing room
+EP_CHECK_AFTER = 1000    -- pause after the cast completes before looking at the mob
+EP_RETRY   = 3
+EP_LINGER  = 8000
+
+function ep_is_enchanter()
+    local c = ''
+    pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or ''):upper() end)
+    return c == 'ENC'
+end
+
+-- The spell currently memmed in the placate gem. Read rather than configured: the user picks the gem,
+-- and whatever is in it is what gets cast, so upgrading the spell needs no settings change.
+function ep_spell()
+    local nm = ''
+    pcall(function() nm = tostring(mq.TLO.Me.Gem(epGem).Name() or '') end)
+    if nm == '' or nm == 'NULL' then return nil end
+    return nm
+end
+
+-- IS THAT ACTUALLY A PLACATE? Casting "whatever is in gem 8" is fine right up to the evening somebody
+-- rearranges their gems and the queue starts throwing Mez, or a nuke, at a row of mobs.
+-- Two tests, cheapest first. Subcategory is the real one - the pacify line shares a spell subcategory,
+-- so it catches every rank including ones nobody thought to list. The name fragments are a fallback for
+-- when that TLO does not resolve, and both are logged the first time so the actual values can be seen
+-- rather than guessed at - the subcategory string on this build is not something to assume.
+EP_NAME_HINTS = { 'placate', 'pacify', 'calm', 'lull', 'soothe', 'wake of tranquility' }
+EP_SUBCAT_HINT = 'calm'
+function ep_spell_ok(nm)
+    if not nm or nm == '' then return false, 'gem is empty' end
+    local sub = ''
+    pcall(function() sub = tostring(mq.TLO.Spell(nm).Subcategory() or '') end)
+    if sub ~= '' and sub ~= 'NULL' and sub:lower():find(EP_SUBCAT_HINT, 1, true) then
+        return true, sub
+    end
+    local low = nm:lower()
+    for _, h in ipairs(EP_NAME_HINTS) do
+        if low:find(h, 1, true) then return true, 'name match' end
+    end
+    return false, (sub ~= '' and sub ~= 'NULL') and ('subcategory "' .. sub .. '"') or 'no subcategory'
+end
+
+-- THE BEST PLACATE THIS ENCHANTER OWNS. Scans the spellbook once and caches, because the alternative -
+-- a hardcoded list of ranks - goes stale the moment anyone scribes an upgrade, and the phantom line
+-- taught that lesson already: pick from what the character actually has, do not assume.
+-- Scanning is ~720 lookups, so it happens ONCE per session and only when it is actually needed, which
+-- is when the chosen gem does not already hold a placate.
+epBestPlacate = nil     -- false = looked and found none, so we do not scan again every tick
+function ep_best_placate()
+    if epBestPlacate ~= nil then return epBestPlacate or nil end
+    local best, bestLvl = nil, -1
+    for i = 1, 720 do
+        local nm = ''
+        pcall(function() nm = tostring(mq.TLO.Me.Book(i).Name() or '') end)
+        if nm ~= '' and nm ~= 'NULL' then
+            if ep_spell_ok(nm) then
+                local lvl = 0
+                pcall(function() lvl = tonumber(mq.TLO.Spell(nm).Level()) or 0 end)
+                if lvl > bestLvl then best, bestLvl = nm, lvl end
+            end
+        end
+    end
+    epBestPlacate = best or false
+    if best then rezlog('[placate] best placate in my book: %s (level %d)', best, bestLvl)
+    else         rezlog('\\ar[placate] no placate-line spell found in my spellbook\\ax') end
+    return best
+end
+
+-- Put it in the chosen gem if it is not already there. /memspell overwrites, which is the point: the
+-- user pointing at a gem IS the instruction that the gem is for placate.
+function ep_ensure_gem()
+    local have = ep_spell()
+    if have and ep_spell_ok(have) then return true end
+    local want = ep_best_placate()
+    if not want then return false end
+    if epMemAt and (mq.gettime() - epMemAt) < 15000 then return false end   -- one attempt in flight
+    epMemAt = mq.gettime()
+    rezlog('[placate] gem %d holds %s - memming %s instead', epGem,
+           (have and ('"' .. have .. '"')) or 'nothing', want)
+    pcall(function() mq.cmdf('/memspell %d "%s"', epGem, want) end)
+    mq.delay(10000, function() return (mq.TLO.Me.Gem(epGem).Name() or '') == want end)
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Gem(epGem).Name() or '') end)
+    if now ~= want then
+        rezlog('\\ar[placate] could not mem %s into gem %d (it reads "%s")\\ax', want, epGem, now)
+        return false
+    end
+    rezlog('[placate] %s is memmed in gem %d', want, epGem)
+    return true
+end
+
+function ep_gem_ready()
+    local t = -1
+    pcall(function() t = tonumber(mq.TLO.Me.GemTimer(epGem).TotalSeconds()) or -1 end)
+    return t == 0
+end
+
+function ep_find(id)
+    for i, e in ipairs(epQueue) do if e.id == id then return i, e end end
+    return nil
+end
+
+function ep_mark(id, state, why)
+    local _, e = ep_find(id)
+    if not e or e.state then return end
+    e.state, e.oor = state, false
+    rezlog('[placate] %s - %s', e.name or ('id ' .. id), why)
+    pcall(function() peer_bcast('/at_epmark %d %s', id, state) end)
+end
+
+-- Strip the three slots. Records what was there first, INCLUDING empty, so the restore knows the
+-- difference between "put the sword back" and "leave it empty".
+-- Put whatever is on the cursor into a specific FREE BAG SLOT.
+-- USED BY THE CURRENCY PULL TOO, not just the placate strip. That pull used /autoinventory and reported
+-- "bags are full" on a character with plenty of room - the same failure the weapon strip had, where
+-- /autoinventory decides for itself and can simply decline. Naming a destination slot removes the
+-- decision. One implementation, so a fix here fixes both.
+-- NOT /autoinventory: that returns an item to where it belongs, and for a weapon or a shield where it
+-- belongs is the equipment slot we just took it out of. The 2026-08-02 log caught it exactly - "picked
+-- up Staff of Ancient Eloquence, stowing" and 32ms later "still holds Staff of Ancient Eloquence". The
+-- torch bagged fine because nothing wanted to equip it, which is why two of three slots failed and one
+-- appeared to work.
+-- Naming a destination slot removes the choice.
+function ep_stow_cursor()
+    if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
+    for b = 1, 10 do
+        local slots = 0
+        pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
+        for sl = 1, slots do
+            local occupied = true
+            pcall(function()
+                occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
+            end)
+            if not occupied then
+                pcall(function() mq.cmdf('/itemnotify in pack%d %d leftmouseup', b, sl) end)
+                mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+                if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
+            end
+        end
+    end
+    rezlog('\\ar[placate] no free bag slot to stow %s - putting it back\\ax',
+           tostring(mq.TLO.Cursor.Name() or '?'))
+    clear_cursor()   -- last resort: let the game decide rather than leave it on the cursor
+    return false
+end
+
+function ep_strip()
+    if epSaved then return true end
+    epSaved, epStripAt = {}, mq.gettime()
+    -- PAUSE E3 FOR THE WHOLE RUN. Everything from here to the re-equip is cursor work and casting, and a
+    -- live E3 grabs the cursor, re-targets and re-equips underneath it - it will happily put the weapons
+    -- straight back on while we are trying to take them off, and re-target mid-placate.
+    -- Bracketed by strip/restore on purpose: those two are already paired, and every way out of a placate
+    -- run goes through ep_restore - queue finished, the stripped-too-long backstop, /atregear, and the
+    -- script exiting. So there is no path that pauses E3 without something later resuming it.
+    -- /e3p on = paused, /e3p off = E3 driving. Backwards-looking, but it is E3's naming, not ours.
+    mq.cmd('/e3p on')
+    -- REMEMBER THE TARGET ONCE, not per mob. The verification step targets each mob to read the debuff
+    -- off it, and it used to put the previous target back straight afterwards - then target the next mob
+    -- a second later and restore again. Two extra target switches per mob, each with a settle wait, for
+    -- a target nobody looks at until the queue is done. And when the enchanter was self-targeted, which
+    -- casters usually are, the restore meant visibly re-targeting yourself between every placate.
+    -- One save here, one restore at the end.
+    epPrevTarget = 0
+    pcall(function() epPrevTarget = tonumber(mq.TLO.Target.ID()) or 0 end)
+    rezlog('[placate] E3 paused; stripping weapons before the first cast...')
+    for _, slot in ipairs(EP_SLOTS) do
+        local nm = ''
+        pcall(function() nm = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        epSaved[slot] = nm
+        -- SAY WHAT WE READ AND WHAT WE DID, per slot. Two attempts at this have failed silently: first
+        -- because the slot names were wrong and every read came back empty, then again for a reason the
+        -- logs could not show because nothing logged the intermediate steps. A strip that does nothing
+        -- must not look identical to a strip that had nothing to do.
+        if nm == '' then
+            rezlog('[placate]   %s: reads empty - nothing to take off', slot)
+        else
+            clear_cursor()
+            local before = (mq.TLO.Cursor.ID() or 0)
+            pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
+            local onCursor = ''
+            pcall(function() onCursor = tostring(mq.TLO.Cursor.Name() or '') end)
+            if onCursor == '' then
+                rezlog('\\ar[placate]   %s: held %s but /itemnotify put nothing on the cursor\\ax', slot, nm)
+            else
+                rezlog('[placate]   %s: picked up %s, stowing', slot, onCursor)
+            end
+            ep_stow_cursor()   -- into a bag slot by name, never /autoinventory
+            mq.delay(200)      -- let the equipment slot catch up before we judge it
+            local after = ''
+            pcall(function() after = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+            if after ~= '' then
+                rezlog('\\ar[placate]   %s: still holds %s after the attempt\\ax', slot, after)
+            end
+            local _ = before
+        end
+    end
+    -- Say what actually came off, not what we intended to take off. The previous line announced all
+    -- three unconditionally, which is how a strip that removed nothing still read as a success.
+    local took, kept = {}, {}
+    for _, slot in ipairs(EP_SLOTS) do
+        local now = ''
+        pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if (epSaved[slot] or '') ~= '' and now == '' then took[#took + 1] = epSaved[slot]
+        elseif (epSaved[slot] or '') ~= '' then kept[#kept + 1] = slot end
+    end
+    if #took > 0 then
+        rezlog('[placate] stripped %s so augment procs cannot break the placate', table.concat(took, ', '))
+    else
+        rezlog('[placate] nothing to strip - all three slots were already empty')
+    end
+    if #kept > 0 then
+        rezlog('\\ar[placate] could NOT remove: %s - a proc from those may break the placate\\ax',
+               table.concat(kept, ', '))
+    end
+    return true
+end
+
+-- Put everything back. Safe to call at any time, including when nothing was stripped.
+function ep_restore(why)
+    if not epSaved then return end
+    for _, slot in ipairs(EP_SLOTS) do
+        local original = epSaved[slot] or ''
+        local now = ''
+        pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if now ~= original then
+            clear_cursor()
+            if original ~= '' then
+                pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', original) end)
+                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
+                if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                    pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                    mq.delay(700, function()
+                        return (mq.TLO.Me.Inventory(slot).Name() or '') == original
+                    end)
+                end
+            end
+            ep_stow_cursor()
+        end
+    end
+    local missed = {}
+    for _, slot in ipairs(EP_SLOTS) do
+        local original = epSaved[slot] or ''
+        local now = ''
+        pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if now ~= original then missed[#missed + 1] = slot end
+    end
+    if #missed > 0 then
+        rezlog('\\ar[placate] could NOT re-equip: %s - check them by hand\\ax', table.concat(missed, ', '))
+    else
+        rezlog('[placate] re-equipped %s (%s)', table.concat(EP_SLOTS, ', '), why or 'done')
+    end
+    epSaved, epStripAt = nil, 0
+    -- Put the original target back, once, now the whole queue is done.
+    if epPrevTarget and epPrevTarget > 0 then
+        local cur = 0
+        pcall(function() cur = tonumber(mq.TLO.Target.ID()) or 0 end)
+        if cur ~= epPrevTarget then
+            pcall(function() mq.cmdf('/target id %d', epPrevTarget) end)
+        end
+    end
+    epPrevTarget = 0
+    -- Hand the toon back. Last thing, after the gear is actually on - resuming earlier would let E3
+    -- start driving while items are still moving.
+    mq.cmd('/e3p off')
+    rezlog('[placate] E3 resumed')
+end
+
+-- Runs on every toon; returns immediately on anyone who is not an enchanter. Main loop only - it
+-- equips, unequips and casts, none of which belongs anywhere near an ImGui callback.
+-- SOAK TEST FOR THE STRIP/RESTORE CYCLE. Run before trusting this on anyone else's characters: the
+-- failure being looked for is an item that comes off and does not come back - a desync where the client
+-- and server disagree about where a weapon is - and that is not something to discover on a stranger.
+-- Checks the things that would actually constitute losing a weapon, not just that the commands ran:
+--   * after the strip, is the item findable in the BAGS (not merely absent from the slot)
+--   * after the restore, is it back in the SAME slot it started in
+-- ABORTS on the first failure rather than looping - if something has gone wrong with an item, doing it
+-- nine more times is the worst available response.
+epTestRuns = 0
+epTestOK   = 0
+function ep_soak_test(times)
+    times = math.max(1, math.min(50, math.floor(tonumber(times) or 10)))
+    if epSaved then
+        log('\\ay[placate test] weapons are already stripped - run /atregear first\\ax')
+        return
+    end
+    local start = {}
+    for _, slot in ipairs(EP_SLOTS) do
+        local nm = ''
+        pcall(function() nm = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        start[slot] = nm
+    end
+    log('[placate test] %d cycles. Starting gear:', times)
+    for _, slot in ipairs(EP_SLOTS) do
+        log('   %-9s %s', slot, start[slot] ~= '' and start[slot] or '(empty)')
+    end
+
+    epTestRuns, epTestOK = 0, 0
+    for i = 1, times do
+        epTestRuns = i
+        local fault = nil
+
+        ep_strip()
+        -- Every item we took off must be findable in the bags. "Not in the slot" is not good enough -
+        -- that is also what a vanished item looks like.
+        for _, slot in ipairs(EP_SLOTS) do
+            local want = start[slot]
+            if want ~= '' then
+                local still = ''
+                pcall(function() still = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+                local inBags = 0
+                pcall(function() inBags = tonumber(mq.TLO.FindItemCount('=' .. want)()) or 0 end)
+                if still ~= '' then fault = string.format('%s still equipped (%s)', slot, still)
+                elseif inBags < 1 then fault = string.format('%s: %s is NOT in bags after stripping', slot, want) end
+            end
+        end
+
+        if not fault then
+            mq.delay(3000)
+            ep_restore('soak test')
+            mq.delay(500)
+            for _, slot in ipairs(EP_SLOTS) do
+                local want = start[slot]
+                local now = ''
+                pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+                if now ~= want then
+                    fault = string.format('%s reads "%s", expected "%s"', slot,
+                                          now ~= '' and now or '(empty)', want ~= '' and want or '(empty)')
+                end
+            end
+        end
+
+        if fault then
+            log('\\ar[placate test] cycle %d FAILED: %s\\ax', i, fault)
+            log('\\ar[placate test] stopping here so nothing is made worse. Check your gear.\\ax')
+            ep_restore('test aborted')
+            break
+        end
+        epTestOK = epTestOK + 1
+        log('[placate test] cycle %d/%d ok', i, times)
+        if i < times then mq.delay(3000) end
+    end
+    log('[placate test] %d of %d cycles clean.', epTestOK, epTestRuns)
+    if epTestOK == epTestRuns and epTestRuns > 0 then
+        log('\\ag[placate test] no desyncs seen.\\ax')
+    end
+end
+
+function ep_tick()
+    if not ep_is_enchanter() then return end
+
+    -- BACKSTOP FIRST, before anything else can return early. Being stripped is a state with a real cost -
+    -- an enchanter with no weapons is an enchanter not meleeing and not proccing anything useful - and a
+    -- queue that stalls on an unreachable mob would otherwise leave them that way indefinitely.
+    if epSaved and (mq.gettime() - epStripAt) > EP_STRIP_MAX then
+        ep_restore('backstop - stripped too long')
+    end
+
+    if epCast then
+        -- PLACATE HAS A CAST TIME, so nothing can be concluded while it is still going out. This used to
+        -- read the gem timer immediately and call the job done the moment it moved, which reported a
+        -- success before the spell had even finished being cast.
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if casting then
+            epCast.sawCast = true
+            return
+        end
+
+        -- Then LOOK. A resist is not a failure to cast - the gem still cycles, the cast still completes -
+        -- so the only way to tell a landed placate from a resisted one is to look at the mob. Target it
+        -- briefly, read the debuff, and put the previous target straight back.
+        -- A beat after the cast ends, because the debuff does not appear on the same frame.
+        if (mq.gettime() - epCast.at) < EP_CHECK_AFTER then return end
+
+        -- STILL TARGETED, so just read it. We targeted this mob before casting at it, and with E3 paused
+        -- nothing else moves the target - so there is no need to re-target it here, and no settle wait.
+        -- This used to target the mob, read, then hand the target back, per mob.
+        local landed = false
+        if (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id then
+            local sp = ep_spell()
+            if sp then
+                pcall(function() landed = (tonumber(mq.TLO.Target.Buff(sp).ID()) or 0) > 0 end)
+            end
+        else
+            -- Something moved it anyway. Rare with E3 held, but say so rather than silently reporting
+            -- a failure that was really a lost target.
+            rezlog('\\ay[placate] target moved off %s before the check - cannot tell if it landed\\ax',
+                   epCast.name)
+        end
+        -- Deliberately NOT restoring here: the next mob in the queue gets targeted a moment later
+        -- anyway, and the caller's target goes back once when the queue finishes.
+
+        if landed then
+            ep_mark(epCast.id, 'done', 'placate landed')
+            epCast = nil
+            return
+        end
+        if epCast.tries < EP_RETRY then
+            epCast.tries = epCast.tries + 1
+            epCast.at, epCast.sawCast = mq.gettime(), false
+            rezlog('[placate] did not land on %s - retry %d of %d', epCast.name, epCast.tries, EP_RETRY)
+            if (tonumber(mq.TLO.Target.ID()) or 0) ~= epCast.id then
+                pcall(function() mq.cmdf('/target id %d', epCast.id) end)
+                mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id end)
+            end
+            pcall(function() mq.cmdf('/nowcast me "%s" %d', ep_spell() or '', epCast.id) end)
+            return
+        end
+        rezlog('\\ay[placate] gave up on %s after %d tries\\ax', epCast.name, epCast.tries)
+        ep_mark(epCast.id, 'failed', 'would not land')
+        epCast = nil
+        return
+    end
+
+    -- Anything left to do?
+    local next_e
+    for _, q in ipairs(epQueue) do if not q.state then next_e = q; break end end
+    if not next_e then
+        -- Queue finished. Put the weapons back - this is the "once everything is placated" half.
+        if epSaved then ep_restore('queue finished') end
+        return
+    end
+
+    local sp = ep_spell()
+    if not sp then
+        -- Empty gem is the same situation as a wrong one: fill it rather than complain about it.
+        if not ep_ensure_gem() then return end
+        sp = ep_spell()
+        if not sp then return end
+    end
+    -- WRONG SPELL IN THE GEM? MEM THE RIGHT ONE. This used to refuse and print an error, on the grounds
+    -- that memming interrupts the enchanter and displaces what they chose to put there. Neither holds up:
+    -- choosing the gem IS the instruction that the gem is for placate, and this whole feature already
+    -- strips their weapons off, which is considerably more intrusive than swapping one gem.
+    -- The one real objection was picking a rank on their behalf - answered by reading it out of their own
+    -- spellbook rather than a list, the same way the phantom line picks the best disc a monk owns.
+    -- An error here would also land on a background toon nobody is watching, so the queue would just
+    -- quietly do nothing. Memming makes it work.
+    local spOk, spWhy = ep_spell_ok(sp)
+    if not spOk then
+        if not ep_ensure_gem() then return end
+        sp = ep_spell()
+        if not sp then return end
+        spOk, spWhy = ep_spell_ok(sp)
+        if not spOk then return end
+    end
+    if epSaidGem ~= sp then
+        epSaidGem = sp
+        rezlog('[placate] using "%s" from gem %d (matched on %s)', sp, epGem, tostring(spWhy))
+    end
+
+    if (mq.gettime() - (epLast or 0)) < EP_RECAST then return end
+    if not ep_gem_ready() then return end
+
+    -- Dead or gone while it waited its turn.
+    local ty, hp = '', 0
+    pcall(function() ty = tostring(mq.TLO.Spawn(next_e.id).Type() or '') end)
+    pcall(function() hp = tonumber(mq.TLO.Spawn(next_e.id).PctHPs()) or 0 end)
+    if ty ~= 'NPC' or hp <= 0 then ep_mark(next_e.id, 'failed', 'dead or gone'); return end
+
+    -- STRIP BEFORE THE FIRST CAST, not before each one. Nothing above this point casts, so by the time
+    -- we get here we know there is real work to do and it is worth paying for.
+    ep_strip()
+
+    epLast = mq.gettime()
+    -- Target it BEFORE the cast, once. It stays there for the verification read afterwards because E3
+    -- is paused for the whole run - one target per mob rather than one to cast plus one to check.
+    pcall(function() mq.cmdf('/target id %d', next_e.id) end)
+    mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == next_e.id end)
+    rezlog('[placate] %s on %s', sp, next_e.name)
+    pcall(function() mq.cmdf('/nowcast me "%s" %d', sp, next_e.id) end)
+    epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false }
+end
+
 -- ===== PHANTOM LINE (placate) =====
 -- A queue rather than a button: the driver clicks a mob to enqueue it, and whoever holds the disc works
 -- down the list in order, one at a time, waiting out the 10s recast between casts.
@@ -6528,6 +8346,88 @@ function pw_tick()
     pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev }
 end
 
+function draw_placate()
+    local holder = nil
+    for _, nm in ipairs(group_members()) do
+        if epState[nm] then holder = nm; break end
+    end
+
+    if ImGui.Button('Placate##epadd', 160, 0) then
+        local id, nm, ty, hp = 0, '', '', 0
+        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
+        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
+        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
+        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
+        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
+            log('\\ay[placate] target an NPC first\\ax')
+        elseif ep_find(id) then
+            log('[placate] %s is already queued', nm)
+        else
+            epQueue[#epQueue + 1] = { id = id, name = nm, oor = false }
+            log('[placate] queued %s (%d in the list)', nm, #epQueue)
+            pcall(function() peer_bcast('/at_epadd %d %s', id, nm:gsub(' ', '_')) end)
+        end
+    end
+    ImGui.SameLine()
+    if ImGui.SmallButton('Clear list##epclear') then
+        epQueue, epDoneAt = {}, nil
+        pcall(function() peer_bcast('/at_epclear') end)
+        log('[placate] queue cleared')
+    end
+    -- Say when the weapons are off, because it is a state with a cost and it should never be a surprise.
+    if epSaved then
+        ImGui.SameLine()
+        ImGui.TextColored(0.90, 0.72, 0.35, 1.0, 'weapons off')
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(
+                'primary, secondary and range are stowed so augment procs\ncannot break a placate.\nThey go back on when the queue finishes.') end)
+        end
+    end
+    if #epQueue == 0 then return end
+
+    local pending = 0
+    for i, e in ipairs(epQueue) do
+        if not e.state then pending = pending + 1 end
+        ImGui.Text(string.format('%d.', i)); ImGui.SameLine()
+        local tip
+        if e.state == 'done' then
+            ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (cast)')
+            tip = e.name .. '\nplacate was cast at it'
+        elseif e.state == 'immune' then
+            ImGui.TextColored(0.85, 0.30, 0.30, 1.0, e.name .. '  (immune)')
+            tip = e.name .. '\nthe game says it looks unaffected - it cannot be placated'
+        elseif e.state == 'failed' then
+            ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
+            tip = e.name .. '\ngave up - dead, gone, or the cast would not go off'
+        else
+            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, e.name)
+            tip = e.name .. '\nwaiting its turn'
+        end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(tip) end)
+        end
+        ImGui.SameLine()
+        if ImGui.SmallButton('x##epdel' .. i) then
+            pcall(function() peer_bcast('/at_epdel %d', e.id) end)
+            table.remove(epQueue, i)
+            break
+        end
+    end
+    if pending == 0 and #epQueue > 0 then
+        epDoneAt = epDoneAt or mq.gettime()
+        local hold = (#epQueue == 1) and 10000 or EP_LINGER
+        local left = math.max(0, hold - (mq.gettime() - epDoneAt))
+        ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
+        if left <= 0 then
+            epQueue, epDoneAt = {}, nil
+            pcall(function() peer_bcast('/at_epclear') end)
+        end
+    else
+        epDoneAt = nil
+    end
+    ImGui.Spacing()
+end
+
 function draw_phantom()
     local holder = nil
     for _, nm in ipairs(group_members()) do
@@ -6573,6 +8473,9 @@ function draw_phantom()
         if e.state == 'done' then
             ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (on)')
             tip = e.name .. '\n' .. pw_label() .. ' is on it'
+        elseif e.state == 'immune' then
+            ImGui.TextColored(0.85, 0.30, 0.30, 1.0, e.name .. '  (immune)')
+            tip = e.name .. '\nthe game says it looks unaffected - it cannot be affected by this'
         elseif e.state == 'failed' then
             ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
             tip = e.name .. '\ngave up on this one - dead, gone, or it would not land'
@@ -6660,6 +8563,18 @@ end
 -- NOT this chunk's globals: the checkbox wrote _G.miniPots while save_settings read the real miniPots,
 -- two different variables. It looked fine in-session (the checkbox and the render loop agreed with
 -- each other) and saved nothing, which is a horrible way to fail. Closures capture the actual upvalue.
+-- Hover text for the mini sections whose behaviour is not obvious from the label. Kept beside the
+-- section list rather than inside the render so it reads as documentation, which is what it is.
+MINI_HELP = {
+    coth = 'Uses Call of the Hero from the Wayfarers aug.\n' ..
+           'Note: the aug needs to be in a charm to work.\n' ..
+           'Use /atcoth to start a gather anchored on another character.',
+    rez  = 'Configure the rez order under the Rez tab.',
+    combos = 'Group MGB heals with class combinations,\nso you only need to click one button.',
+    phantom = 'Monk placate line. Click mobs to queue them;\nthe monk works down the list.',
+    placate = 'Enchanter placate. Strips weapons first so augment\nprocs cannot break it, then puts them back.',
+}
+
 MINI_SECTIONS = {
     { key = 'rez',    label = 'Rez',                   draw = draw_rez_mini,
       get = function() return miniRez end,    set = function(v) miniRez = v end },
@@ -6667,7 +8582,11 @@ MINI_SECTIONS = {
       get = function() return miniDI end,     set = function(v) miniDI = v end },
     { key = 'burns',  label = 'Burns',
       draw = function()
-          if not miniBurnTable then draw_burn_dots(); return end
+          -- THREE VIEWS, smallest first: compact (name + ready count + dots), the tier matrix, then
+          -- the full table. miniBurnView supersedes the old miniBurnTable boolean, which could only
+          -- say "matrix or table"; the loader below migrates the old value so nobody loses their choice.
+          if miniBurnView == 0 then draw_burn_compact(); return end
+          if miniBurnView == 1 then draw_burn_dots(); return end
           for i, f in ipairs({ 'All', 'Tank', 'DPS', 'Healer' }) do
               if i > 1 then ImGui.SameLine() end
               local on, pushed = (miniBurnFilter == f), 0   -- count, so pop_state_button balances
@@ -6701,6 +8620,8 @@ MINI_SECTIONS = {
       get = function() return miniArcane end, set = function(v) miniArcane = v end },
     { key = 'phantom', label = 'Phantom (placate)',     draw = draw_phantom,
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
+    { key = 'placate', label = 'Placate (enchanter)',    draw = draw_placate,
+      get = function() return miniPlacate end, set = function(v) miniPlacate = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
 function mini_section(key)
@@ -7006,14 +8927,14 @@ local function render()
         -- auto-resize will not grow past what the rest of the content wants, and ImGui clamps a table's
         -- outer width to the available region - so the extra columns just got clipped off the edge.
         -- With the table on, the window becomes resizable and scrollable so it can actually be dragged.
-        local mflags = (miniBurns and miniBurnTable)
+        local mflags = (miniBurns and miniBurnView == 2)
             and 0
             or ((ImGuiWindowFlags.AlwaysAutoResize or 0) + (ImGuiWindowFlags.NoScrollbar or 0))
         -- Fires once per session as well as on the toggle: if detail was ALREADY on at load, the toggle
         -- never runs, and ImGui just restores the small size it remembered from when this was an
         -- auto-resizing window. Two call signatures because bindings differ; a silent pcall failure here
         -- is exactly why the first attempt did nothing.
-        if (miniBurns and miniBurnTable) and not miniSizedOnce then
+        if (miniBurns and miniBurnView == 2) and not miniSizedOnce then
             miniSizedOnce = true; miniSizeWanted = true
         end
         if miniSizeWanted then
@@ -7022,7 +8943,7 @@ local function render()
             local okS = pcall(function() ImGui.SetNextWindowSize(w, h, ImGuiCond.Always or 1) end)
             if not okS then pcall(function() ImGui.SetNextWindowSize(w, h) end) end
         end
-        local show = ImGui.Begin('AdventureTime###advtime_mini', windowOpen, mflags)
+        local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime_mini', windowOpen, mflags)
         windowOpen = show
         if show then
             if ImGui.SmallButton('Expand') then miniMode = false; save_settings() end
@@ -7051,7 +8972,7 @@ local function render()
         return
     end
     ImGui.SetNextWindowSize(560, 500, ImGuiCond.FirstUseEver)
-    local show = ImGui.Begin('AdventureTime###advtime', windowOpen)
+    local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime', windowOpen)
     windowOpen = show
     if show then
         -- top strip: global controls + the tribute glance (always visible, above the tabs)
@@ -7073,6 +8994,11 @@ local function render()
                 render_group('Draughts II', COL_II, LIST_II)
                 render_group(nil, COL_ORB, { 'Orb of Shadows' })
                 render_group(nil, COL_EM,  { 'Emerald' })
+                -- These call sites are hardcoded rather than driven from ITEMS, so adding a name to
+                -- that list gets it COUNTED but never DRAWN - which is exactly what happened to Ruby
+                -- and Diamond Coin: eighteen items queried, sixteen visible.
+                render_group(nil, COL_RUBY, { 'Ruby' })
+                render_group(nil, COL_DC,   { 'Diamond Coin' }, 'Diamond Coin')
                 if distributing then
                     ImGui.TextDisabled('Working...')
                 else
@@ -7109,13 +9035,11 @@ local function render()
             if showSec.rez and ImGui.BeginTabItem('Rez') then
                 draw_rez_tab()
             end
-            if showSec.misc and ImGui.BeginTabItem('Misc') then
-                if not pcall(draw_misc_tab) then
-                    ImGui.TextColored(0.85, 0.35, 0.35, 1.0, 'Misc panel error - see console')
-                end
-                ImGui.EndTabItem()
-            end
             if ImGui.BeginTabItem('Settings') then
+                ImGui.Spacing()
+                ImGui.TextColored(0.45, 0.75, 0.95, 1.0,
+                    'AdventureTime ' .. VERSION .. '   (build ' .. BUILD_TAG .. ')')
+                ImGui.Separator()
                 ImGui.Spacing()
                 ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Sections')
                 ImGui.TextDisabled('Turn off anything you do not use - hidden sections stop rendering.')
@@ -7130,7 +9054,6 @@ local function render()
                 chk('pots',    'Pots tab')
                 chk('burns',   'Burns tab')
                 chk('rez',     'Rez tab')
-                chk('misc',    'Misc tab')
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Raid chat')
                 ImGui.Spacing()
@@ -7167,12 +9090,73 @@ local function render()
                             local was = sec.get() and true or false
                             local now = ImGui.Checkbox(sec.label .. '##at_sec_' .. k, was)
                             if now ~= was then sec.set(now); dirty = true end
+                            -- A '?' beside the rows whose behaviour is not obvious from the label.
+                            -- These are the things people have to be told once and then never again -
+                            -- which is exactly what a hover is for, rather than a line of help text
+                            -- taking up space forever.
+                            if MINI_HELP[k] then
+                                ImGui.SameLine()
+                                ImGui.TextDisabled('?')
+                                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                                    pcall(function() ImGui.SetTooltip(MINI_HELP[k]) end)
+                                end
+                            end
+                            -- SHOWN ON EVERY TOON, NOT JUST THE ENCHANTER. This was gated on
+                            -- ep_is_enchanter(), which hid it everywhere it would actually be used: the
+                            -- person setting it is looking at the DRIVER's window, and the driver is not
+                            -- the enchanter - so the field only appeared on the one character nobody has
+                            -- on screen. Set it anywhere and it is broadcast to whoever does the casting,
+                            -- the same way the rez order and the CotW toggle already work.
+                            if k == 'placate' and miniPlacate then
+                                ImGui.SameLine()
+                                ImGui.SetNextItemWidth(70)
+                                local g = ImGui.InputInt('gem##at_epgem', epGem or 8, 0)
+                                g = math.max(1, math.min(12, math.floor(tonumber(g) or 8)))
+                                if g ~= epGem then
+                                    epGem = g; dirty = true
+                                    pcall(function() peer_bcast('/at_epgem %d', g) end)
+                                end
+                                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                                    local sp = ep_spell()
+                                    local who = nil
+                                    for _, nm in ipairs(group_members()) do
+                                        if epState[nm] then who = nm; break end
+                                    end
+                                    pcall(function() ImGui.SetTooltip(
+                                        'which gem holds placate' ..
+                                        (who and ('\nenchanter: ' .. who) or '\nno enchanter has reported in yet') ..
+                                        (sp and ('\nin that gem here: ' .. sp ..
+                                                 (ep_spell_ok(sp) and '  (looks right)' or '  (NOT a placate)'))
+                                             or '')) end)
+                                end
+                            end
                             if k == 'burns' and miniBurns then
                                 ImGui.SameLine()
-                                local wasT = miniBurnTable and true or false
-                                local nowT = ImGui.Checkbox('full detail##at_burntbl', wasT)
-                                if nowT ~= wasT then
-                                    miniBurnTable = nowT
+                                -- Three named views instead of a "full detail" tick, because there are
+                                -- three now and a checkbox cannot say which of the other two you get.
+                                local wasV = miniBurnView
+                                for vi, vlabel in ipairs({ 'compact', 'matrix', 'full' }) do
+                                    if vi > 1 then ImGui.SameLine() end
+                                    local on, vpushed = (miniBurnView == vi - 1), 0
+                                    if on and ImGuiCol and ImGuiCol.Button then
+                                        local okv = pcall(function()
+                                            ImGui.PushStyleColor(ImGuiCol.Button, 0.20, 0.45, 0.70, 1.0)
+                                        end)
+                                        if okv then vpushed = 1 end
+                                    end
+                                    if ImGui.SmallButton(vlabel .. '##at_bv_' .. vlabel) then
+                                        miniBurnView = vi - 1
+                                    end
+                                    pop_state_button(vpushed)
+                                end
+                                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                                    pcall(function() ImGui.SetTooltip(
+                                        'compact - one line each, ready count and dots\n' ..
+                                        'matrix  - a column per burn tier\n' ..
+                                        'full    - every item, timers and names') end)
+                                end
+                                local nowT = (miniBurnView == 2)
+                                if miniBurnView ~= wasV then
                                     -- One-shot: give the window a usable size the moment detail goes on,
                                     -- rather than leaving it at whatever the compact view had shrunk to.
                                     if nowT then miniSizeWanted = true end
@@ -7314,11 +9298,33 @@ if DI.ladderOff then
 end
 if SHOW_UI then mq.imgui.init(scriptName, render) end
 pcall(function() mq.bind('/at', function() windowOpen = not windowOpen end) end)
+-- BRINGING IT BACK. Closing the window with the X sets windowOpen false and there is nothing left on
+-- screen to click, so the only way back was /at - which is easy to forget and not obviously a toggle.
+-- These two say what they do and always OPEN rather than toggle, because someone typing them has just
+-- lost the window and wants it back; a toggle would half the time close it again.
+-- Bound here rather than with the rest because windowOpen and miniMode are locals declared far below
+-- that block, and a bind up there would close over nothing.
+pcall(function() mq.bind('/atui', function()
+    windowOpen = true
+    miniMode = true
+    save_settings()
+    printf('\ag[AdventureTime]\ax mini window open (\ay/atuie\ax for the full one)')
+end) end)
+pcall(function() mq.bind('/atuie', function()
+    windowOpen = true
+    miniMode = false
+    save_settings()
+    printf('\ag[AdventureTime]\ax expanded window open (\ay/atui\ax for the mini one)')
+end) end)
 if SHOW_UI then
-    log('ready [%s] - \\ay/lua run adventuretime\\ax on each toon; open \\ay/at\\ax here and Give out.', BUILD_TAG)
+    log('AdventureTime %s ready [%s] - \\ay/lua run adventuretime\\ax on each toon; open \\ay/at\\ax here and Give out.',
+        VERSION, BUILD_TAG)
     log('   \\ay/atcoth\\ax starts the CoTH gather from any toon (\\ay/atcoth off\\ax to stop).')
+    -- Said at startup because the moment you need it is the moment the window is gone, and a command
+    -- you have never seen is no help then.
+    log('   \\ay/atui\\ax reopens the mini window, \\ay/atuie\\ax the expanded one.')
 else
-    log('ready [%s] (worker - headless; obeying the driver).', BUILD_TAG)
+    log('AdventureTime %s ready [%s] (worker - headless; obeying the driver).', VERSION, BUILD_TAG)
 end
 -- DRIVER ONLY. This populates the Pots status columns, which only exist on the driver - but it used to
 -- run unconditionally, so all six toons each fired a full peers x items query pass at startup. Six
@@ -7495,6 +9501,118 @@ while running do
         pcall(arc_retry_tick)
         pcall(pot_retry_tick)
         pcall(pw_tick)
+        -- The Withdraw button only sets a request; the work happens here because it drives windows on
+        -- a peer and waits on them.
+        if dcGiveWant then
+            local w = dcGiveWant; dcGiveWant = nil
+            pcall(function() give_out_one(w.item, w.currency) end)
+        end
+        if tribGroupWant then
+            local w = tribGroupWant; tribGroupWant = nil
+            local sent = 0
+            for _, nm in ipairs(group_members()) do
+                local n = (counts[nm:lower()] or {})[w.item] or 0
+                if n > 0 then
+                    sent = sent + 1
+                    -- Capped at what each actually holds, so a toon with 40 donates 40 rather than
+                    -- failing on a request for 400.
+                    local send = math.min(w.qty, n)
+                    if nm:lower() == myName:lower() then
+                        tribWant = { item = w.item, qty = send }
+                    else
+                        pcall(function()
+                            peer_cmdf(nm, '/attribute %s %d', w.item:gsub(' ', '_'), send)
+                        end)
+                    end
+                end
+            end
+            log('[tribute] asked %d character(s) to donate up to %d %s each', sent, w.qty, w.item)
+            -- Long: several toons are walking to their own tribute masters.
+            altCurRefresh = mq.gettime() + 45000
+        end
+        if tribWant then
+            local w = tribWant; tribWant = nil
+            pcall(function() trib_donate(w.item, w.qty) end)
+            altCurRefresh = mq.gettime() + 2000   -- ours is already done; just let the counts settle
+        end
+        if altReclaimWant then
+            -- No quantity: Reclaim is all-or-nothing by design, so there is nothing to compute here.
+            local w = altReclaimWant; altReclaimWant = nil
+            pcall(function() altcur_reclaim(w.name) end)
+        end
+        if altReclaimAllWant then
+            local w = altReclaimAllWant; altReclaimAllWant = nil
+            local asked = 0
+            for _, nm in ipairs(group_members()) do
+                local n = (counts[nm:lower()] or {})[w.name] or 0
+                if n > 0 then
+                    asked = asked + 1
+                    if nm:lower() == myName:lower() then
+                        pcall(function() altcur_reclaim(w.name) end)
+                    else
+                        pcall(function() peer_cmdf(nm, '/atreclaim %s', w.name:gsub(' ', '_')) end)
+                    end
+                end
+            end
+            log('[altcur] asked %d character(s) to reclaim all their %s', asked, w.name)
+            altCurRefresh = mq.gettime() + 8000
+        end
+        if altWithdrawAllWant then
+            local w = altWithdrawAllWant; altWithdrawAllWant = nil
+            -- EVERY character that has a balance, not just the richest. Picking one made sense while
+            -- this was "get me enough to hand out"; for "withdraw all" it just left five toons holding
+            -- currency they cannot use. Each converts its OWN, in parallel, so it is no slower.
+            local asked = 0
+            for _, nm in ipairs(group_members()) do
+                local bal = (altCounts[nm:lower()] or {})[w.name]
+                if type(bal) == 'number' and bal > 0 then
+                    asked = asked + 1
+                    if nm:lower() == myName:lower() then
+                        pcall(function() altcur_pull(w.name, bal) end)
+                    else
+                        pcall(function() peer_cmdf(nm, '/atpull %s %d', w.name:gsub(' ', '_'), bal) end)
+                    end
+                end
+            end
+            log('[altcur] asked %d character(s) to withdraw all their %s', asked, w.name)
+            altCurRefresh = mq.gettime() + 8000   -- longer: several may be converting at once
+        end
+        -- RE-READ BOTH SIDES. Every action on this row moves coins between bags and the currency tab,
+        -- so re-reading only the balances left the row half stale - the top line still showing what
+        -- was in bags before the withdraw, or before the tribute spent it.
+        if altCurRefresh and mq.gettime() > altCurRefresh then
+            altCurRefresh = nil
+            local roster = group_members()
+            local peers = {}
+            for _, m in ipairs(roster) do if m:lower() ~= myName:lower() then peers[#peers + 1] = m end end
+            -- ALL ITEMS, not just the alt one. query_all_counts REPLACES the counts table on entry -
+            -- `counts = { [me] = {...} }` - so a partial query does not update a subset, it discards
+            -- everything it was not asked about. Refreshing after a tribute therefore blanked every
+            -- draught on the board.
+            -- That is correct behaviour for a full refresh and simply cannot be used for a partial one,
+            -- so this asks for everything. It is the same call Counts makes.
+            pcall(function() query_all_counts(peers, all_items()) end)
+            for _, it in ipairs(ALT_ITEMS) do pcall(function() query_alt_currency(roster, it) end) end
+            statusCounts = {}
+            for _, nm in ipairs(roster) do statusCounts[nm:lower()] = counts[nm:lower()] or {} end
+            statusNames = roster
+            uiStatus = 'Diamond Coin counts updated.'
+        end
+        if altPullWant then
+            local w = altPullWant; altPullWant = nil
+            pcall(function() altcur_pull(w.name, w.qty) end)
+        end
+        if epTestWant then
+            local n = epTestWant; epTestWant = nil
+            pcall(function() ep_soak_test(n) end)
+        end
+        pcall(ep_tick)
+        if not epSaidHave and ep_is_enchanter() then
+            epSaidHave = true
+            epState[myName] = true
+            pcall(function() peer_bcast('/at_ephave %s', myName) end)
+            log('[placate] I am the enchanter - I will work the placate queue')
+        end
         if not pwSaidHave and pw_have() then
             pwSaidHave = true
             pwState[myName] = pw_label()
@@ -7545,7 +9663,12 @@ while running do
         local full = group_members()
         local peers = {}
         for _, m in ipairs(full) do if m:lower() ~= myName:lower() then peers[#peers + 1] = m end end
-        query_all_counts(peers, ITEMS)   -- DanNet reads counts directly - a refresh never needs to ping or start anyone
+        -- ONE CALL WITH EVERYTHING. Two back-to-back query_all_counts passes is not just wasteful, it
+        -- is how the draughts came back blank: the second pass rebuilds the per-peer bookkeeping for
+        -- the items IT was given, and the first pass's results were the collateral.
+        -- A refresh means "tell me where everything is", so it reads one combined list.
+        query_all_counts(peers, all_items())
+        for _, it in ipairs(ALT_ITEMS) do pcall(function() query_alt_currency(peers, it) end) end
         local roster = { myName }
         for _, p in ipairs(peers) do roster[#roster + 1] = p end
         statusCounts = {}
@@ -7986,6 +10109,8 @@ while running do
 end
 
 pcall(function() mq.unbind('/at') end)
+pcall(function() mq.unbind('/atuie') end)
+pcall(function() mq.unbind('/atui') end)
 pcall(function() mq.unbind('/at_expecttrade') end)
 pcall(function() mq.unbind('/at_close') end)
 pcall(function() mq.unbind('/at_give') end)
@@ -8038,7 +10163,29 @@ pcall(function() mq.unbind('/at_rezskip') end)
 pcall(function() mq.unbind('/at_rezdone') end)
 pcall(function() mq.unbind('/at_rezorder') end)
 pcall(function() mq.unbind('/at_rezorder?') end)
+-- NEVER LEAVE THE ENCHANTER STRIPPED. Whatever route we exited by, put the weapons back before the
+-- script stops - there is nothing left running afterwards that could.
+pcall(function() ep_restore('script stopping') end)
 pcall(function() mq.unbind('/at_bags') end)
+pcall(function() mq.unbind('/atregear') end)
+pcall(function() mq.unbind('/atslots') end)
+pcall(function() mq.unbind('/atcurrency') end)
+pcall(function() mq.unbind('/atreclaim') end)
+pcall(function() mq.unbind('/attab') end)
+pcall(function() mq.unbind('/attribute') end)
+pcall(function() mq.unbind('/attribprobe') end)
+pcall(function() mq.unbind('/at_altrep') end)
+pcall(function() mq.unbind('/at_altbal') end)
+pcall(function() mq.unbind('/at_altbags') end)
+pcall(function() mq.unbind('/atpull') end)
+pcall(function() mq.unbind('/atplacatetest') end)
+pcall(function() mq.unbind('/atplacategem') end)
+pcall(function() mq.unbind('/at_ephave') end)
+pcall(function() mq.unbind('/at_epgem') end)
+pcall(function() mq.unbind('/at_epmark') end)
+pcall(function() mq.unbind('/at_epclear') end)
+pcall(function() mq.unbind('/at_epdel') end)
+pcall(function() mq.unbind('/at_epadd') end)
 -- Everything else this script binds. These were left registered on /lua stop, so a stopped script
 -- still owned 21 command names pointing at closures from a dead run.
 pcall(function() mq.unbind('/at_cure') end)
