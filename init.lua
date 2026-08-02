@@ -44,7 +44,7 @@ local scriptName = 'AdventureTime'
 -- driver's /at_* commands (pause/trade/bags). No UI = no accidental second driver.
 local ARGS = { ... }
 local SHOW_UI = (ARGS[1] ~= 'worker')
-local BUILD_TAG = 'at-minicloseall-2026-07-31'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-rezgate-2026-08-01'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -66,8 +66,35 @@ do
     local who = '?'
     pcall(function() who = mq.TLO.Me.Name() or '?' end)
     LOG_FILE_PATH = (dir or '') .. 'AdventureTime_' .. who .. '_log.txt'
-    local fh = io.open(LOG_FILE_PATH, 'w')   -- 'w' = fresh each run
+    -- KEEP THE PREVIOUS RUNS. This used to open 'w' - fresh each run - which meant a crash destroyed its
+    -- own evidence: the client goes down, the client comes back, the script restarts and wipes the log
+    -- covering the crash. Three minidumps on 2026-08-01 (14:50:05, 14:51:35, 03:54:42) had no readable
+    -- log window for exactly this reason, because the restart at 14:53 had truncated all six files.
+    -- Same approach LazCraft already uses. A crash costs a few hundred KB of log instead of the answer.
+    local KEEP_SESSIONS = 8
+    local prior = ''
+    local rf = io.open(LOG_FILE_PATH, 'r')
+    if rf then
+        local content = rf:read('*a') or ''
+        rf:close()
+        local marker = '=== AdventureTime log'
+        local sessions, idx = {}, 1
+        while true do
+            local st = content:find(marker, idx, true)
+            if not st then break end
+            local nxt = content:find(marker, st + #marker, true)
+            sessions[#sessions + 1] = content:sub(st, (nxt and nxt - 1) or #content)
+            if not nxt then break end
+            idx = nxt
+        end
+        local first = math.max(1, #sessions - (KEEP_SESSIONS - 1) + 1)
+        local keep = {}
+        for i = first, #sessions do keep[#keep + 1] = sessions[i] end
+        prior = table.concat(keep)
+    end
+    local fh = io.open(LOG_FILE_PATH, 'w')   -- rewrite: kept prior sessions, then this one
     if fh then
+        if prior ~= '' then fh:write(prior) end
         fh:write(string.format('=== AdventureTime log (%s) - started %s [build %s] ===\n',
             who, os.date('%Y-%m-%d %H:%M:%S'), BUILD_TAG))
         fh:close()
@@ -853,6 +880,8 @@ lastClickResync = 0         -- NOT local: this chunk is at Lua's 200-local ceili
 local clickStartAt  = 0     -- ...and their own, much shorter startup settle
 local lastBurnPoll   = 0     -- worker: last local read
 local burnRefreshRequested = false   -- Burns tab 'Refresh' - re-parse the INI and re-report everything
+burnPollOn = true            -- /atburnpoll off to silence the burn poll on this toon (crash test)
+tribLast   = nil             -- last tribute state sent to the driver, so we only send on change
 local burnStartAt    = 0     -- first poll is delayed: reporting before the driver's binds exist loses items
 local lastBurnResync = 0     -- slow full re-report; reports only fire on CHANGE, so a dropped one is
                              -- otherwise lost until that item next flips. This heals it.
@@ -952,7 +981,7 @@ local buffNameOf = {}   -- watched item/AA name -> the buff/song it applies ('' 
 local buffLatch  = {}   -- name -> seconds remaining captured when it went up (held so the push key is stable)
 -- Seconds left on the buff a watched thing applies, or 0. Looks on ME only: a debuff lands on the mob and
 -- so never shows here, which is exactly the filter we want - no TargetType table to keep in step.
-local function my_effect_secs(name, resolver)
+local function my_effect_secs(name, resolver, kind)
     local bn = buffNameOf[name]
     if bn == nil then
         bn = ''
@@ -970,9 +999,21 @@ local function my_effect_secs(name, resolver)
         buffNameOf[name] = bn
     end
     if bn == '' then return 0 end
+    -- ONLY PROBE THE TABLE THE EFFECT CAN ACTUALLY BE IN. This used to read the buff table and then, if
+    -- that came back empty, the SONG table - and "empty" is the normal case, because most burns are not
+    -- running. So every inactive burn cost a song-table lookup every 2 seconds.
+    -- An item's or an AA's granted effect lands in the buff window, not the song window; only spells and
+    -- discs can sit in the song table. The song read for kind 'i' and 'a' was always waste.
+    -- It is also the dangerous kind of waste. The 2026-08-01 18:50:55 crash was Stylin - the bard, the
+    -- toon with the most burn entries (20) and the only one whose song table is rewritten continuously.
+    -- Five of six toons logged past that crash; Stylin logged nothing after it.
+    -- This does not change what the dashboard shows for items and AAs, because their effects were never
+    -- in the song table to find.
     local rem = 0
     pcall(function() rem = tonumber(mq.TLO.Me.Buff(bn).Duration.TotalSeconds()) or 0 end)
-    if rem <= 0 then pcall(function() rem = tonumber(mq.TLO.Me.Song(bn).Duration.TotalSeconds()) or 0 end)  end
+    if rem <= 0 and (kind == nil or kind == 'd' or kind == 's') then
+        pcall(function() rem = tonumber(mq.TLO.Me.Song(bn).Duration.TotalSeconds()) or 0 end)
+    end
     if rem <= 0 then buffLatch[name] = nil; return 0 end
     if not buffLatch[name] then buffLatch[name] = rem end   -- latch so dsecs doesn't churn the push key
     return buffLatch[name]
@@ -980,13 +1021,35 @@ end
 -- Off by default: see the note in the disc branch of ability_state. Flip to true to restore disc
 -- countdowns once the client crashes are understood.
 DISC_TIME_LEFT = false
+
+-- A SWITCH TO TEST THE CRASH, not a feature. /atburnpoll off stops the 2s burn poll on that toon.
+-- Why this one: the 2026-08-01 18:50:55 dump was Stylin, and Stylin is the bard - the toon whose SONG
+-- table is rewritten constantly. Five of the six logged past the crash; Stylin logged nothing after it.
+-- The burn poll is the only hot path here that both scales with a toon's burn count (Stylin parses 20
+-- items, the most in the group) and reads the song table by name, twice per entry, every 2 seconds.
+-- That is a hypothesis, NOT a finding. The point of a switch rather than a rewrite is that it gives a
+-- clean answer either way: run a session with it off on the bard and the crashes either stop or they do
+-- not. Guessing at a fix without that answer is how the last few builds went.
+-- Costs while off: the burn dashboard stops updating for that toon. Nothing else uses it.
 local DISC_TICK_SECS = 6   -- MQ spell durations are in ticks; if disc countdowns read 6x too long, set this to 1
 local function ability_state(name)
     local isItem = false
     pcall(function() isItem = (tonumber(mq.TLO.FindItem('=' .. name).ID()) or 0) > 0 end)
     if isItem then
         local t = 0; pcall(function() t = tonumber(mq.TLO.FindItem('=' .. name).TimerReady()) or 0 end)
-        local ds = my_effect_secs(name, function() return mq.TLO.FindItem('=' .. name).Spell.Name() end)
+        -- ONLY LOOK FOR THE EFFECT WHILE THE THING THAT GRANTS IT IS ON COOLDOWN. A burn's effect cannot
+        -- be running if the item has not been used, and an item that has not been used is READY. So a
+        -- ready item needs no buff-table lookup at all - and ready is the normal state, most of the time,
+        -- for most entries. That single condition removes the great majority of these reads, and it comes
+        -- free from the timer we just read.
+        -- Early fade is still caught: while it is cooling we keep checking every poll, so an effect that
+        -- ends sooner than expected still updates on the next 2s tick. That is the case that mattered.
+        local ds = 0
+        if t > 0 then
+            ds = my_effect_secs(name, function() return mq.TLO.FindItem('=' .. name).Spell.Name() end, 'i')
+        else
+            buffLatch[name] = nil       -- ready again: whatever it granted is done
+        end
         return true, (t == 0), t, (ds > 0), ds, 'i'
     end
     -- OWNERSHIP, not existence. Me.AltAbility[x].ID resolves out of the game's AA table and answers
@@ -1003,8 +1066,14 @@ local function ability_state(name)
     pcall(function() aaSecs = tonumber(mq.TLO.Me.AltAbilityTimer(name).TotalSeconds()) or -1 end)
     local isAA = (aaRank > 0) or aaRdy
     if isAA then
-        local ds = my_effect_secs(name, function() return mq.TLO.Me.AltAbility(name).Spell.Name() end)
-        if aaRdy then return true, true, 0, (ds > 0), ds, 'a' end
+        -- Same rule as items: a ready AA has not been fired, so nothing it grants can be running.
+        local ds = 0
+        if not aaRdy then
+            ds = my_effect_secs(name, function() return mq.TLO.Me.AltAbility(name).Spell.Name() end, 'a')
+        else
+            buffLatch[name] = nil
+        end
+        if aaRdy then return true, true, 0, false, 0, 'a' end
         return true, false, (aaSecs and aaSecs > 0 and aaSecs or -1), (ds > 0), ds, 'a'
     end
     local isSpell = false   -- otherwise a discipline
@@ -1030,8 +1099,17 @@ local function ability_state(name)
             -- So this is off until a run shows the crashes continue without it. Set DISC_TIME_LEFT true
             -- to turn it back on; everything else about the burn dashboard is unaffected, and discs
             -- still show their FULL duration while active - just not a countdown.
+            --
+            -- UPDATE 2026-08-01: that condition has now been met. FOUR ACCESS_VIOLATION dumps (03:54,
+            -- 14:50, 14:51, 15:51) all landed with this flag OFF, all at the identical fault address,
+            -- all a null-pointer WRITE inside eqgame.exe. The countdown was never the cause - it was
+            -- circumstantial, exactly as the note above admitted. This can be turned back on whenever
+            -- the countdown is wanted; it is no longer a suspect.
+            -- What the 15:51 crash DID narrow: the log covering it (kept, now that sessions rotate)
+            -- shows the toon idle - not zoning, not casting, not rezzing, not in combat. Which matches
+            -- the observation from play that these happen out of combat.
             if DISC_TIME_LEFT then
-                dsecs = my_effect_secs(name, function() return mq.TLO.Spell(name).Name() end)
+                dsecs = my_effect_secs(name, function() return mq.TLO.Spell(name).Name() end, 'd')
             end
             -- MyDuration is YOUR duration (level/focus applied) and is a ticktype, so .TotalSeconds
             -- gives seconds outright; base Duration in ticks is the last resort.
@@ -1057,6 +1135,27 @@ end
 -- scan is throttled while unresolved so a toon that has simply never drunk one is not paying for it.
 potBuffName = {}
 potScanAt   = {}
+
+-- ASK THE CLIENT HOW MANY SLOTS THERE ARE. Every buff/song walk in this file used a hardcoded ceiling -
+-- 45 in one place, 55 in four others - which is a guess about someone else's data structure. Reading
+-- past the real end of the buff table is a textbook out-of-bounds, and the crash we keep taking is a
+-- null-pointer WRITE inside eqgame.exe (four dumps on 2026-08-01, identical address, mq2lua on the live
+-- stack every time), which happened most recently while the toon was idle - polling, not fighting.
+-- This does not prove the walks are the cause. It removes a guess and costs nothing: reading the number
+-- the client reports can only ever be the same or fewer slots than the number we invented.
+-- Cached, and re-asked if it ever reads as nothing.
+pwBuffSlots = 0
+function buff_slot_max(fallback)
+    if pwBuffSlots > 0 then return pwBuffSlots end
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.Me.MaxBuffSlots()) or 0 end)
+    if n > 0 then
+        pwBuffSlots = n
+        rezlog('[buffs] the client reports %d buff slots (was walking to %d)', n, fallback)
+        return n
+    end
+    return fallback
+end
 function pot_buff_secs(base)
     local function dur(n)
         local r = 0
@@ -1077,7 +1176,7 @@ function pot_buff_secs(base)
     end
 
     local key = base:gsub('^Draught of ', '')      -- 2) scan for a buff named after the draught
-    for i = 1, 45 do
+    for i = 1, buff_slot_max(45) do
         local nm = ''
         pcall(function() nm = tostring(mq.TLO.Me.Buff(i).Name() or '') end)
         if nm ~= '' and nm ~= 'NULL' and nm:find(key, 1, true) then
@@ -1277,9 +1376,6 @@ local function write_e3_path(dir)
     fh:close()
 end
 
--- Declared HERE, not down with the other display state: parse_burns() runs at line ~1367 during startup,
--- long before that block executes, so a later declaration left this nil and the first burn line threw.
-burnRaw = {}      -- raw [Burn] lines from my E3 ini, kept for their cast specs
 
 local function parse_burns()
     -- The server TLO is NOT reliable for this: it returns 'Lazarus' on one machine and 'Project
@@ -1362,11 +1458,6 @@ local function parse_burns()
         if sec == 'burn' then
             local key, val = line:match('^%s*([^;=%[][^=]-)%s*=%s*(.+)')
             if key and val then
-                -- KEEP THE RAW LINE. The parser below strips everything after the first '/' because it
-                -- only wants the name - but the discarded half is E3's own cast spec, written by E3, for
-                -- entries that demonstrably fire. When we needed the syntax for a discipline there was
-                -- nowhere to look it up; it was sitting in this file the whole time. /atburnraw prints it.
-                burnRaw[#burnRaw + 1] = key .. ' = ' .. val:gsub('[\r\n]', '')
                 local r  = rank_for(key)
                 local nm = val:match('^([^/\r\n]+)')
                 if nm then nm = nm:gsub('%s+$', '') end
@@ -2056,22 +2147,6 @@ function di_read_self()
     if not DI.saidStaffReads then
         DI.saidStaffReads = true
         rezlog('[di] staff reads at load: %s', di_staff_reads())
-        DI.readSamples = { 5000, 15000, 30000, 60000 }   -- and again on a schedule, see below
-        DI.loadedAt = mq.gettime()
-    end
-    -- DOES IT HEAL, AND WHEN? Nityrc read 0/0/true at load with 1543s genuinely remaining, then read it
-    -- correctly 42s later - 1.3s after he attempted a cast. Two very different explanations: either the
-    -- client populates item timers a while after load on its own, or it only does so once the item is
-    -- touched. That decides everything. If it heals on a timer, the staff simply must not be trusted for
-    -- the first N seconds and the cooldown stays the source of truth untouched. If it only heals on use,
-    -- we need to touch it at startup - still the cooldown, just asked properly.
-    -- Sampling on a schedule answers it without guessing, and costs four log lines per session.
-    if DI.readSamples and #DI.readSamples > 0 and DI.loadedAt then
-        local age = mq.gettime() - DI.loadedAt
-        if age >= DI.readSamples[1] then
-            local at = table.remove(DI.readSamples, 1)
-            rezlog('[di] staff reads at +%ds: %s', math.floor(at / 1000), di_staff_reads())
-        end
     end
     -- I FIRED IT, SO IT IS SPENT UNTIL PROVEN OTHERWISE. TimerReady can keep reading 0 for tens of seconds
     -- after the staff has actually gone on reuse - see ASSUME_SPENT. Trusting that stale zero is what let
@@ -2897,14 +2972,6 @@ function rez_chain()
     for _, sl in ipairs(rezOrder) do chain[#chain + 1] = sl end
     return chain
 end
-local function rez_present(name)   -- still on DanNet? a crashed/LD toon drops off (this is the anti-ghost check)
-    local ok = false
-    pcall(function() ok = tostring(mq.TLO.DanNet.Peers() or ''):lower():find(name:lower(), 1, true) ~= nil end)
-    return ok
-end
-local function rez_dead(name)
-    local d = false; pcall(function() d = tlo_true(mq.TLO.Group.Member(name).Dead()) end); return d
-end
 -- Heartbeat cadence state. On a global table rather than four locals: this chunk is at Lua's ceiling.
 HB = { rezFast = false, diFast = false, lastCheck = 0, corpse = false }
 -- Set by the driver while it is running a count pass. Workers hold their OWN chatter for the duration,
@@ -2922,6 +2989,32 @@ function peer_quiet() return mq.gettime() < quietUntil end
 -- frame to decide the cadence, and SpawnCount is not free. Counts ANY pc corpse in zone rather than
 -- walking the group by name - one TLO call instead of eighteen, and over-triggering on a stranger's
 -- corpse only costs us the fast cadence we would otherwise have had anyway.
+-- WHICH SPAWN FILTERS ACTUALLY WORK ON THIS BUILD? Run /at_corpseprobe with a GROUP corpse on the
+-- ground and read the numbers off. This exists because the guard above skips the whole sweep when the
+-- zone has no pc corpses - and rez_event_now() counts EVERY pc corpse, strangers included. In a busy
+-- zone somebody else's corpse keeps the fast path armed and the saving evaporates.
+-- If a narrower filter works, both the cadence and the skip get sharper. Whether MQ accepts 'group' or
+-- 'raid' alongside a corpse type is not something to assume: a corpse is not itself a group member, so
+-- the filter may legitimately return 0 always. Guessing at syntax is what cost this project a night;
+-- printing the variants side by side settles it in one command.
+function corpse_probe()
+    local q = { 'pccorpse', 'pccorpse group', 'group pccorpse', 'pccorpse raid', 'raid pccorpse',
+                'corpse group', 'pccorpse radius 200' }
+    log('[corpse] spawn-search variants (want: a narrow one that matches the group count):')
+    for _, v in ipairs(q) do
+        local n = 'ERR'
+        pcall(function() n = tostring(mq.TLO.SpawnCount(v)() or 'NULL') end)
+        log('   SpawnCount[%-22s] = %s', v, n)
+    end
+    local mine = 0
+    for _, nm in ipairs(group_members()) do
+        local c = 0
+        pcall(function() c = tonumber(mq.TLO.SpawnCount('pccorpse ' .. nm)()) or 0 end)
+        mine = mine + c
+    end
+    log('   per-name sum over the group = %d   <- the number a narrow filter should agree with', mine)
+end
+
 function rez_event_now()
     if (mq.gettime() - HB.lastCheck) > 1000 then
         HB.lastCheck = mq.gettime()
@@ -3074,9 +3167,6 @@ function owner_is_up(nm)
     return true
 end
 
-function peer_dist_to_spawn(peerName, spawnID)
-    return peer_dist_to_corpse(peerName, spawnID)   -- same maths; the corpse was never special
-end
 
 function peer_dist_to_corpse(peerName, corpseID)
     local cx, cy, cz, px, py, pz
@@ -3176,7 +3266,15 @@ end
 -- confirms this is a resurrection offer rather than some other yes/no the game decided to ask.
 --   "Nityrc wants to cast spiritual awakening (100 percent) upon you? Do you wish this?"
 local REZ_WINDOW = 'ConfirmationDialogBox'
-local REZ_TEXT   = { 'wants to cast', 'upon you' }
+-- ANY of these marks the box as a resurrection, rather than ALL of one phrasing. The old test demanded
+-- both 'wants to cast' AND 'upon you', which is exactly how the clicky box reads - "Nityrc wants to cast
+-- Divine Resurrection (100 percent) upon you" - so clickies were accepted the instant they appeared.
+-- Call of the Wild is a different spell and phrases it differently, so it failed the test, nobody clicked,
+-- and the CotW rez sat waiting for a person. It looked like CotW was just slower to zone in; it was not
+-- being auto-accepted at all.
+-- Matching on the RESURRECTION WORDS is the durable version: a box offering to restore experience is a
+-- rez whatever the caster's spell is called.
+local REZ_TEXT   = { 'wants to cast', 'upon you', 'resurrect', 'restore', 'experience', 'call of the wild' }
 local REZ_BUTTONS = { 'CD_Yes_Button', 'Yes_Button', 'CD_OK_Button' }
 local function rez_autoaccept()
     local now = mq.gettime()
@@ -3184,9 +3282,15 @@ local function rez_autoaccept()
     if win_open(REZ_WINDOW) then
         pcall(function() txt = tostring(mq.TLO.Window(REZ_WINDOW).Child('CD_TextOutput').Text() or '') end)
         local low = txt:lower()
-        isRez = true
+        -- ANY match, not all. See REZ_TEXT.
         for _, needle in ipairs(REZ_TEXT) do
-            if not low:find(needle, 1, true) then isRez = false; break end
+            if low:find(needle, 1, true) then isRez = true; break end
+        end
+        -- Nothing matched, but a confirmation box IS open while we are dead with a rez inbound. Say what
+        -- it says rather than ignoring it - if a third rez source words things a third way, this line is
+        -- how we find out instead of wondering why one caster is slow.
+        if not isRez and rezBoxAt == 0 and mq.gettime() < rezExpectUntil then
+            rezlog('\\ay[rez] a dialog is open that I do not recognise as a rez: %s\\ax', txt:sub(1, 90))
         end
     end
 
@@ -3227,6 +3331,27 @@ local function rez_autoaccept()
         pcall(function() peer_bcast('/at_rezdone %s', myName) end)
     end
     if rezBoxClicked or not rezAccept then return end
+
+    -- ONE MORE GATE BEFORE CLICKING YES. Up to here the only thing standing between this and pressing
+    -- the Yes button on an arbitrary ConfirmationDialogBox is the REZ_TEXT word list - and that list was
+    -- widened on a guess to catch Call of the Wild, which words its box completely differently from the
+    -- clickies ("is attempting to return you to your corpse", sharing not one phrase with "wants to cast
+    -- ... upon you"). Widening it was right, and it fixed a real bug, but 'restore' and 'experience' are
+    -- generic enough to appear in some other dialog nobody has thought of.
+    -- So check the one thing that is true of every resurrection and nothing else: you cannot be rezzed
+    -- unless you are dead, or alive at bind with your corpse still on the ground. Neither costs anything
+    -- here because this only runs with a dialog already open, which is rare.
+    -- This cannot reject a real rez: both states are covered, and a corpse that has expired cannot be
+    -- rezzed anyway.
+    local canBeRezzed = false
+    pcall(function() canBeRezzed = tlo_true(mq.TLO.Me.Dead()) end)
+    if not canBeRezzed then canBeRezzed = (rez_corpse(myName) > 0) end
+    if not canBeRezzed then
+        rezlog('\\ay[rez] a dialog looks like a rez but I am alive with no corpse - not clicking it: %s\\ax',
+               txt:sub(1, 80))
+        rezBoxClicked = true    -- do not re-evaluate it every tick
+        return
+    end
 
     -- Try each button name; the first that makes the window go away was the right one.
     for _, b in ipairs(REZ_BUTTONS) do
@@ -3298,7 +3423,13 @@ local function rez_tick()
             end
             return
         end
-        if (now - rezCast.at) < 1500 then return end               -- 1s cast + settle; recast fast if it was interrupted
+        -- PER KIND, because these are not the same cast. The crowns and tokens are 1s clickies, so 1.5s is
+        -- a fair "it should have happened by now". Call of the Wild is a SPELL with a real cast time, and
+        -- at 1.5s it was re-firing while the first cast was still resolving: on 2026-07-31 Sunetoo cast at
+        -- 01:01:09.8, logged 'still casting' at .234, retried at 01:01:11.5, and Stylin did not stand up
+        -- until 01:01:20.5 - about 5s slower than a clicky rez, and the wait was our own second cast.
+        local gap = (rezCast.kind == 'cotw') and 6000 or 1500
+        if (now - rezCast.at) < gap then return end
         -- One attempt when we were already beyond reach, three when we were not. A cast that failed on
         -- range will fail again from the same spot, so grinding out three of them just holds the baton.
         local maxTries = rezCast.far and 1 or 3
@@ -3328,6 +3459,15 @@ local function rez_tick()
     -- messages: a corpse 18 units away that another rezzer had already claimed reported as 'no
     -- reachable corpse', which reads as a range problem and sent me looking in the wrong place.
     local tgtName, tgtID, skipped, tgtFar, tgtDist = nil, nil, {}, false, -1
+    -- NOTHING TO SWEEP IF THE ZONE HAS NO CORPSES. rez_event_now() is one cached SpawnCount over ALL pc
+    -- corpses, refreshed at most once a second; the loop below calls rez_corpse() per priority slot, and
+    -- each of THOSE is its own SpawnCount plus a NearestSpawn walk. Twelve slots, every tick, to discover
+    -- what a single cached read already knew.
+    -- The implication only runs one way and that is the safe way: if there is not one pc corpse in the
+    -- zone then no individual member can have one, so skipping is exact rather than approximate. It also
+    -- returns true whenever I am dead, so nothing about my own corpse is affected.
+    -- Same reasoning the raid sweep already uses one screen down; it just never got applied to the group.
+    if not rez_event_now() then return end
     local myZone0 = 0; pcall(function() myZone0 = tonumber(mq.TLO.Zone.ID()) or 0 end)
     for _, nm in ipairs(rezPriority) do
         local id, dist = rez_corpse(nm)
@@ -3785,6 +3925,19 @@ pcall(function()
         end
     end)
     mq.bind('/at_arcane', function() arc_click() end)
+    mq.bind('/at_corpseprobe', function() corpse_probe() end)
+    mq.bind('/at_burnpoll', function(mode)
+        burnPollOn = (mode ~= 'off')
+        log('burn poll is %s here', burnPollOn and 'ON' or 'OFF (crash test - dashboard will not update)')
+    end)
+    mq.bind('/atburnpoll', function(mode)
+        local on = (mode ~= 'off')
+        for _, nm in ipairs(group_members()) do
+            if nm:lower() ~= myName:lower() then pcall(function() peer_cmdf(nm, '/at_burnpoll %s', on and 'on' or 'off') end) end
+        end
+        burnPollOn = on
+        log('burn poll %s for the whole group', on and 'enabled' or 'DISABLED')
+    end)
     -- The queue is mirrored on every toon so the driver can draw it and the holder can work it.
     mq.bind('/at_pwadd', function(id, nm)
         id = tonumber(id); if not id or pw_find(id) then return end
@@ -3801,13 +3954,10 @@ pcall(function()
     mq.bind('/at_pwoor', function(id, v)
         local _, e = pw_find(tonumber(id) or 0); if e then e.oor = (v == '1') end
     end)
-    mq.bind('/at_pwhave', function(who) if who and who ~= '' then pwState[who] = true end end)
-    -- Print my own [Burn] lines exactly as E3 wrote them. This is how to find the correct cast spec for
-    -- any kind of thing - disc, AA, item, song - instead of guessing at tokens.
-    mq.bind('/atburnraw', function()
-        if #burnRaw == 0 then log('[burns] no raw lines captured (ini not found or no [Burn] section)'); return end
-        log('[burns] %d raw [Burn] line(s) from my ini:', #burnRaw)
-        for _, l in ipairs(burnRaw) do log('   %s', l) end
+    -- Carries the disc NAME, not just a flag: the driver's button is labelled with whatever the holder
+    -- will really cast, and only the holder knows which one that is.
+    mq.bind('/at_pwhave', function(who, disc)
+        if who and who ~= '' then pwState[who] = (disc and disc ~= '') and disc:gsub('_', ' ') or true end
     end)
     mq.bind('/at_arcstate', function(char, have, secs, up)
         if char then
@@ -3895,7 +4045,7 @@ pcall(function()
             -- 'Divine Redemption Rk. II' defeats every exact-name lookup in this file, and that is the
             -- obvious suspect the moment buff= and song= both read 0 while the game says it is blocked.
             local hit = ''
-            for i = 1, 55 do
+            for i = 1, buff_slot_max(55) do
                 local bn, sn = '', ''
                 pcall(function() bn = tostring(mq.TLO.Me.Buff(i).Name() or '') end)
                 pcall(function() sn = tostring(mq.TLO.Me.Song(i).Name() or '') end)
@@ -3911,7 +4061,7 @@ pcall(function()
         -- differs from the generic Spell[name] lookup and we need its real id, not a better guess.
         log('[diprobe] my buffs right now:')
         local shown = 0
-        for i = 1, 55 do
+        for i = 1, buff_slot_max(55) do
             local bid, bnm = 0, ''
             pcall(function() bid = tonumber(mq.TLO.Me.Buff(i).ID()) or 0 end)
             pcall(function() bnm = tostring(mq.TLO.Me.Buff(i).Name() or '') end)
@@ -3925,7 +4075,7 @@ pcall(function()
         -- invisible to the very probe meant to explain why it was invisible.
         log('[diprobe] my songs / short-duration effects right now:')
         local sshown = 0
-        for i = 1, 55 do
+        for i = 1, buff_slot_max(55) do
             local sid, snm = 0, ''
             pcall(function() sid = tonumber(mq.TLO.Me.Song(i).ID()) or 0 end)
             pcall(function() snm = tostring(mq.TLO.Me.Song(i).Name() or '') end)
@@ -4094,7 +4244,7 @@ pcall(function()
         local parts = {}
         for _, nm in ipairs(DI.SAVES) do
             local hit = ''
-            for i = 1, 55 do
+            for i = 1, buff_slot_max(55) do
                 local bn, sn = '', ''
                 pcall(function() bn = tostring(mq.TLO.Me.Buff(i).Name() or '') end)
                 pcall(function() sn = tostring(mq.TLO.Me.Song(i).Name() or '') end)
@@ -4272,7 +4422,7 @@ pcall(function()
     end)
     mq.bind('/at_pong', function(peer) if peer then alive[peer:lower()] = true end end)
     mq.bind('/at_resync', function()   -- driver says the group changed: re-report EVERYTHING
-        burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}
+        burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}; tribLast = nil
         potLast = {}; healLast = {}; cureLast = {}; magicLast = {}
         lastBurnPoll, lastClickPoll = 0, 0   -- poll on the next tick rather than waiting out the 2s
         burnStartAt, clickStartAt = 0, 0   -- skip both startup settles: the driver is waiting on us now
@@ -4303,16 +4453,6 @@ pcall(function()
     end)
 end)
 
-local function is_up(peer, waitMs)
-    alive[peer:lower()] = nil
-    peer_cmdf(peer, '/at_ping %s', myName)
-    local w = 0
-    while w < (waitMs or 900) do
-        mq.doevents(); mq.delay(100); w = w + 100
-        if alive[peer:lower()] then return true end
-    end
-    return alive[peer:lower()] == true
-end
 
 -- Bring the whole group up in PARALLEL: ping everyone at once, launch all the non-responders at once,
 -- then wait a single settle - instead of a launch+wait per toon. Returns the list that's responsive.
@@ -4335,10 +4475,6 @@ local function bring_up_group(peers)
     local up = {}
     for _, p in ipairs(peers) do if alive[p:lower()] then up[#up + 1] = p end end
     return up
-end
-local function count_for(who, item)
-    if who:lower() == myName:lower() then return my_count(item) end
-    return peer_count(who, item)
 end
 
 -- ---------------------------------------------------------------------------
@@ -4704,15 +4840,6 @@ local statusResize = false        -- widen the window once when status is turned
 local statusCounts = {}           -- peerlower -> { item -> count } (cached)
 local statusNames = {}            -- ordered display names for the status columns
 
-local function do_give(giver, receiver, item, qty)
-    if giver:lower() == myName:lower() then
-        give_item_to(receiver, item, qty)
-    else
-        peer_cmdf(giver, '/at_give %s %d %s', enc(item), qty, receiver)
-        -- give the remote hand-off time to finish before the next one (nav + trade)
-        mq.delay(9000)
-    end
-end
 
 local function give_out()
     if distributing then return end
@@ -5236,19 +5363,6 @@ function burn_colour(st)
     if r < 60 then return 0.95, 0.85, 0.30 end
     if r < 300 then return 0.95, 0.62, 0.25 end
     return 0.85, 0.35, 0.35
-end
--- Items a character is reporting, burns only, in display order.
-function burn_items_of(c)
-    local its = {}
-    for it, st in pairs(burnState[c] or {}) do if (st.tier or 0) > 0 then its[#its + 1] = it end end
-    table.sort(its, function(a, b)
-        local ra, sa = burn_rank(burnState[c][a])
-        local rb, sb = burn_rank(burnState[c][b])
-        if ra ~= rb then return ra < rb end
-        if sa ~= sb then return sa < sb end
-        return a < b
-    end)
-    return its
 end
 
 -- Compact burn view: one row per character, one dot per burn item, colour carries the whole state.
@@ -6218,15 +6332,56 @@ function arc_click()
     arcPending = { at = mq.gettime(), tries = 1 }   -- the main loop watches it from here
 end
 
--- ===== PHANTOM WHISPERS =====
+-- ===== PHANTOM LINE (placate) =====
 -- A queue rather than a button: the driver clicks a mob to enqueue it, and whoever holds the disc works
 -- down the list in order, one at a time, waiting out the 10s recast between casts.
 -- WHO CASTS IT is decided by who OWNS it, not by class or name - only the monk has this disc, so "has it"
 -- and "is the monk" are the same test, and the ownership version keeps working if a second one shows up.
 -- OUT OF RANGE STALLS, it does not skip. The queue is an explicit instruction from a person, and quietly
 -- reordering it would mean the mob you clicked first is not the one that gets hit first.
-PHANTOM      = 'Phantom Whispers'
-PW_RECAST    = 10000     -- disc recast; do not even look at the queue inside this
+-- THE WHOLE PHANTOM LINE, best first. This started as a hardcoded 'Phantom Whispers', which is the level
+-- 71 DoN version - so a monk without it got nothing at all, when the same placate exists seven ways down
+-- to level 35. Levels and recasts are read off the client's own discipline list (2026-07-31).
+-- RECAST IS PER DISC and is NOT uniform: Whispers recycles in 10s, every older one in 20s. The hardcoded
+-- 10000 would have been wrong for six of the seven, letting the queue try again while the disc was still
+-- recycling. CombatAbilityReady would have caught it, but only after a wasted attempt.
+PHANTOM_LINE = {
+    { name = 'Phantom Whispers', level = 71, recast = 10000 },
+    { name = 'Phantom Cry',      level = 69, recast = 20000 },
+    { name = 'Phantom Shadow',   level = 65, recast = 20000 },
+    { name = 'Phantom Call',     level = 64, recast = 20000 },
+    { name = 'Phantom Echo',     level = 57, recast = 20000 },
+    { name = 'Phantom Wind',     level = 50, recast = 20000 },
+    { name = 'Phantom Zephyr',   level = 35, recast = 20000 },
+}
+pwDisc     = nil    -- the best one THIS character owns, resolved from the list above
+pwDiscLook = 0      -- last time we went looking, so a miss is retried rather than cached forever
+
+-- The highest phantom this character actually has. Cached once found; a MISS is only rate-limited, never
+-- cached - discs read as absent for a moment after a reload, and caching that would disable the feature
+-- for the session on the one toon that can use it.
+function pw_disc()
+    if pwDisc then return pwDisc end
+    local now = mq.gettime()
+    if (now - pwDiscLook) < 5000 then return nil end
+    pwDiscLook = now
+    for _, d in ipairs(PHANTOM_LINE) do
+        local idx = 0
+        pcall(function() idx = tonumber(mq.TLO.Me.CombatAbility(d.name)()) or 0 end)
+        if idx > 0 then
+            pwDisc = d
+            rezlog('[pw] using %s (level %d, %ds recast) - the best phantom I have', d.name, d.level, d.recast / 1000)
+            return pwDisc
+        end
+    end
+    return nil
+end
+
+-- Name for display when nothing is resolved yet: the line as a whole, not one member of it.
+function pw_label()
+    local d = pwDisc
+    return d and d.name or 'Phantom'
+end
 -- RANGE IS ASKED FOR, NOT GUESSED. This started as a flat 50 that turned out to be far too short, which
 -- is the same mistake as every hardcoded number in this file - the client knows the answer, so ask it.
 -- Mirrors rez_range(), which resolves the clicky's reach from Spell.MyRange and caches it. MyRange rather
@@ -6236,12 +6391,13 @@ PW_RANGE_FALLBACK = 200  -- only if the TLO gives nothing: the standard cast ran
 pwRangeCache = nil
 function pw_range()
     if pwRangeCache then return pwRangeCache end
+    local d = pw_disc(); if not d then return PW_RANGE_FALLBACK end
     local r = 0
-    pcall(function() r = tonumber(mq.TLO.Spell(PHANTOM).MyRange()) or 0 end)
-    if r <= 0 then pcall(function() r = tonumber(mq.TLO.Spell(PHANTOM).Range()) or 0 end) end
+    pcall(function() r = tonumber(mq.TLO.Spell(d.name).MyRange()) or 0 end)
+    if r <= 0 then pcall(function() r = tonumber(mq.TLO.Spell(d.name).Range()) or 0 end) end
     if r > 0 then
         pwRangeCache = r
-        rezlog('[pw] cast range resolved to %d from the disc', r)
+        rezlog('[pw] cast range resolved to %d from %s', r, d.name)
         return r
     end
     return PW_RANGE_FALLBACK   -- not readable yet; assume the usual and ask again next time
@@ -6263,11 +6419,7 @@ pwCast  = nil            -- the attempt in flight: { id, at, tries, prevTarget }
 pwLast  = 0              -- when I last got one to land, for the recast gate
 pwState = {}             -- char -> true if that toon owns the disc (so the UI can name the holder)
 
-function pw_have()
-    local idx = 0
-    pcall(function() idx = tonumber(mq.TLO.Me.CombatAbility(PHANTOM)()) or 0 end)
-    return idx > 0
-end
+function pw_have() return pw_disc() ~= nil end
 
 function pw_find(id)
     for i, e in ipairs(pwQueue) do if e.id == id then return i, e end end
@@ -6277,7 +6429,15 @@ end
 -- Is the debuff actually on the mob? Only readable while it is targeted, which it is during a cast.
 function pw_on_mob()
     local up = false
-    pcall(function() up = (tonumber(mq.TLO.Target.Buff(PHANTOM).ID()) or 0) > 0 end)
+    local d = pwDisc; if not d then return false end
+    -- CHECK THERE IS A TARGET FIRST. Target.Buff[name].ID() is a two-level walk into the target's buff
+    -- table, and with no target the first step is null. The pcall around it is no help - it catches Lua
+    -- errors, and a null dereference inside the client is not one; it takes the process down before Lua
+    -- hears about it. The only protection is not making the read.
+    local tid = 0
+    pcall(function() tid = tonumber(mq.TLO.Target.ID()) or 0 end)
+    if tid <= 0 then return false end
+    pcall(function() up = (tonumber(mq.TLO.Target.Buff(d.name).ID()) or 0) > 0 end)
     return up
 end
 
@@ -6299,7 +6459,8 @@ end
 -- Runs on EVERY toon; returns immediately on anyone without the disc. Main loop only - it targets and
 -- yields, neither of which belongs anywhere near an ImGui callback.
 function pw_tick()
-    if not pw_have() then return end
+    local disc = pw_disc()
+    if not disc then return end
 
     if pwCast then
         local age = mq.gettime() - pwCast.at
@@ -6319,7 +6480,7 @@ function pw_tick()
             pwCast.tries = pwCast.tries + 1
             pwCast.at = mq.gettime()
             rezlog('[pw] no sign of it on %s - retry %d of %d', pwCast.name or '?', pwCast.tries, PW_RETRY_MAX)
-            pcall(function() mq.cmdf('/disc %s', PHANTOM) end)
+            pcall(function() mq.cmdf('/disc %s', disc.name) end)
             return
         end
         rezlog('\\ay[pw] gave up on %s after %d tries\\ax', pwCast.name or '?', pwCast.tries)
@@ -6332,9 +6493,9 @@ function pw_tick()
     end
 
     if #pwQueue == 0 then return end
-    if (mq.gettime() - pwLast) < PW_RECAST then return end
+    if (mq.gettime() - pwLast) < disc.recast then return end
     local rdy = false
-    pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(PHANTOM)()) end)
+    pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(disc.name)()) end)
     if not rdy then return end
 
     local e
@@ -6362,8 +6523,8 @@ function pw_tick()
     pcall(function() prev = tonumber(mq.TLO.Target.ID()) or 0 end)
     pcall(function() mq.cmdf('/target id %d', e.id) end)
     mq.delay(250)
-    rezlog('[pw] %s on %s @%dm', PHANTOM, e.name, dist)
-    pcall(function() mq.cmdf('/disc %s', PHANTOM) end)
+    rezlog('[pw] %s on %s @%dm', disc.name, e.name, dist)
+    pcall(function() mq.cmdf('/disc %s', disc.name) end)
     pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev }
 end
 
@@ -6372,7 +6533,14 @@ function draw_phantom()
     for _, nm in ipairs(group_members()) do
         if pwState[nm] then holder = nm; break end
     end
-    if ImGui.Button('Phantom Whispers', 150, 0) then
+
+    -- Named for the disc that will ACTUALLY be cast, which differs by monk. A button reading "Phantom
+    -- Whispers" on a toon that owns Phantom Echo would be quietly lying about what it does.
+    -- pwState[holder] carries the disc NAME from a current build, but a peer on an older one reports a
+    -- bare true - and concatenating a boolean into the label throws. Take it only when it is a string.
+    local lbl = pw_label()
+    if holder and type(pwState[holder]) == 'string' then lbl = pwState[holder] end
+    if ImGui.Button(lbl .. '##pwadd', 160, 0) then
         local id, nm, ty, hp = 0, '', '', 0
         pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
         pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
@@ -6404,7 +6572,7 @@ function draw_phantom()
         local label, tip
         if e.state == 'done' then
             ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (on)')
-            tip = e.name .. '\n' .. PHANTOM .. ' is on it'
+            tip = e.name .. '\n' .. pw_label() .. ' is on it'
         elseif e.state == 'failed' then
             ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
             tip = e.name .. '\ngave up on this one - dead, gone, or it would not land'
@@ -6531,7 +6699,7 @@ MINI_SECTIONS = {
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
     { key = 'arcane', label = 'Arcane Reprisal',        draw = draw_arcane_buttons,
       get = function() return miniArcane end, set = function(v) miniArcane = v end },
-    { key = 'phantom', label = 'Phantom Whispers',      draw = draw_phantom,
+    { key = 'phantom', label = 'Phantom (placate)',     draw = draw_phantom,
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
@@ -7231,7 +7399,39 @@ elseif driverName then
     pcall(function() peer_cmdf(driverName, '/at_rezorder? %s', myName) end)   -- late joiner (e.g. crash relaunch): ask for the live order
 end
 
+-- SKIP EVERYTHING WHILE THE CLIENT IS NOT IN A FIT STATE TO BE ASKED. During a zone the client tears
+-- down and rebuilds its spawn, buff and inventory structures, and a TLO read landing in that window
+-- dereferences pointers that are briefly null. Three minidumps on 2026-08-01 were all the same fault -
+-- a null-pointer WRITE inside eqgame.exe, with mq2lua on the live stack in every one - and this group
+-- zones constantly because of the CoTH gather.
+-- This is a GUESS, and it is the safe kind: skipping a poll costs nothing, because every subsystem here
+-- is a poll loop that will simply look again next tick. Nothing is timed off the number of iterations.
+-- IMPORTANT, and the reason the existing pcalls have never helped: pcall catches LUA errors. An access
+-- violation inside the client is not a Lua error - it takes the whole process down before Lua sees
+-- anything. Guarding has to happen BEFORE the read, never around it.
+-- GLOBAL, not local: this chunk is at Lua's 200-local ceiling and two more tipped it over.
+function client_ready()
+    local zoning, state = false, ''
+    pcall(function() zoning = tlo_true(mq.TLO.Me.Zoning()) end)
+    pcall(function() state  = tostring(mq.TLO.MacroQuest.GameState() or '') end)
+    if zoning then return false end
+    if state ~= '' and state ~= 'INGAME' then return false end
+    return true
+end
+notReadySince = 0
+
 while running do
+    if not client_ready() then
+        -- Say so once per stretch rather than every 250ms, and only if it lasts long enough to matter.
+        if notReadySince == 0 then notReadySince = mq.gettime()
+        elseif (mq.gettime() - notReadySince) > 15000 then
+            notReadySince = mq.gettime()
+            log('[sync] holding - the client is zoning or not in game')
+        end
+        mq.delay(250)
+        goto continue_tick
+    end
+    notReadySince = 0
     if closeAllRequested then
         log('Close all - shutting down the group.')
         for _, m in ipairs(group_members()) do
@@ -7297,9 +7497,9 @@ while running do
         pcall(pw_tick)
         if not pwSaidHave and pw_have() then
             pwSaidHave = true
-            pwState[myName] = true
-            pcall(function() peer_bcast('/at_pwhave %s', myName) end)
-            log('[pw] I have %s - I will work the queue', PHANTOM)
+            pwState[myName] = pw_label()
+            pcall(function() peer_bcast('/at_pwhave %s %s', myName, pw_label():gsub(' ', '_')) end)
+            log('[pw] I have %s - I will work the queue', pw_label())
         end
         do
             local ok, err = pcall(di_check_landed)
@@ -7416,11 +7616,21 @@ while running do
             if sent >= 1 then break end
         end
     end
-    if driverName and (mq.gettime() - lastTribPush) > 15000 then   -- report MY tribute to the driver, unprompted
+    -- CHANGE-GATED, like every other reporter here. This was the one push left that went out on a timer
+    -- regardless: every worker told the driver its tribute state every 15s whether or not it had moved,
+    -- which is five messages a minute per toon carrying a flag and a number that change maybe twice a
+    -- session. The read stays on the 15s tick - it is two cheap TLOs - only the SEND is gated.
+    -- tribLast is cleared by /at_resync along with the other last-sent tables, so a driver that restarts
+    -- still gets a full report rather than silence.
+    if driverName and (mq.gettime() - lastTribPush) > 15000 then
         lastTribPush = mq.gettime()
         local a = false; pcall(function() local v = mq.TLO.Me.TributeActive(); a = (v == true) or (tostring(v):upper() == 'TRUE') end)
         local f = 0; pcall(function() f = tonumber(mq.TLO.Me.CurrentFavor()) or 0 end)
-        peer_cmdf(driverName, '/at_trib %s %d %d', myName, a and 1 or 0, f)
+        local k = string.format('%d/%d', a and 1 or 0, f)
+        if tribLast ~= k then
+            tribLast = k
+            peer_cmdf(driverName, '/at_trib %s %d %d', myName, a and 1 or 0, f)
+        end
     end
     if (mq.gettime() - lastDiscPoll) > 1000 then   -- disc watcher: start/fade log, and catch discs cut short
         lastDiscPoll = mq.gettime()
@@ -7560,7 +7770,7 @@ while running do
         lastBurnResync = mq.gettime()   -- periodic re-sync: forget last-sent state so everything reports again
         if not SHOW_UI then burnLast = {} end
     end
-    if mq.gettime() > burnStartAt and (mq.gettime() - lastBurnPoll) > 2000 then   -- read MY watched item timers locally (cheap), push changes
+    if burnPollOn and mq.gettime() > burnStartAt and (mq.gettime() - lastBurnPoll) > 2000 then   -- read MY watched item timers locally (cheap), push changes
         lastBurnPoll = mq.gettime()
         -- Group draughts ride the same local poll. secs/dsecs are LATCHED values, not live countdowns,
         -- so the key only moves when the state genuinely flips - one push on drink, one on fall-off.
@@ -7613,6 +7823,19 @@ while running do
         -- 6000 not 20000: the cleric-DG hold only trusts a report < 8000ms old. A cleric that has
         -- not taken aggro is not COMBAT-flagged, so it would sit on the slow tick and read as
         -- stale - and the staff would fire early believing no DG source is left.
+        -- OUT OF COMBAT, READ THIS FOUR TIMES SLOWER. di_read_self is not cheap: three Me.Buff name
+        -- lookups for the save flags, plus the staff timers, the emerald count, the DG rank and the
+        -- boots - roughly fifteen TLO reads, and it ran on every 250ms tick regardless of state.
+        -- The push it feeds is gated to 4s in combat and 20s idle, so out of combat we were reading
+        -- eighty times more often than we could ever send. And di_tick itself early-returns when not
+        -- in combat, so nothing local consumed the extra freshness either.
+        -- In combat the rate is untouched: a save being consumed is exactly the discontinuity that
+        -- needs to reach the group immediately, and a change pushes the instant it is seen.
+        -- 1000ms idle is still eight times fresher than the 8s staleness window the cleric-DG hold
+        -- trusts, so the hold cannot start reading stale reports because of this.
+        DI.selfGap = ic and 250 or 1000
+        if (mq.gettime() - (DI.lastSelfRead or 0)) < DI.selfGap then goto di_read_done end
+        DI.lastSelfRead = mq.gettime()
         local a, b, c, d, e = di_read_self()   -- e = the save's NAME; dropping it left the wire arg nil
         -- MY STAFF CAME BACK - SAY SO, AND THE BATON COMES HOME. The ring should sit as far forward as it
         -- can, so the earliest toon with a ready staff is the natural holder. Announcing on the edge means
@@ -7681,6 +7904,8 @@ while running do
                        DI.dgLatched and ' [latched]' or '', c)
             end
         end
+        -- Label last in the block, so the skip above cannot jump into the scope of a local declared here.
+        ::di_read_done::
     end
     -- 250ms in combat, 1000ms otherwise. This poll is what notices the tank has gained a save, and the
     -- broadcast is change-detected - so a faster poll costs NO extra traffic, it just spots the change
@@ -7754,6 +7979,10 @@ while running do
     accept_incoming()
     mq.doevents()   -- pump raid-watch events
     mq.delay(250)
+    -- Label goes LAST in the block so the client_ready skip at the top does not jump into the scope of
+    -- any local declared in the body - Lua permits a goto to a label at the end of a block precisely
+    -- for this pattern.
+    ::continue_tick::
 end
 
 pcall(function() mq.unbind('/at') end)
@@ -7810,14 +8039,39 @@ pcall(function() mq.unbind('/at_rezdone') end)
 pcall(function() mq.unbind('/at_rezorder') end)
 pcall(function() mq.unbind('/at_rezorder?') end)
 pcall(function() mq.unbind('/at_bags') end)
+-- Everything else this script binds. These were left registered on /lua stop, so a stopped script
+-- still owned 21 command names pointing at closures from a dead run.
+pcall(function() mq.unbind('/at_cure') end)
+pcall(function() mq.unbind('/at_cureprobe') end)
+pcall(function() mq.unbind('/at_curestate') end)
+pcall(function() mq.unbind('/at_diprobe') end)
+pcall(function() mq.unbind('/at_healstate') end)
+pcall(function() mq.unbind('/at_magic') end)
+pcall(function() mq.unbind('/at_magicprobe') end)
+pcall(function() mq.unbind('/at_magicstate') end)
+pcall(function() mq.unbind('/at_mgbclick') end)
+pcall(function() mq.unbind('/at_pot') end)
+pcall(function() mq.unbind('/at_potprobe') end)
+pcall(function() mq.unbind('/at_potstate') end)
+pcall(function() mq.unbind('/at_quiet') end)
+pcall(function() mq.unbind('/at_resync') end)
+pcall(function() mq.unbind('/at_rezaccept') end)
+pcall(function() mq.unbind('/at_rezcotw') end)
+pcall(function() mq.unbind('/at_rezinc') end)
+pcall(function() mq.unbind('/at_rezprobe') end)
+pcall(function() mq.unbind('/at_rezwindows') end)
+pcall(function() mq.unbind('/atcoth') end)
+pcall(function() mq.unbind('/atsync') end)
 pcall(function() mq.unbind('/at_arcstate') end)
 pcall(function() mq.unbind('/at_arcane') end)
+pcall(function() mq.unbind('/at_corpseprobe') end)
+pcall(function() mq.unbind('/atburnpoll') end)
+pcall(function() mq.unbind('/at_burnpoll') end)
 pcall(function() mq.unbind('/at_pwhave') end)
 pcall(function() mq.unbind('/at_pwoor') end)
 pcall(function() mq.unbind('/at_pwmark') end)
 pcall(function() mq.unbind('/at_pwclear') end)
 pcall(function() mq.unbind('/at_pwdel') end)
 pcall(function() mq.unbind('/at_pwadd') end)
-pcall(function() mq.unbind('/atburnraw') end)
 pcall(function() mq.cmd('/e3p off') end)   -- always hand our toon back to E3 on the way out
 if SHOW_UI then mq.imgui.destroy(scriptName) end
