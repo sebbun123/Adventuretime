@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.0'
-local BUILD_TAG = 'at-1.0-2026-08-02'   -- bump on every change; prints on startup
+VERSION = '1.01'
+local BUILD_TAG = 'at-1.01-divineconst-2026-08-03'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -73,6 +73,9 @@ do
     local who = '?'
     pcall(function() who = mq.TLO.Me.Name() or '?' end)
     LOG_FILE_PATH = (dir or '') .. 'AdventureTime_' .. who .. '_log.txt'
+    -- Separate file, overwritten rather than appended: we only ever want the LAST value, and a file
+    -- that grows is a file that eventually costs something to write.
+    PHASE_FILE_PATH = (dir or '') .. 'AdventureTime_' .. who .. '_lastphase.txt'
     -- KEEP THE PREVIOUS RUNS. This used to open 'w' - fresh each run - which meant a crash destroyed its
     -- own evidence: the client goes down, the client comes back, the script restarts and wipes the log
     -- covering the crash. Three minidumps on 2026-08-01 (14:50:05, 14:51:35, 03:54:42) had no readable
@@ -109,6 +112,53 @@ do
         LOG_FILE_PATH = nil
     end
 end
+-- CRASH BREADCRUMB. Six crashes in, the logs have told us almost nothing about the moment of death -
+-- the last line before the last one was 33 seconds earlier, because most of what this script does is
+-- silent. A crash kills the process outright, so nothing can be written AFTER it; the only way to know
+-- what was running is to have written it BEFORE.
+-- So: every subsystem stamps its name here as it starts, and the main loop flushes the stamp to a tiny
+-- file once a second. After a crash that file holds whatever was running in the last second of life.
+-- Cost is one 40-byte overwrite per second, which is nothing next to what it answers.
+-- This is DIAGNOSIS, not a fix. It exists to turn "something in AdventureTime, out of combat" into a
+-- named subsystem, which is the first genuinely narrowing thing we would have had.
+-- A RING OF THE LAST FEW PHASES, not a single current value.
+-- The first version recorded one phase and flushed it at the END of the loop - immediately after setting
+-- it to 'idle'. So the file could only ever say 'idle', whichever subsystem had just run. Two crashes
+-- were spent finding that out, and the answer they gave was an artefact of the instrument.
+-- Recording a RING fixes it properly rather than just moving the flush: the phase that crashed may not
+-- be the one that happened to be current at flush time, so the last several are kept with timestamps.
+-- Whatever was running in the final second is then in the file regardless of when the flush landed.
+AT_PHASE_RING = {}
+AT_PHASE_N    = 0
+AT_PHASE_AT   = 0
+AT_PHASE_KEEP = 10
+function atphase(name)
+    -- Collapse repeats: idle every tick would otherwise push everything interesting out of the ring.
+    local last = AT_PHASE_RING[((AT_PHASE_N - 1) % AT_PHASE_KEEP) + 1]
+    if last and last.name == name then last.n = (last.n or 1) + 1; last.t = mq.gettime(); return end
+    AT_PHASE_N = AT_PHASE_N + 1
+    AT_PHASE_RING[((AT_PHASE_N - 1) % AT_PHASE_KEEP) + 1] =
+        { name = name, t = mq.gettime(), wall = os.date('%H:%M:%S'), n = 1 }
+end
+function atphase_flush()
+    if not PHASE_FILE_PATH then return end
+    if (mq.gettime() - AT_PHASE_AT) < 1000 then return end
+    AT_PHASE_AT = mq.gettime()
+    local fh = io.open(PHASE_FILE_PATH, 'w')
+    if not fh then return end
+    fh:write(string.format('=== %s  build %s ===\n', os.date('%Y-%m-%d %H:%M:%S'), BUILD_TAG))
+    fh:write('last phases, oldest first - the bottom line is the most recent:\n')
+    local total = math.min(AT_PHASE_N, AT_PHASE_KEEP)
+    for i = 1, total do
+        local idx = ((AT_PHASE_N - total + i - 1) % AT_PHASE_KEEP) + 1
+        local e = AT_PHASE_RING[idx]
+        if e then
+            fh:write(string.format('  %s  %-16s x%d\n', e.wall, e.name, e.n or 1))
+        end
+    end
+    fh:close()
+end
+
 -- Both clocks, sampled together, so elapsed milliseconds can be turned back into a wall time.
 LOG_T0_WALL = os.time()
 LOG_T0_MS   = mq.gettime()
@@ -1092,6 +1142,11 @@ rezAuto     = false   -- master auto-rez toggle (default OFF - flip on deliberat
 -- out - so it is strictly cheaper than any clicky and fires AHEAD of the whole order. Globals, not
 -- locals: the main chunk is at 180 of Lua's 200-local ceiling and this is not worth spending two on.
 COTW_AA     = 'Call of the Wild'
+-- Divine Resurrection: the cleric rez AA. Renewable, no reagent, and it returns more experience than
+-- either clicky - so it goes ahead of CotW and the whole clicky order.
+-- Globals, not locals: this chunk is at Lua's 200-local ceiling.
+DIVINE_SPELL = 'Divine Resurrection'
+rezDivine    = true   -- Divine Res fires before CotW and the clickies whenever a holder is up
 rezCotw     = true    -- CotW fires before the clicky order whenever a holder is up (ON when owned)
 rezLog      = {}      -- last 5 actions (driver-side display)
 local lastRezPoll = 0
@@ -1769,6 +1824,7 @@ local function save_settings()
             f:write('rezAuto=' .. (rezAuto and '1' or '0') .. '\n')
             f:write('rezAccept=' .. (rezAccept and '1' or '0') .. '\n')
             f:write('rezCotw=' .. (rezCotw and '1' or '0') .. '\n')
+            f:write('rezDivine=' .. (rezDivine and '1' or '0') .. '\n')
             f:write('diLadderOff=' .. (DI.ladderOff and '1' or '0') .. '\n')
             for _, k in ipairs({ 'tribute', 'pots', 'burns', 'rez' }) do
                 f:write('show_' .. k .. '=' .. (showSec[k] and '1' or '0') .. '\n')
@@ -1785,6 +1841,13 @@ local function save_settings()
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
+            f:write('uiLocked=' .. (uiLocked and '1' or '0') .. '\n')
+            do
+                local sk = {}
+                for nm, md in pairs(chainMode) do sk[#sk + 1] = nm .. ':' .. md end
+                table.sort(sk)
+                f:write('chainMode=' .. table.concat(sk, ',') .. '\n')
+            end
             f:write('miniBurnView=' .. tostring(miniBurnView) .. '\n')
             f:write('charOrder=' .. table.concat(charOrder, ',') .. '\n')
             f:write('miniBurnFilter=' .. tostring(miniBurnFilter) .. '\n')
@@ -1811,6 +1874,7 @@ local function load_settings()
             if k == 'rezAuto' then rezAuto = (v == '1' or v:lower() == 'true') end
             if k == 'rezAccept' then rezAccept = (v == '1' or v:lower() == 'true') end
             if k == 'rezCotw' then rezCotw = (v == '1' or v:lower() == 'true') end
+            if k == 'rezDivine' then rezDivine = (v == '1' or v:lower() == 'true') end
             if k == 'diLadderOff' then DI.ladderOff = (v == '1') end
             local sec = k:match('^show_(%w+)$')
             if sec and showSec[sec] ~= nil then showSec[sec] = (v == '1' or v:lower() == 'true') end
@@ -1825,6 +1889,14 @@ local function load_settings()
             if k == 'epGem' then epGem = math.max(1, math.min(12, tonumber(v) or 8)) end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
+            if k == 'uiLocked' then uiLocked = (v == '1' or v:lower() == 'true') end
+            if k == 'chainMode' then
+                chainMode = {}
+                for ent in tostring(v or ''):gmatch('[^,]+') do
+                    local nm, md = ent:match('^(.-):(.+)$')
+                    if nm and (md == 'off' or md == 'raid') then chainMode[nm:lower()] = md end
+                end
+            end
             -- Migration: old files carry miniBurnTable, new ones miniBurnView. Reading both means an
             -- upgrade keeps whichever view was in use rather than silently resetting it.
             if k == 'miniBurnTable' then miniBurnView = (v == '1' or v:lower() == 'true') and 2 or 1 end
@@ -2517,8 +2589,14 @@ end
 
 function di_order()
     local out = {}
-    for _, nm in ipairs(rezPriority) do if rez_rank(member_class(nm)) ~= 1 then out[#out + 1] = nm end end
-    for _, nm in ipairs(rezPriority) do if rez_rank(member_class(nm)) == 1 then out[#out + 1] = nm end end
+    -- Anyone sat out is simply absent from the order, so the baton skips straight past them rather than
+    -- being handed over and stalling on a toon that will never fire.
+    for _, nm in ipairs(rezPriority) do
+        if not chain_off(nm) and rez_rank(member_class(nm)) ~= 1 then out[#out + 1] = nm end
+    end
+    for _, nm in ipairs(rezPriority) do
+        if not chain_off(nm) and rez_rank(member_class(nm)) == 1 then out[#out + 1] = nm end
+    end
     return out
 end
 
@@ -3064,6 +3142,21 @@ end
 -- character does not own (ability_state documents the same trap), so "timer > 0" would mark all six
 -- toons holders. Rank also IS the class check - only shamans and druids can buy CotW - which is why
 -- nothing here touches Me.Class and why this needs no edit when the group composition changes.
+-- MY Divine Res: seconds until ready, 0 = ready, -1 = don't own it. Same contract as my_cotw_secs, and
+-- now the same MECHANISM: this is an AA, not a spell. The first version read Me.Book and Me.Gem, which
+-- is why a cleric who owns it reported -1 - the AA is not in the spellbook and never will be.
+-- Ownership comes from RANK for the same reason CotW's does: AltAbilityTimer returns 1 for an AA the
+-- character does not own, so "timer > 0" would mark everyone a holder. Rank also IS the class check, so
+-- nothing here touches Me.Class and it needs no edit if the group changes.
+function my_divine_secs()
+    local rank = 0; pcall(function() rank = tonumber(mq.TLO.Me.AltAbility(DIVINE_SPELL).Rank()) or 0 end)
+    if rank <= 0 then return -1 end
+    local rdy = false; pcall(function() rdy = tlo_true(mq.TLO.Me.AltAbilityReady(DIVINE_SPELL)()) end)
+    if rdy then return 0 end
+    local s = -1; pcall(function() s = tonumber(mq.TLO.Me.AltAbilityTimer(DIVINE_SPELL).TotalSeconds()) or -1 end)
+    return (s and s > 0) and s or 0
+end
+
 function my_cotw_secs()
     local rank = 0; pcall(function() rank = tonumber(mq.TLO.Me.AltAbility(COTW_AA).Rank()) or 0 end)
     if rank <= 0 then return -1 end
@@ -3087,20 +3180,49 @@ end
 -- SORTED BY NAME because every toon builds this list locally from its own reports and they all have to
 -- arrive at the same list. Anything derived from table iteration order would differ per client and
 -- desync the baton. Alphabetical is arbitrary; identical everywhere is the requirement.
+-- Order is Divine Res -> CotW -> the clicky order, cheapest and best first. Divine goes in front for the
+-- same reason CotW goes in front of the clickies: renewable, no consumable behind it, and it returns more
+-- experience than either. Pins are sorted by name because every toon builds this list locally and they
+-- must all arrive at the same one.
+function rez_divine_pins()
+    local pins = {}
+    for _, nm in ipairs(group_members()) do
+        local secs = (nm:lower() == myName:lower()) and my_divine_secs()
+                      or (rezReady[nm] and rezReady[nm].divine)
+        if secs ~= nil and secs >= 0 and not chain_off(nm) then pins[#pins + 1] = nm end
+    end
+    table.sort(pins, function(a, b) return a:lower() < b:lower() end)
+    return pins
+end
+
 function rez_chain()
     if #rezOrder == 0 then load_rez_order() end
-    if not rezCotw then return rezOrder end
+    local chain = {}
+    if rezDivine then
+        for _, nm in ipairs(rez_divine_pins()) do chain[#chain + 1] = { name = nm, clicky = 'divine' } end
+    end
+    if not rezCotw then
+        for _, sl in ipairs(rezOrder) do
+            if not chain_off(sl.name) then chain[#chain + 1] = sl end
+        end
+        if #chain == 0 then return rezOrder end
+        return chain
+    end
     local pins = {}
     for _, nm in ipairs(group_members()) do
         -- my own read is live and authoritative; everyone else's arrives on the heartbeat
         local secs = (nm:lower() == myName:lower()) and my_cotw_secs() or (rezReady[nm] and rezReady[nm].cotw)
-        if secs ~= nil and secs >= 0 then pins[#pins + 1] = nm end
+        if secs ~= nil and secs >= 0 and not chain_off(nm) then pins[#pins + 1] = nm end
     end
-    if #pins == 0 then return rezOrder end
     table.sort(pins, function(a, b) return a:lower() < b:lower() end)
-    local chain = {}
-    for _, nm in ipairs(pins)     do chain[#chain + 1] = { name = nm, clicky = 'cotw' } end
-    for _, sl in ipairs(rezOrder) do chain[#chain + 1] = sl end
+    for _, nm in ipairs(pins) do chain[#chain + 1] = { name = nm, clicky = 'cotw' } end
+    -- Slots belonging to a sat-out character are dropped here rather than filtered at the election, so
+    -- every toon builds the identical chain - filtering later would leave each client with a different
+    -- idea of whose turn it is, which is exactly how a baton desyncs.
+    for _, sl in ipairs(rezOrder) do
+        if not chain_off(sl.name) then chain[#chain + 1] = sl end
+    end
+    if #chain == 0 then return rezOrder end
     return chain
 end
 -- Heartbeat cadence state. On a global table rather than four locals: this chunk is at Lua's ceiling.
@@ -3728,6 +3850,13 @@ local function rez_tick()
     -- tank keeps tanking while a groupmate handles the rez, but applied to every corpse in the zone it
     -- just makes the tank evaluate hundreds of strangers in order to decline each one. That was 350+
     -- lines of "I am the tank ... holding" in one twenty-minute run, one per corpse per second.
+    -- RAID CORPSES ARE OPT-IN NOW. Purple means this character is willing to spend a charge on someone
+    -- outside the group; anything else declines and lets a raid rezzer handle it. The tank rule below
+    -- still applies on top - a tank set to purple is opted in, but a tank is still not the right person
+    -- to be walking to a stranger mid-fight.
+    if tgtRaid and chain_mode(myName) ~= 'raid' then
+        return
+    end
     if tgtRaid and rez_rank(member_class(myName)) == 1 then
         return
     end
@@ -3953,6 +4082,15 @@ local function rez_tick()
         rezlog('[rez] RAID token on %s @%dm (not in my group)', tgtName, tgtDist)
     end
     pcall(function() peer_cmdf(tgtName, '/at_rezinc %s', myName) end)
+    -- PULL THE CORPSE FIRST. /corpse drags a nearby body to your feet, and a corpse just out of reach is
+    -- the difference between a rez and a wasted charge - which matters most exactly when it is hardest
+    -- to walk, mid-wipe with things still up.
+    -- Costs nothing when the corpse is already close: the command is ignored rather than failing, and it
+    -- needs the corpse targeted, which it is by this point.
+    -- Deliberately NOT gated on distance. Reading a distance to decide whether to try is another read
+    -- that can be wrong; issuing it unconditionally cannot be.
+    pcall(function() mq.cmd('/corpse') end)
+    mq.delay(250)
     rezlog('[rez] FIRING /nowcast me "%s" %d (target %s @%dm, reach %d)', item, tgtID, tgtName, tgtDist, rez_range())
     pcall(function() mq.cmdf('/nowcast me "%s" %d', item, tgtID) end)
     pcall(function() mq.cmdf('/gsay %s %s on %s', (myClicky == 'cotw') and 'Cast' or 'Clicked', item, tgtName) end)   -- announce the rez in group chat
@@ -4019,6 +4157,26 @@ pcall(function()
     -- Must reach every toon, not just the driver: each one builds the chain locally, so a toon left on
     -- the old value would compute a different order and elect against everyone else.
     mq.bind('/at_rezcotw', function(mode) rezCotw = (mode == 'on'); rezlog('[rez] CotW priority %s', mode or '?') end)
+    mq.bind('/at_rezdivine', function(mode) rezDivine = (mode == 'on'); rezlog('[rez] Divine Res priority %s', mode or '?') end)
+    -- Why is Divine Res not reporting? Three possible answers - wrong class, not scribed, not memmed -
+    -- and they need different fixes. Ask rather than infer.
+    mq.bind('/atdivine', function()
+        local rank, rdy, secs = 0, false, -1
+        pcall(function() rank = tonumber(mq.TLO.Me.AltAbility(DIVINE_SPELL).Rank()) or 0 end)
+        pcall(function() rdy = tlo_true(mq.TLO.Me.AltAbilityReady(DIVINE_SPELL)()) end)
+        pcall(function() secs = tonumber(mq.TLO.Me.AltAbilityTimer(DIVINE_SPELL).TotalSeconds()) or -1 end)
+        log('[divine] AA "%s"', DIVINE_SPELL)
+        log('   rank      %d   %s', rank, (rank > 0) and 'owned' or 'NOT owned - name may be wrong here')
+        log('   ready     %s', tostring(rdy))
+        log('   timer     %ss', tostring(secs))
+        log('   my_divine_secs() = %d   (-1 means it will not be offered)', my_divine_secs())
+    end)
+    mq.bind('/at_chainskip', function(who, md)
+        if not who or who == '' then return end
+        if md == 'off' or md == 'raid' then chainMode[who:lower()] = md
+        else chainMode[who:lower()] = nil end
+        save_settings()
+    end)
     -- The announce toggle has to REACH THE HEALERS. The checkbox lives on the driver, but the /rsay
     -- fires on whoever is maintaining the XTargets - a worker. Workers read the settings file once at
     -- startup and never again, so unchecking it on the driver changed the file and the driver's own
@@ -4198,6 +4356,39 @@ pcall(function()
             pcall(function() items = tonumber(mq.TLO.FindItemCount('=' .. nm)()) or 0 end)
             log('   %-16s bags=%-6d list=%s', nm, items, tostring(altcur_balance(nm) or 'not listed'))
         end
+    end)
+    -- DUMP THE SONG AND BUFF WINDOWS WITH THEIR EXACT BYTES. EQ is inconsistent about apostrophes -
+    -- some names carry a plain ASCII ' and some a backtick or a typographic quote - and an INI CheckFor
+    -- compares strings, so the wrong one fails to match and simply never fires. Silently, which is the
+    -- worst way for a config to be wrong.
+    -- Printing the codepoint of anything non-alphanumeric settles it: copy the name from the log line
+    -- and the character is whatever it actually is, not whatever the keyboard produced.
+    mq.bind('/atsongs', function(filter)
+        local want = (filter or ''):lower()
+        local function dump(kind, n)
+            for i = 1, n do
+                local nm = ''
+                pcall(function()
+                    nm = tostring((kind == 'song' and mq.TLO.Me.Song(i) or mq.TLO.Me.Buff(i)).Name() or '')
+                end)
+                if nm ~= '' and nm ~= 'NULL' and (want == '' or nm:lower():find(want, 1, true)) then
+                    local odd = {}
+                    for ci = 1, #nm do
+                        local b = nm:byte(ci)
+                        if not nm:sub(ci, ci):match('[%w%s]') then
+                            odd[#odd + 1] = string.format('%q=%d', nm:sub(ci, ci), b)
+                        end
+                    end
+                    log('  %s %-2d %s%s', kind, i, nm,
+                        (#odd > 0) and ('   [' .. table.concat(odd, ' ') .. ']') or '')
+                end
+            end
+        end
+        log('[songs] song window:')
+        dump('song', buff_slot_max(55))
+        log('[songs] buff window:')
+        dump('buff', buff_slot_max(45))
+        log('   bytes shown for any non-alphanumeric character: 39 is a plain apostrophe, 96 a backtick.')
     end)
     mq.bind('/atslots', function()
         for _, sl in ipairs({ 'mainhand', 'offhand', 'ranged', 'primary', 'secondary', 'range' }) do
@@ -4534,7 +4725,7 @@ pcall(function()
     mq.bind('/at_disavereport', function(...)
         rezlog('[di] tank reports at refusal: %s', table.concat({ ... }, ' '))
     end)
-    mq.bind('/at_rezready', function(char, cr, tk, al, zone, cw) if char then rezReady[char] = { crown = tonumber(cr) or -1, token = tonumber(tk) or -1, cotw = tonumber(cw) or -1, alive = (tonumber(al) == 1), zone = tonumber(zone) or 0, updated = mq.gettime() } end end)
+    mq.bind('/at_rezready', function(char, cr, tk, al, zone, cw, dv) if char then rezReady[char] = { crown = tonumber(cr) or -1, token = tonumber(tk) or -1, cotw = tonumber(cw) or -1, divine = tonumber(dv) or -1, alive = (tonumber(al) == 1), zone = tonumber(zone) or 0, updated = mq.gettime() } end end)
     mq.bind('/at_rezdone', function(name)
         if not name then return end
         rezDone[name:lower()] = mq.gettime() + 15000
@@ -5081,6 +5272,19 @@ end
 -- ---------------------------------------------------------------------------
 local uiStatus  = ''
 local tributeRows = {}   -- { {name=, active=bool, favor=number}, ... } filled by refresh_tribute()
+-- Per-character rez scope. THREE states, not two, because "sit them out" and "let them rez strangers"
+-- are different decisions and both come up:
+--   nil / 'group'  green   - group corpses only. The default, and what everyone did before.
+--   'off'          red     - no rezzes at all. Sat out of the rez and DI chains entirely.
+--   'raid'         purple  - group AND raid corpses. Willing to spend a charge on a stranger.
+-- One list drives both chains, because the reason to change a character's scope is about the character
+-- rather than the mechanic, and two lists would be two things to keep in step.
+-- A character is still SHOWN whatever their mode: knowing what a sat-out toon is holding is exactly what
+-- you want when deciding to put them back in.
+chainMode       = {}      -- [nameLower] = 'off' | 'raid'   (absent = group only)
+function chain_mode(nm) return chainMode[(nm or ''):lower()] or 'group' end
+function chain_off(nm)  return chain_mode(nm) == 'off' end
+uiLocked        = false   -- lock both windows in place: no dragging, no resizing
 miniMode        = false   -- compact window when minimized. NOT local: save_settings is defined
                           -- further up the file and would otherwise write a same-named global.
 -- NOT local: save_settings/load_settings are defined further up the file, so a local declared here
@@ -6436,20 +6640,60 @@ function draw_cure_buttons()
     if not drewAny then ImGui.TextDisabled('no cure sources in group') end
 end
 
+-- The per-character scope buttons, shared by the mini section and the Rez tab. One implementation on
+-- purpose: two copies of a three-state cycle is two places for the states to end up in a different
+-- order, and it is the sort of difference nobody notices until a character is set to something they
+-- did not intend.
+function draw_chain_modes(names, wide)
+    for i, nm in ipairs(names) do
+        if wide and i > 1 then ImGui.SameLine() end
+        local md = chain_mode(nm)
+        if md == 'off' then      ImGui.PushStyleColor(ImGuiCol.Text, 0.90, 0.35, 0.35, 1.0)
+        elseif md == 'raid' then ImGui.PushStyleColor(ImGuiCol.Text, 0.74, 0.55, 0.96, 1.0)
+        else                     ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0) end
+        if ImGui.SmallButton(nm:sub(1, 9) .. '##skip_' .. (wide and 'w' or 'm') .. nm) then
+            local nxt = (md == 'group') and 'off' or ((md == 'off') and 'raid' or 'group')
+            chainMode[nm:lower()] = (nxt ~= 'group') and nxt or nil
+            save_settings()
+            pcall(function() peer_bcast('/at_chainskip %s %s', nm, nxt) end)
+            rezlog('[rez] %s: %s', nm, (nxt == 'off') and 'no rezzes'
+                                    or (nxt == 'raid') and 'group AND raid' or 'group only')
+        end
+        ImGui.PopStyleColor(1)
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(string.format(
+                '%s - %s\n\nclick to cycle:\n  green  group corpses only\n  red    no rezzes at all\n  purple group AND raid corpses',
+                nm, (md == 'off') and 'no rezzes'
+                 or (md == 'raid') and 'group AND raid' or 'group only')) end)
+        end
+    end
+end
+
 local function draw_rez_mini()
     -- Same shape as the Burns tab: characters across the top, one row per clicky.
     local cols = {}
     for _, nm in ipairs(rezPriority) do
         local rr = rezReady[nm]
-        if rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0 or (rr.cotw or -1) >= 0) then cols[#cols + 1] = nm end
+        -- divine belongs in this test. Without it, a character whose ONLY rez is the Divine Res AA gets no
+        -- column at all - so the row that was added to show it could never show it. It was added to the
+        -- chain, the wire and the display row, and missed in the one place that decides who is listed.
+        if rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0
+                   or (rr.cotw or -1) >= 0 or (rr.divine or -1) >= 0) then cols[#cols + 1] = nm end
     end
     if #cols == 0 then ImGui.TextDisabled('rez: no crown/token reports'); return end
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
     if not ImGui.BeginTable('##rezmini', 1 + #cols, flags) then return end
     ImGui.TableSetupColumn('')
-    for _, nm in ipairs(cols) do ImGui.TableSetupColumn(nm:sub(1, 9)) end
-    ImGui.TableHeadersRow()
+    for _, nm in ipairs(cols) do ImGui.TableSetupColumn('') end
+    -- Clickable scope buttons, one per character - see draw_chain_modes.
+    ImGui.TableNextRow()
+    ImGui.TableNextColumn()
+    ImGui.TextDisabled('click a name')
+    for _, nm in ipairs(cols) do
+        ImGui.TableNextColumn()
+        draw_chain_modes({ nm }, false)
+    end
     local function row(which, label)
         ImGui.TableNextRow()
         ImGui.TableNextColumn()
@@ -6462,7 +6706,27 @@ local function draw_rez_mini()
     end
     -- CotW on top: it fires first, so it reads first. rez_cell already renders -1 as 'doesn't own',
     -- so the melee simply show blank on this row.
-    if rezCotw then row('cotw', 'CotW') end
+    -- ONE ROW for both spell rezzes. They are the same thing from the display's point of view - a
+    -- renewable rez with no consumable behind it - and no character has both, so a row each was two
+    -- rows where five of six cells were always blank.
+    -- Divine wins where a character somehow has both, matching the chain order.
+    if rezDivine or rezCotw then
+        ImGui.TableNextRow()
+        ImGui.TableNextColumn()
+        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'AA Rez')
+        for _, nm in ipairs(cols) do
+            ImGui.TableNextColumn()
+            local rr = rezReady[nm]
+            local dv = (rezDivine and rr and rr.divine) or -1
+            local cw = (rezCotw   and rr and rr.cotw)   or -1
+            local v  = (dv >= 0) and dv or cw
+            rez_cell(v, rr and rr.updated)
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() and v >= 0 then
+                pcall(function() ImGui.SetTooltip(nm .. ': ' ..
+                    ((dv >= 0) and 'Divine Resurrection' or 'Call of the Wild')) end)
+            end
+        end
+    end
     row('token', 'Token')   -- token first: it's the scarce one, so it burns first
     row('crown', 'Crown')
     ImGui.EndTable()
@@ -6535,6 +6799,13 @@ end
 -- The whole Rez tab lives in its own function: render() was over Lua's 60-upvalue limit.
 function draw_rez_tab()
             if #rezPriority == 0 then load_rez_priority() end
+            -- Per-character rez scope, at the top because it is the thing you change mid-session. The
+            -- same control as the mini section, same shared renderer.
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Who rezzes')
+            ImGui.TextDisabled('click a name: green group only, red none, purple group AND raid')
+            draw_chain_modes(rezPriority, true)
+            ImGui.Separator()
+            ImGui.Spacing()
             if ImGui.BeginTable('##reztabsplit', 2, (ImGuiTableFlags.BordersInnerV or 0)) then
             ImGui.TableSetupColumn('rez');  ImGui.TableSetupColumn('di')
             ImGui.TableNextRow(); ImGui.TableNextColumn()
@@ -6559,6 +6830,12 @@ function draw_rez_tab()
                end
             end
             do local prevC = rezCotw
+               rezDivine = ImGui.Checkbox('Divine Res first', rezDivine)
+               if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                   pcall(function() ImGui.SetTooltip(
+                       'Cleric Divine Resurrection, ahead of Call of the Wild and the clickies.\n' ..
+                       'Renewable, costs nothing, and returns more experience.') end)
+               end
                rezCotw = ImGui.Checkbox('Call of the Wild first', rezCotw)
                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                    pcall(function() ImGui.SetTooltip(
@@ -8930,6 +9207,11 @@ local function render()
         local mflags = (miniBurns and miniBurnView == 2)
             and 0
             or ((ImGuiWindowFlags.AlwaysAutoResize or 0) + (ImGuiWindowFlags.NoScrollbar or 0))
+        -- LOCK. NoMove alone is not enough - a window you cannot drag but can still resize by the corner
+        -- still wanders, and the reason to lock one is that a stray click while fighting moves it.
+        if uiLocked then
+            mflags = mflags + (ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)
+        end
         -- Fires once per session as well as on the toggle: if detail was ALREADY on at load, the toggle
         -- never runs, and ImGui just restores the small size it remembered from when this was an
         -- auto-resizing window. Two call signatures because bindings differ; a silent pcall failure here
@@ -8946,6 +9228,18 @@ local function render()
         local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime_mini', windowOpen, mflags)
         windowOpen = show
         if show then
+            -- Padlock: closed when locked, open when not. A glyph rather than a word because both title
+            -- strips are already tight, and the state is legible at a glance either way.
+            if ImGui.SmallButton((uiLocked and '\240\159\148\146' or '\240\159\148\147') .. '##at_lock') then
+                uiLocked = not uiLocked
+                save_settings()
+            end
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                pcall(function() ImGui.SetTooltip(uiLocked
+                        and 'Locked - the window cannot be moved or resized.\nClick to unlock.'
+                        or  'Unlocked. Click to pin it in place so a stray click cannot drag it.') end)
+            end
+            ImGui.SameLine()
             if ImGui.SmallButton('Expand') then miniMode = false; save_settings() end
             ImGui.SameLine()
             -- The same Close all that sits at the bottom of the expanded window, put where it can be
@@ -8972,10 +9266,23 @@ local function render()
         return
     end
     ImGui.SetNextWindowSize(560, 500, ImGuiCond.FirstUseEver)
-    local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime', windowOpen)
+    local wflags = uiLocked and ((ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)) or 0
+    local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime', windowOpen, wflags)
     windowOpen = show
     if show then
         -- top strip: global controls + the tribute glance (always visible, above the tabs)
+        -- Padlock: closed when locked, open when not. A glyph rather than a word because both title
+        -- strips are already tight, and the state is legible at a glance either way.
+        if ImGui.SmallButton((uiLocked and '\240\159\148\146' or '\240\159\148\147') .. '##at_lock') then
+            uiLocked = not uiLocked
+            save_settings()
+        end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(uiLocked
+                and 'Locked - the window cannot be moved or resized.\nClick to unlock.'
+                or  'Unlocked. Click to pin it in place so a stray click cannot drag it.') end)
+        end
+        ImGui.SameLine()
         if ImGui.Button('Counts', 70, 0) then refreshRequested = true end   -- the 80-query pass; not cheap
         ImGui.SameLine()
         if ImGui.Button('Mini', 50, 0) then miniMode = true; save_settings() end
@@ -9498,9 +9805,9 @@ while running do
         -- of DI because DI.watch could never be cleared. Rate-limited so a persistent fault says so once a
         -- minute instead of flooding, and it keeps running rather than disabling itself - a broken verdict
         -- is bad, but a DI system that quietly stops is exactly what we could not see.
-        pcall(arc_retry_tick)
-        pcall(pot_retry_tick)
-        pcall(pw_tick)
+        atphase('arcane'); pcall(arc_retry_tick)
+        atphase('pots'); pcall(pot_retry_tick)
+        atphase('phantom'); pcall(pw_tick)
         -- The Withdraw button only sets a request; the work happens here because it drives windows on
         -- a peer and waits on them.
         if dcGiveWant then
@@ -9606,7 +9913,7 @@ while running do
             local n = epTestWant; epTestWant = nil
             pcall(function() ep_soak_test(n) end)
         end
-        pcall(ep_tick)
+        atphase('placate'); pcall(ep_tick)
         if not epSaidHave and ep_is_enchanter() then
             epSaidHave = true
             epState[myName] = true
@@ -9755,7 +10062,8 @@ while running do
             peer_cmdf(driverName, '/at_trib %s %d %d', myName, a and 1 or 0, f)
         end
     end
-    if (mq.gettime() - lastDiscPoll) > 1000 then   -- disc watcher: start/fade log, and catch discs cut short
+    if (mq.gettime() - lastDiscPoll) > 1000 then
+        atphase('disc_watch')   -- disc watcher: start/fade log, and catch discs cut short
         lastDiscPoll = mq.gettime()
         local cur = ''
         pcall(function() cur = tostring(mq.TLO.Me.ActiveDisc.Name() or '') end)
@@ -9893,7 +10201,8 @@ while running do
         lastBurnResync = mq.gettime()   -- periodic re-sync: forget last-sent state so everything reports again
         if not SHOW_UI then burnLast = {} end
     end
-    if burnPollOn and mq.gettime() > burnStartAt and (mq.gettime() - lastBurnPoll) > 2000 then   -- read MY watched item timers locally (cheap), push changes
+    if burnPollOn and mq.gettime() > burnStartAt and (mq.gettime() - lastBurnPoll) > 2000 then
+        atphase('burn_poll')   -- read MY watched item timers locally (cheap), push changes
         lastBurnPoll = mq.gettime()
         -- Group draughts ride the same local poll. secs/dsecs are LATCHED values, not live countdowns,
         -- so the key only moves when the state genuinely flips - one push on drink, one on fall-off.
@@ -9959,6 +10268,7 @@ while running do
         DI.selfGap = ic and 250 or 1000
         if (mq.gettime() - (DI.lastSelfRead or 0)) < DI.selfGap then goto di_read_done end
         DI.lastSelfRead = mq.gettime()
+        atphase('di_read_self')
         local a, b, c, d, e = di_read_self()   -- e = the save's NAME; dropping it left the wire arg nil
         -- MY STAFF CAME BACK - SAY SO, AND THE BATON COMES HOME. The ring should sit as far forward as it
         -- can, so the earliest toon with a ready staff is the natural holder. Announcing on the edge means
@@ -10061,6 +10371,7 @@ while running do
         -- The keepalive is not for freshness, it is so a DROPPED message heals and so a peer that has
         -- never heard of me learns I exist.
         local cr, tk, cw = my_rez_secs(CROWN_ITEM), my_rez_secs(TOKEN_ITEM), my_cotw_secs()
+        local dv = my_divine_secs()
         local dead = false; pcall(function() dead = tlo_true(mq.TLO.Me.Dead()) end)
         local zone = 0; pcall(function() zone = tonumber(mq.TLO.Zone.ID()) or 0 end)
         local al = dead and 0 or 1
@@ -10068,8 +10379,12 @@ while running do
         -- point. What the baton cares about is ready-or-not, so that is what triggers a send.
         -- CotW carries ownership as well as readiness, so the key tracks both: -1 (don't own) must be
         -- distinguishable from a live cooldown, or a shaman who has just bought the AA never re-reports.
-        local key = string.format('%d/%d/%d/%d/%d', (cr == 0) and 0 or 1, (tk == 0) and 0 or 1,
-                                  (cw < 0) and 2 or ((cw == 0) and 0 or 1), al, zone)
+        -- Divine is in the key for the same reason CotW is: a cleric memming it mid-session goes from
+        -- "cannot cast" to "ready", and without it in the key that change never triggers a report - so
+        -- the group would keep spending clickies while a free rez sat there.
+        local key = string.format('%d/%d/%d/%d/%d/%d', (cr == 0) and 0 or 1, (tk == 0) and 0 or 1,
+                                  (cw < 0) and 2 or ((cw == 0) and 0 or 1), al, zone,
+                                  (dv < 0) and 2 or ((dv == 0) and 0 or 1))
         -- 2s while a corpse is in the zone, 20s otherwise. The election now decides everything else
         -- locally; the ONLY thing it still needs the network for is knowing a peer's script is alive
         -- and what its clicky is doing. Both matter exactly when someone is dead, so that is when the
@@ -10078,11 +10393,11 @@ while running do
         if key ~= rezReadyKey or due then
             rezReadyKey = key
             lastRezReadyPoll = mq.gettime()
-            rezReady[myName] = { crown = cr, token = tk, cotw = cw, alive = (al == 1), zone = zone, updated = mq.gettime() }
+            rezReady[myName] = { crown = cr, token = tk, cotw = cw, divine = dv, alive = (al == 1), zone = zone, updated = mq.gettime() }
             -- cotw goes LAST on the wire on purpose: a toon still on the previous build sends five args,
             -- the new bind reads the sixth as nil, and it becomes -1 ("doesn't own"). A mixed-build
             -- window therefore degrades to exactly the current behaviour instead of desyncing.
-            peer_bcast('/at_rezready %s %d %d %d %d %d', myName, cr, tk, al, zone, cw)
+            peer_bcast('/at_rezready %s %d %d %d %d %d %d', myName, cr, tk, al, zone, cw, dv)
         end
     end
     if distributing then
@@ -10097,10 +10412,15 @@ while running do
     -- heartbeat already runs, throttled to once a second, so the fast rate costs nothing when idle.
     if not distributing and mq.gettime() >= rezHoldUntil
        and (mq.gettime() - lastRezPoll) > (rez_event_now() and 250 or 1000) then
+        atphase('rez_tick')
         lastRezPoll = mq.gettime(); rez_announce_ready(); rez_autoaccept(); rez_tick()
     end
     accept_incoming()
-    mq.doevents()   -- pump raid-watch events
+    atphase('doevents'); mq.doevents()
+    -- Flush FIRST, then mark idle. The other way round overwrote the tick's actual work with 'idle'
+    -- before it was ever written down.
+    atphase_flush()
+    atphase('idle')
     mq.delay(250)
     -- Label goes LAST in the block so the client_ready skip at the top does not jump into the scope of
     -- any local declared in the body - Lua permits a goto to a label at the end of a block precisely
@@ -10169,6 +10489,7 @@ pcall(function() ep_restore('script stopping') end)
 pcall(function() mq.unbind('/at_bags') end)
 pcall(function() mq.unbind('/atregear') end)
 pcall(function() mq.unbind('/atslots') end)
+pcall(function() mq.unbind('/atsongs') end)
 pcall(function() mq.unbind('/atcurrency') end)
 pcall(function() mq.unbind('/atreclaim') end)
 pcall(function() mq.unbind('/attab') end)
@@ -10204,6 +10525,11 @@ pcall(function() mq.unbind('/at_quiet') end)
 pcall(function() mq.unbind('/at_resync') end)
 pcall(function() mq.unbind('/at_rezaccept') end)
 pcall(function() mq.unbind('/at_rezcotw') end)
+pcall(function() mq.unbind('/at_rezdivine') end)
+pcall(function() mq.unbind('/at_chainskip') end)
+pcall(function() mq.unbind('/atdivine') end)
+pcall(function() mq.unbind('/at_chainskip') end)
+pcall(function() mq.unbind('/atdivine') end)
 pcall(function() mq.unbind('/at_rezinc') end)
 pcall(function() mq.unbind('/at_rezprobe') end)
 pcall(function() mq.unbind('/at_rezwindows') end)
