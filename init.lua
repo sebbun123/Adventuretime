@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.01'
-local BUILD_TAG = 'at-1.01-divineconst-2026-08-03'   -- bump on every change; prints on startup
+VERSION = '1.02'
+local BUILD_TAG = 'at-1.02-2026-08-03'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -1138,6 +1138,13 @@ rezPriority    = {}     -- ordered char names: rez-target priority (top first); 
 local CROWN_ITEM = 'Bloodcursed Crown of Vzith'
 local TOKEN_ITEM = 'Exalted Glowing Bath Token'
 rezAuto     = false   -- master auto-rez toggle (default OFF - flip on deliberately)
+-- WIPE MODE. AdventureTime now rezzes fast enough to put the group straight back on the thing that
+-- killed it, ten times over. E3 has the same idea: after a wipe, stop rezzing until someone has zoned.
+-- Deliberately NOT auto-detected. "Was that a wipe or six unlucky deaths" is a judgement call, and a
+-- rez system that decides on its own to stop rezzing is worse than one that needs a word from you.
+-- Cleared by ZONING, not a timer: zoning is the thing that actually means "we have regrouped and are
+-- coming back deliberately", which is exactly the condition to start rezzing again.
+rezWipe     = false
 -- Call of the Wild: the shaman/druid rez AA. Renewable, short reuse, no reagent, and no debuff to hand
 -- out - so it is strictly cheaper than any clicky and fires AHEAD of the whole order. Globals, not
 -- locals: the main chunk is at 180 of Lua's 200-local ceiling and this is not worth spending two on.
@@ -1814,7 +1821,14 @@ local SETTINGS_FILE
 local function settings_path()
     if SETTINGS_FILE then return SETTINGS_FILE end
     local cfg = ''; pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    SETTINGS_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_settings.txt')) or 'adventuretime_settings.txt'
+    -- PER CHARACTER, same reason as the rez order: every toon shared one settings file, so mini sections,
+    -- targets, toggles and the rez scope all belonged to whoever saved last.
+    -- Always the per-character path for writing; the loader falls back to the old shared file once.
+    local who2 = ''
+    pcall(function() who2 = tostring(mq.TLO.Me.Name() or '') end)
+    local base2 = (cfg ~= '') and (cfg .. '\\') or ''
+    SETTINGS_FILE = base2 .. 'adventuretime_settings_' .. ((who2 ~= '') and who2 or 'unknown') .. '.txt'
+    SETTINGS_FILE_LEGACY = base2 .. 'adventuretime_settings.txt'
     return SETTINGS_FILE
 end
 local function save_settings()
@@ -1864,6 +1878,9 @@ end
 local function load_settings()
     pcall(function()
         local f = io.open(settings_path(), 'r')
+        -- Per-character file first; the old shared one only if that does not exist, so an existing setup
+        -- carries over rather than coming up on defaults. The next save writes per-character.
+        if not f and SETTINGS_FILE_LEGACY then f = io.open(SETTINGS_FILE_LEGACY, 'r') end
         if not f then return end
         for line in f:lines() do
             -- [%w_] not %w: the show_* keys carry an underscore, so the old pattern returned nil for
@@ -1935,7 +1952,15 @@ local REZ_ORDER_FILE
 local function rez_order_path()
     if REZ_ORDER_FILE then return REZ_ORDER_FILE end
     local cfg = ''; pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    REZ_ORDER_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_rezorder.txt')) or 'adventuretime_rezorder.txt'
+    -- PER CHARACTER. This was one shared file for every toon on the machine, so running a second box
+    -- overwrote the first's rez order - the B team's driver came up showing the A team's crowns, because
+    -- whichever saved last won.
+    -- The path is ALWAYS the per-character one, so writes can never collide again. The old shared file is
+    -- only consulted when loading, and only if no per-character file exists yet - see load_rez_order.
+    local who = ''
+    pcall(function() who = tostring(mq.TLO.Me.Name() or '') end)
+    local base = (cfg ~= '') and (cfg .. '\\') or ''
+    REZ_ORDER_FILE = base .. 'adventuretime_rezorder_' .. ((who ~= '') and who or 'unknown') .. '.txt'
     return REZ_ORDER_FILE
 end
 function default_rez_order()
@@ -3650,6 +3675,7 @@ end
 
 local function rez_tick()
     if #rezPriority == 0 then load_rez_priority() end   -- workers have no UI to load it; load here so their picker runs
+    if rezWipe then return end        -- wipe called: nobody rezzes until this character zones
     if not rezAuto or #rezPriority == 0 then return end
     local now = mq.gettime()
 
@@ -3855,6 +3881,11 @@ local function rez_tick()
     -- still applies on top - a tank set to purple is opted in, but a tank is still not the right person
     -- to be walking to a stranger mid-fight.
     if tgtRaid and chain_mode(myName) ~= 'raid' then
+        -- SAY SO, once per corpse. Declining in silence is indistinguishable from the feature being
+        -- broken - which is exactly how it looked the first time a raid corpse went unrezzed after this
+        -- gate went in. rezdbg is the picker's own channel, so this costs nothing unless you are watching.
+        rezdbg(string.format('target %s(%d): raid corpse and I am set to %s - purple is needed for raid',
+                             tgtName, tgtID, chain_mode(myName)))
         return
     end
     if tgtRaid and rez_rank(member_class(myName)) == 1 then
@@ -4077,6 +4108,14 @@ local function rez_tick()
     if tgtRaid then
         raidOffered[tgtID] = now
         lastRaidToken = now
+        -- RETIRE IT NOW, not on confirmation. rezCorpseDone is normally set when the target says it
+        -- accepted - but a raid stranger is not running this script and never will say so, so the only
+        -- guard left was a 15s rezPending. It expires, the corpse is still lying there (rezzed corpses
+        -- persist on this server), and everyone fires again: on 2026-08-03 one body took a CotW, then a
+        -- token 15s later from the SAME rezzer, then a crown 10s after that.
+        -- We can never learn whether a stranger's rez landed, so one charge per body is the rule. A
+        -- missed rez costs a corpse run; three charges costs three charges.
+        rezCorpseDone[tgtID] = true
         -- Tell any other AdventureTime user in earshot, so they do not spend a token on the same body.
         pcall(function() mq.cmdf('/say ATREZ %d %s', tgtID, tgtName) end)
         rezlog('[rez] RAID token on %s @%dm (not in my group)', tgtName, tgtDist)
@@ -4103,6 +4142,11 @@ local function rez_tick()
     -- skip path, so the longer hold costs nothing when it is not needed.
     rezPending[tgtID] = now + 15000
     peer_bcast('/at_rezclaim %d %d', tgtID, 15000)   -- CAST IS OUT: hold it for the whole flight
+    -- AND RETIRE IT ACROSS THE GROUP when it is a raid corpse. Inside the group a claim is enough
+    -- because the target confirms acceptance and everyone retires the id - but a stranger never
+    -- confirms, so the claim simply lapses after 15s and the next rezzer in the chain takes the same
+    -- body. That is how one corpse took a CotW, a token and a crown inside 25 seconds.
+    if tgtRaid then peer_bcast('/at_rezretire %d', tgtID) end
     rezlog('[rez] claim SENT on corpse %d for 15000ms (cast is out)', tgtID)
     local msg = string.format('%s -> %s -> %s', myName, pick.kind or 'crown', tgtName)
     if SHOW_UI then rez_note(msg) elseif driverName then peer_cmdf(driverName, '/at_rezlog %s', msg) end
@@ -4158,6 +4202,20 @@ pcall(function()
     -- the old value would compute a different order and elect against everyone else.
     mq.bind('/at_rezcotw', function(mode) rezCotw = (mode == 'on'); rezlog('[rez] CotW priority %s', mode or '?') end)
     mq.bind('/at_rezdivine', function(mode) rezDivine = (mode == 'on'); rezlog('[rez] Divine Res priority %s', mode or '?') end)
+    mq.bind('/at_wipe', function(mode)
+        rezWipe = (mode == 'on')
+        rezlog(rezWipe and '\\ay[rez] WIPE - no rezzes until this character zones\\ax'
+                        or '[rez] wipe cleared')
+    end)
+    -- /atwipe from any toon holds the whole group. /atwipe off releases early if it was a false alarm.
+    mq.bind('/atwipe', function(mode)
+        local on = (mode ~= 'off')
+        rezWipe = on
+        pcall(function() peer_bcast('/at_wipe %s', on and 'on' or 'off') end)
+        rezlog(on and '\\ay[rez] WIPE called - the group will not rez until it zones\\ax'
+                   or '[rez] wipe cleared for the group')
+        if on then pcall(function() mq.cmd('/gsay AdventureTime: WIPE - holding rezzes until we zone') end) end
+    end)
     -- Why is Divine Res not reporting? Three possible answers - wrong class, not scribed, not memmed -
     -- and they need different fixes. Ask rather than infer.
     mq.bind('/atdivine', function()
@@ -4261,7 +4319,19 @@ pcall(function()
     end)
     -- Manual escape hatch. If a run is abandoned with the weapons off - a crash, a zone, a stop - this
     -- puts them back without waiting for the backstop.
-    mq.bind('/atregear', function() ep_restore('asked by hand') end)
+    mq.bind('/atregear', function()
+        -- Works from the recovery FILE too, not just an in-flight run. After a crash there is no
+        -- epSaved in memory, and that is exactly when someone types this.
+        if not epSaved then
+            local saved = ep_recovery_read()
+            if saved then
+                epSaved = saved
+                epStripAt = mq.gettime()
+                rezlog('[placate] recovering from %s', ep_recovery_path())
+            end
+        end
+        ep_restore('asked by hand')
+    end)
     -- What each slot actually reads. If a strip ever quietly does nothing again, this says why in one
     -- line instead of by inference - the same trick that settled the DI staff timer.
     mq.bind('/atplacatetest', function(n) epTestWant = tonumber(n) or 10 end)
@@ -4755,6 +4825,12 @@ pcall(function()
     -- nothing for anyone else: the group released the corpse four seconds in and a second rezzer took
     -- it mid-cast. A pre-cast claim is worth a few seconds; a claim made after actually casting has to
     -- outlive the whole cast, and the box can take eight seconds when the target is still zoning.
+    -- Retire a corpse permanently across the group. Used for raid bodies, where nobody will ever confirm
+    -- the rez landed and a lapsing claim means a second charge on the same corpse.
+    mq.bind('/at_rezretire', function(id)
+        local n = tonumber(id)
+        if n and n > 0 then rezCorpseDone[n] = true end
+    end)
     mq.bind('/at_rezclaim', function(id, ms)
         local n = tonumber(id)
         if n then
@@ -4863,8 +4939,13 @@ pcall(function()
         for _, m in ipairs(group_members()) do
             if m:lower() == who:lower() then return end           -- our own group: already coordinated
         end
+        -- Retire, not a hold. An 8s back-off expires and we fire anyway - which is exactly what happened
+        -- when Emerold crowned a body ten seconds after hearing Homar call it. Someone has spent a charge
+        -- on this corpse; that is the whole reason for the shout.
         rezPending[n] = mq.gettime() + 8000
-        rezlog('[rez] %s (outside my group) called %s - backing off corpse %d', who, tostring(tgt), n)
+        rezCorpseDone[n] = true
+        rezlog('[rez] %s (outside my group) called corpse %d (%s) - retiring it, they have it',
+               who, n, tostring(tgt))
     end)
     mq.event('at_raid_join',   '#1# joined the raid#*#',            raid_changed)   -- Laz: 'Name joined the raid.'
     mq.event('at_raid_leave',  '#1# has left the raid#*#',          raid_changed)   -- Laz: 'Name has left the raid.'
@@ -6644,6 +6725,42 @@ end
 -- purpose: two copies of a three-state cycle is two places for the states to end up in a different
 -- order, and it is the sort of difference nobody notices until a character is set to something they
 -- did not intend.
+-- The wipe button, shared by the mini section and the Rez tab. ONE button that changes rather than two
+-- sitting side by side: only one of them is ever the right thing to press, and a permanent 'Clear wipe'
+-- next to a live 'Wipe' is an invitation to hit the wrong one in a hurry.
+-- Colour carries the state as well as the label, because in a wipe you are reading at a glance.
+function draw_wipe_button(tag)
+    if rezWipe then
+        ImGui.PushStyleColor(ImGuiCol.Button, 0.55, 0.32, 0.12, 1.0)
+        local hit = ImGui.SmallButton('Clear wipe##wipe' .. tag)
+        pop_state_button(1)
+        if hit then
+            rezWipe = false
+            pcall(function() peer_bcast('/at_wipe off') end)
+            rezlog('[rez] wipe cleared for the group')
+        end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(
+                'Rezzes are HELD. Clears itself when this character zones,\nor press this to start again now.') end)
+        end
+        ImGui.SameLine()
+        ImGui.TextColored(0.95, 0.62, 0.25, 1.0, 'WIPE - rezzes held')
+    else
+        if ImGui.SmallButton('Wipe##wipe' .. tag) then
+            rezWipe = true
+            pcall(function() peer_bcast('/at_wipe on') end)
+            pcall(function() mq.cmd('/gsay AdventureTime: WIPE - holding rezzes until we zone') end)
+            rezlog('\\ay[rez] WIPE called - the group will not rez until it zones\\ax')
+        end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(
+                'Stop the whole group rezzing until it zones.\n' ..
+                'For when a fast rez just puts everyone back on the thing that killed them.\n' ..
+                'Clears itself the moment this character zones.') end)
+        end
+    end
+end
+
 function draw_chain_modes(names, wide)
     for i, nm in ipairs(names) do
         if wide and i > 1 then ImGui.SameLine() end
@@ -6680,6 +6797,9 @@ local function draw_rez_mini()
         if rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0
                    or (rr.cotw or -1) >= 0 or (rr.divine or -1) >= 0) then cols[#cols + 1] = nm end
     end
+    -- Above the table, because a rez system that has deliberately stopped looks exactly like a broken
+    -- one, and this is the answer to "why is nobody rezzing".
+    draw_wipe_button('mini')
     if #cols == 0 then ImGui.TextDisabled('rez: no crown/token reports'); return end
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
@@ -6801,6 +6921,9 @@ function draw_rez_tab()
             if #rezPriority == 0 then load_rez_priority() end
             -- Per-character rez scope, at the top because it is the thing you change mid-session. The
             -- same control as the mini section, same shared renderer.
+            draw_wipe_button('tab')
+            ImGui.Separator()
+            ImGui.Spacing()
             ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Who rezzes')
             ImGui.TextDisabled('click a name: green group only, red none, purple group AND raid')
             draw_chain_modes(rezPriority, true)
@@ -7956,6 +8079,61 @@ EP_CHECK_AFTER = 1000    -- pause after the cast completes before looking at the
 EP_RETRY   = 3
 EP_LINGER  = 8000
 
+-- ONE PAUSE for the whole placate run: from before the memorise through to the gear going back on.
+-- It used to be two - one around the mem, one around the strip - which left a gap between them where
+-- E3 could act, and that gap is exactly where the character is standing up with a spellbook open.
+-- Tracked with a flag rather than paired calls, because the run has several exits and a pause that
+-- outlives the thing it was protecting is worse than no pause: an enchanter frozen out of E3 does not
+-- announce itself, it just stops fighting.
+-- WHAT WE TOOK OFF, WRITTEN TO DISK. epSaved lives in memory, which is fine right up until the client
+-- crashes mid-run - and this client does crash. The record dies with it, and the character is left with
+-- an epic in a bag and nothing that knows it should be worn.
+-- So the moment anything comes off it goes in a file, and the moment everything is back on the file
+-- goes. A file still present at startup means a run did not finish, and the gear goes back before
+-- anything else happens.
+function ep_recovery_path()
+    local dir = ''
+    pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    local who = ''
+    pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
+    return (dir ~= '' and (dir .. '\\') or '') .. 'adventuretime_stripped_' .. who .. '.txt'
+end
+function ep_recovery_write()
+    local fh = io.open(ep_recovery_path(), 'w')
+    if not fh then return end
+    for _, slot in ipairs(EP_SLOTS) do
+        fh:write(string.format('%s=%s\n', slot, (epSaved and epSaved[slot]) or ''))
+    end
+    fh:close()
+end
+function ep_recovery_clear()
+    pcall(function() os.remove(ep_recovery_path()) end)
+end
+function ep_recovery_read()
+    local fh = io.open(ep_recovery_path(), 'r')
+    if not fh then return nil end
+    local t, any = {}, false
+    for line in fh:lines() do
+        local k, v = line:match('^(%w+)=(.*)$')
+        if k then t[k] = v or ''; if v and v ~= '' then any = true end end
+    end
+    fh:close()
+    return any and t or nil
+end
+
+epPaused = false
+function ep_pause()
+    if epPaused then return end       -- idempotent: strip may ask again after the mem already did
+    epPaused = true
+    mq.cmd('/e3p on')
+end
+function ep_resume(why)
+    if not epPaused then return end
+    epPaused = false
+    mq.cmd('/e3p off')
+    rezlog('[placate] E3 resumed (%s)', why or 'done')
+end
+
 function ep_is_enchanter()
     local c = ''
     pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or ''):upper() end)
@@ -8028,7 +8206,13 @@ function ep_ensure_gem()
     if not want then return false end
     if epMemAt and (mq.gettime() - epMemAt) < 15000 then return false end   -- one attempt in flight
     epMemAt = mq.gettime()
-    rezlog('[placate] gem %d holds %s - memming %s instead', epGem,
+    -- PAUSE E3 FOR THE MEM. This runs BEFORE ep_strip, so it is outside the pause that covers the rest
+    -- of a placate run - meaning E3 was live for the one part that sits the character and opens a window.
+    -- It will happily re-mem, stand, or start casting underneath us mid-memorise.
+    -- Self-contained pause and resume: ep_strip takes its own immediately afterwards, and /e3p is
+    -- idempotent, so the two cannot fight.
+    ep_pause()
+    rezlog('[placate] gem %d holds %s - memming %s instead (E3 paused)', epGem,
            (have and ('"' .. have .. '"')) or 'nothing', want)
     pcall(function() mq.cmdf('/memspell %d "%s"', epGem, want) end)
     mq.delay(10000, function() return (mq.TLO.Me.Gem(epGem).Name() or '') == want end)
@@ -8036,8 +8220,32 @@ function ep_ensure_gem()
     pcall(function() now = tostring(mq.TLO.Me.Gem(epGem).Name() or '') end)
     if now ~= want then
         rezlog('\\ar[placate] could not mem %s into gem %d (it reads "%s")\\ax', want, epGem, now)
+        ep_resume('mem failed')          -- nothing to strip, so release it here
         return false
     end
+    -- STAND UP AND SHUT THE BOOK. /memspell opens the spellbook and sits the character, and a cast
+    -- attempted while sitting with the book open simply does not go out - so every placate after a mem
+    -- was silently wasted until someone stood up by hand.
+    -- /stand does both on this client. Verified rather than assumed: if it did not take, say so, because
+    -- the alternative is a queue that looks like it is working and never casts.
+    mq.cmd('/stand')
+    mq.delay(1200, function()
+        local sitting = true
+        pcall(function() sitting = tlo_true(mq.TLO.Me.Sitting()) end)
+        return not sitting and not mq.TLO.Window('SpellBookWnd').Open()
+    end)
+    local stillSitting, bookOpen = false, false
+    pcall(function() stillSitting = tlo_true(mq.TLO.Me.Sitting()) end)
+    pcall(function() bookOpen = (mq.TLO.Window('SpellBookWnd').Open() == true) end)
+    if bookOpen then
+        pcall(function() mq.TLO.Window('SpellBookWnd').DoClose() end)
+        mq.delay(400, function() return not mq.TLO.Window('SpellBookWnd').Open() end)
+    end
+    if stillSitting or mq.TLO.Window('SpellBookWnd').Open() then
+        rezlog('\\ay[placate] memmed %s but could not stand / close the book - the next cast may not go out\\ax', want)
+    end
+    -- E3 stays paused from here: the strip and the casting follow immediately, and ep_restore hands it
+    -- back once the gear is on.
     rezlog('[placate] %s is memmed in gem %d', want, epGem)
     return true
 end
@@ -8107,7 +8315,7 @@ function ep_strip()
     -- run goes through ep_restore - queue finished, the stripped-too-long backstop, /atregear, and the
     -- script exiting. So there is no path that pauses E3 without something later resuming it.
     -- /e3p on = paused, /e3p off = E3 driving. Backwards-looking, but it is E3's naming, not ours.
-    mq.cmd('/e3p on')
+    ep_pause()
     -- REMEMBER THE TARGET ONCE, not per mob. The verification step targets each mob to read the debuff
     -- off it, and it used to put the previous target back straight afterwards - then target the next mob
     -- a second later and restore again. Two extra target switches per mob, each with a settle wait, for
@@ -8117,6 +8325,15 @@ function ep_strip()
     epPrevTarget = 0
     pcall(function() epPrevTarget = tonumber(mq.TLO.Target.ID()) or 0 end)
     rezlog('[placate] E3 paused; stripping weapons before the first cast...')
+    -- Record BEFORE removing anything. Written first so a crash between the read and the click still
+    -- leaves a file naming what should be worn - the opposite order would lose exactly the case this
+    -- exists for.
+    for _, slot in ipairs(EP_SLOTS) do
+        local nm0 = ''
+        pcall(function() nm0 = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        epSaved[slot] = nm0
+    end
+    ep_recovery_write()
     for _, slot in ipairs(EP_SLOTS) do
         local nm = ''
         pcall(function() nm = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
@@ -8167,12 +8384,44 @@ function ep_strip()
         rezlog('\\ar[placate] could NOT remove: %s - a proc from those may break the placate\\ax',
                table.concat(kept, ', '))
     end
+    -- CONFIRM EACH ITEM IS FINDABLE BEFORE WE GO ANYWHERE. Taking something off is only half of it - the
+    -- restore puts it back by NAME, so an item that came off but cannot be found again is already lost
+    -- at this point, and we would not learn that until the run ended.
+    -- Checking here means the failure is reported while the cause is still on screen.
+    local lost = {}
+    for _, slot in ipairs(EP_SLOTS) do
+        local want = epSaved[slot] or ''
+        if want ~= '' then
+            local held = 0
+            pcall(function() held = tonumber(mq.TLO.FindItemCount('=' .. want)()) or 0 end)
+            local worn = ''
+            pcall(function() worn = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+            if held < 1 and worn ~= want then lost[#lost + 1] = want end
+        end
+    end
+    if #lost > 0 then
+        rezlog('\\ar[placate] STRIPPED BUT CANNOT FIND: %s - stopping before casting\\ax',
+               table.concat(lost, ', '))
+        pcall(function() mq.cmdf('/gsay AdventureTime: cannot find %s after stripping - stopping',
+                                 table.concat(lost, ', ')) end)
+        ep_restore('lost an item during the strip')   -- put back whatever we still can, at once
+        return false
+    end
     return true
 end
 
 -- Put everything back. Safe to call at any time, including when nothing was stripped.
 function ep_restore(why)
-    if not epSaved then return end
+    if not epSaved then
+        -- Nothing was stripped, but the mem may still have paused E3 - release it either way.
+        ep_resume(why or 'nothing to restore')
+        return
+    end
+    -- BAGS OPEN FOR THE WHOLE RESTORE. The strip stows each weapon into a named bag slot, and putting it
+    -- back means finding it by name - which is not reliable with the bags shut. The strip already opens
+    -- them for its own work; the restore never did, which is how a run could report success with an epic
+    -- still sitting in a bag.
+    toggle_all_bags()
     for _, slot in ipairs(EP_SLOTS) do
         local original = epSaved[slot] or ''
         local now = ''
@@ -8192,19 +8441,78 @@ function ep_restore(why)
             ep_stow_cursor()
         end
     end
+    -- SECOND AND THIRD ATTEMPT. One pass was enough when it worked and silent when it did not; a
+    -- weapon that failed to seat first time usually seats on a retry, and the cost of trying twice more
+    -- is a second against the cost of walking around without an epic.
+    -- KEEP TRYING WHILE E3 IS STILL HELD. Two attempts then resume regardless meant the pause ended
+    -- with a weapon in a bag - E3 came back, the character carried on, and nothing else was ever going
+    -- to put it on. Six rounds instead, and the verify below decides when we stop rather than a count.
+    -- Bounded rather than infinite: an item that cannot be equipped at all (wrong zone, cursed, gone)
+    -- would otherwise hold E3 down forever, which is worse than fighting a weapon short.
+    for attempt = 2, 6 do
+        local anyMissing = false
+        for _, slot in ipairs(EP_SLOTS) do
+            local original = epSaved[slot] or ''
+            local now = ''
+            pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+            if now ~= original and original ~= '' then
+                anyMissing = true
+                clear_cursor()
+                pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', original) end)
+                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
+                if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                    pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                    mq.delay(900, function()
+                        return (mq.TLO.Me.Inventory(slot).Name() or '') == original
+                    end)
+                end
+                ep_stow_cursor()
+            end
+        end
+        if not anyMissing then break end
+        rezlog('[placate] re-equip attempt %d of 6', attempt)
+        mq.delay(300)   -- let the client settle between passes rather than hammering it
+    end
+
+    toggle_all_bags()   -- back as we found them, before the final check
+
+    -- THE CHECK THAT MATTERS: read every slot again, right here, immediately before E3 is handed back.
+    -- Everything above reports what it BELIEVES it did; this reads what is actually worn.
     local missed = {}
     for _, slot in ipairs(EP_SLOTS) do
         local original = epSaved[slot] or ''
         local now = ''
         pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
-        if now ~= original then missed[#missed + 1] = slot end
+        if now ~= original then
+            missed[#missed + 1] = string.format('%s (want "%s", have "%s")',
+                slot, (original ~= '') and original or 'nothing',
+                (now ~= '') and now or 'nothing')
+        end
     end
     if #missed > 0 then
-        rezlog('\\ar[placate] could NOT re-equip: %s - check them by hand\\ax', table.concat(missed, ', '))
+        -- LOUD, and the file STAYS. This is the case that cost an epic: the run said it was done, E3 came
+        -- back, and the weapon sat in a bag with nothing left that knew about it.
+        -- Said three ways because one line in a busy log is exactly what got missed - the group is told
+        -- as well, since the person is usually looking at the game and not at a log file.
+        rezlog('\\ar[placate] GEAR NOT RESTORED: %s\\ax', table.concat(missed, ', '))
+        rezlog('\\ar[placate] recorded in %s - it will be retried on the next start, or type /atregear\\ax',
+               ep_recovery_path())
+        pcall(function() mq.cmdf('/gsay AdventureTime: my gear did NOT go back on - %s',
+                                 table.concat(missed, ', ')) end)
+        -- E3 IS COMING BACK ANYWAY, and that is deliberate: holding it down indefinitely turns a missing
+        -- weapon into a character that does nothing at all. But say so, so the state is not a surprise.
+        rezlog('\\ar[placate] handing E3 back with gear still off - fix it and /atregear\\ax')
     else
+        ep_recovery_clear()   -- verified back on: the record has done its job
         rezlog('[placate] re-equipped %s (%s)', table.concat(EP_SLOTS, ', '), why or 'done')
     end
-    epSaved, epStripAt = nil, 0
+    -- KEEP the record when something is still off. Clearing it on failure threw away the one thing that
+    -- knew what should be worn, so a second /atregear in the same session had nothing to work from.
+    if #missed == 0 then
+        epSaved, epStripAt = nil, 0
+    else
+        epStripAt = mq.gettime()   -- restart the backstop clock so it tries again rather than firing at once
+    end
     -- Put the original target back, once, now the whole queue is done.
     if epPrevTarget and epPrevTarget > 0 then
         local cur = 0
@@ -8216,8 +8524,7 @@ function ep_restore(why)
     epPrevTarget = 0
     -- Hand the toon back. Last thing, after the gear is actually on - resuming earlier would let E3
     -- start driving while items are still moving.
-    mq.cmd('/e3p off')
-    rezlog('[placate] E3 resumed')
+    ep_resume(why or 'gear restored')
 end
 
 -- Runs on every toon; returns immediately on anyone who is not an enchanter. Main loop only - it
@@ -8308,6 +8615,15 @@ function ep_tick()
     -- queue that stalls on an unreachable mob would otherwise leave them that way indefinitely.
     if epSaved and (mq.gettime() - epStripAt) > EP_STRIP_MAX then
         ep_restore('backstop - stripped too long')
+    end
+    -- SECOND BACKSTOP, for the pause without a strip. The mem takes the pause before anything is
+    -- removed, so a run that memmed and then found nothing to cast at - mob died, queue cleared, gem
+    -- emptied - would leave E3 held with epSaved never set, and the backstop above cannot see it.
+    -- If we are paused, holding nothing, with no cast in flight and no work queued, let go.
+    if epPaused and not epSaved and not epCast then
+        local pending = 0
+        for _, q in ipairs(epQueue) do if not q.state then pending = pending + 1 end end
+        if pending == 0 then ep_resume('nothing left to do') end
     end
 
     if epCast then
@@ -8415,7 +8731,10 @@ function ep_tick()
 
     -- STRIP BEFORE THE FIRST CAST, not before each one. Nothing above this point casts, so by the time
     -- we get here we know there is real work to do and it is worth paying for.
-    ep_strip()
+    -- ep_strip returns false when something came off and cannot be found again. Do not cast in that
+    -- state: it has already put back what it could, and pressing on would mean casting a queue while an
+    -- item is unaccounted for.
+    if not ep_strip() then return end
 
     epLast = mq.gettime()
     -- Target it BEFORE the cast, once. It stays there for the verification read afterwards because E3
@@ -9630,6 +9949,50 @@ if SHOW_UI then
     -- Said at startup because the moment you need it is the moment the window is gone, and a command
     -- you have never seen is no help then.
     log('   \\ay/atui\\ax reopens the mini window, \\ay/atuie\\ax the expanded one.')
+    log('   \\ay/atwipe\\ax holds all rezzes until the group zones (\\ay/atwipe off\\ax to release).')
+-- RECOVER STRIPPED GEAR AT STARTUP. A file here means a placate run did not put the weapons back -
+-- almost always because the client died mid-run. Nothing else will ever notice: the character just
+-- fights on without an epic, and the only clue is a stack of DPS that quietly is not there.
+-- Runs before anything else touches the character, and holds E3 while it works.
+pcall(function()
+    local saved = ep_recovery_read()
+    if not saved then return end
+    log('\\ay[placate] found gear stripped by an unfinished run - putting it back\\ax')
+    ep_pause()
+    for _, slot in ipairs(EP_SLOTS) do
+        local want = saved[slot] or ''
+        local now = ''
+        pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if want ~= '' and now ~= want then
+            clear_cursor()
+            pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', want) end)
+            mq.delay(800, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
+            if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                mq.delay(1000, function()
+                    return (mq.TLO.Me.Inventory(slot).Name() or '') == want
+                end)
+            end
+            ep_stow_cursor()
+            local got = ''
+            pcall(function() got = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+            log('   %s: %s', slot, (got == want) and ('restored ' .. want)
+                                                 or ('\\arSTILL MISSING ' .. want .. '\\ax'))
+        end
+    end
+    ep_resume('startup recovery')
+    -- Only forget it once every slot matches. Anything short of that and the file stays, so the next
+    -- start tries again - the whole point is that this cannot quietly give up.
+    local ok = true
+    for _, slot in ipairs(EP_SLOTS) do
+        local want = saved[slot] or ''
+        local now = ''
+        pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if want ~= '' and now ~= want then ok = false end
+    end
+    if ok then ep_recovery_clear(); log('[placate] gear recovery complete')
+    else log('\\ar[placate] gear recovery INCOMPLETE - will try again next start\\ax') end
+end)
 else
     log('AdventureTime %s ready [%s] (worker - headless; obeying the driver).', VERSION, BUILD_TAG)
 end
@@ -9986,7 +10349,15 @@ while running do
     end
     do   -- timed background jobs: tribute refresh, and (if the toggle's on) auto tank-XTargets. Zone = always.
         local z = mq.TLO.Zone.ID() or 0
-        if z ~= lastZoneID then lastZoneID = z; zoneSettleAt = mq.gettime() + 3000 end
+        if z ~= lastZoneID then
+            lastZoneID = z; zoneSettleAt = mq.gettime() + 3000
+            -- Zoned: the wipe is over by definition. Cleared per character rather than broadcast, so a
+            -- toon still standing in the zone stays held until it comes back too.
+            if rezWipe then
+                rezWipe = false
+                rezlog('\\ag[rez] zoned - wipe mode cleared, rezzing again\\ax')
+            end
+        end
         local settled = false
         if zoneSettleAt and mq.gettime() >= zoneSettleAt then zoneSettleAt = nil; settled = true end
         if settled then tributeRequested = true end
@@ -10477,6 +10848,7 @@ pcall(function() mq.unbind('/at_diauto') end)
 pcall(function() mq.unbind('/at_difired') end)
 pcall(function() mq.unbind('/at_rezready') end)
 pcall(function() mq.unbind('/at_rezclaim') end)
+pcall(function() mq.unbind('/at_rezretire') end)
 pcall(function() mq.unbind('/at_rezrdy?') end)
 pcall(function() mq.unbind('/at_rezrdy!') end)
 pcall(function() mq.unbind('/at_rezskip') end)
@@ -10526,6 +10898,8 @@ pcall(function() mq.unbind('/at_resync') end)
 pcall(function() mq.unbind('/at_rezaccept') end)
 pcall(function() mq.unbind('/at_rezcotw') end)
 pcall(function() mq.unbind('/at_rezdivine') end)
+pcall(function() mq.unbind('/atwipe') end)
+pcall(function() mq.unbind('/at_wipe') end)
 pcall(function() mq.unbind('/at_chainskip') end)
 pcall(function() mq.unbind('/atdivine') end)
 pcall(function() mq.unbind('/at_chainskip') end)
