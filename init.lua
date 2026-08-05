@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.02'
-local BUILD_TAG = 'at-1.02-2026-08-03'   -- bump on every change; prints on startup
+VERSION = '1.03'
+local BUILD_TAG = 'at-1.03-release-2026-08-05'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -264,6 +264,11 @@ end
 GROUP_POTS = {
     { key = 'shimmer',   base = 'Draught of Shimmering Reflection', label = 'Group Shimmering Reflection' },
     { key = 'fortitude', base = 'Draught of Fleeting Fortitude',    label = 'Group Fleeting Fortitude'    },
+    -- Inferno Ward moved here from the INIs. As a burn line it fired on every 15 and 30 minute burn
+    -- whether or not the fight warranted it; as a button it is spent when someone decides to spend it.
+    -- Same shape as the two above, so it gets the tier picking, the per-toon inventory read and the
+    -- carries/up/timer display for free.
+    { key = 'inferno',   base = 'Draught of Inferno Ward',        label = 'Group Inferno Ward'          },
 }
 function pot_base_for(key)
     for _, p in ipairs(GROUP_POTS) do if p.key == key then return p.base, p.label end end
@@ -271,6 +276,259 @@ function pot_base_for(key)
 end
 -- driver: potState[char][key] = { carries, up, secs, dsecs, updated }. Worker: last-pushed key per pot.
 potState = {}
+
+-- NIGHTVEIL EMBLEM. Same shape as the CoTH emblem: an aug that only fires from a CHARM, and a character
+-- can be carrying up to four of them - so the ONLY one that counts is the charmed one. Looking it up by
+-- name with FindItem would find a spare in a bag and call the character ready.
+-- State is pushed per character like the potions, because each toon knows its own charm and its own
+-- cooldown and the driver's copy is only as fresh as the last push.
+NIGHTVEIL_ITEM = 'Nightveil Emblem'
+NIGHTVEIL_OPTS = '/CastType|Item/NoInterrupt'
+nvMethod       = nil    -- which click method worked here; found once, then reused
+-- The effect the emblem applies. Used as a second proof that a click landed, since a timer read through
+-- the wrong copy of the item is exactly what made every method look like a failure.
+NIGHTVEIL_BUFF = 'Intensity of the Resolute'
+nvState = {}      -- [char] = { ok, secs, updated }   ok=1 socketed in a charm, secs 0=ready
+nvLast  = ''      -- change key for the push
+
+-- THE READ, SETTLED 2026-08-05. A Nightveil Emblem SOCKETED INTO A CHARM has no readable timer - every
+-- member on the aug and on its carrier answers 0/ready straight through a live two-hour cooldown. A
+-- LOOSE copy sitting in a bag reads correctly and returns REMAINING SECONDS. All copies share recast
+-- pool 71, so the loose one's countdown IS the socketed one's countdown.
+-- This inverts an earlier conclusion in this file. A previous pass decided reading by name was safe
+-- because FindItem "was not picking up a spare" - it was, and that is precisely why it worked. The
+-- spare is the only honest reader on the character.
+-- CONSEQUENCE: the read only exists where a spare is carried. A character holding exactly one emblem,
+-- socketed, has no way to see its own cooldown; FindItem resolves to the socketed copy and lies.
+-- nv_secs() returns -1 in that case rather than reporting a confident 0.
+-- TimerReady CAN RETURN A STRING. On this build it answers "Not ready" rather than a number, and
+-- tonumber("Not ready") is nil - which our `or 0` then turned into 0, meaning READY. Every read said the
+-- emblem was available, forever, and no click could ever be seen to have worked.
+-- This reads it as text first and only then tries to make a number of it.
+-- Returns: 0 ready, >0 seconds left, -1 unknown.
+function timer_secs(v)
+    if v == nil then return -1 end
+    local t = tostring(v)
+    local n = tonumber(t)
+    if n then return (n > 0) and n or 0 end          -- a plain number: 0 is ready
+    local low = t:lower()
+    if low:find('not ready', 1, true) then return 1 end   -- on cooldown, duration unknown
+    if low:find('ready', 1, true) then return 0 end
+    -- Something like "1h 58m" or "58:12" - pull the digits out and treat any of them as "not ready".
+    if t:match('%d') then return 1 end
+    return -1
+end
+
+function nv_carrier()
+    local slot = find_aug(NIGHTVEIL_ITEM)
+    if slot ~= 'charm' then return nil end
+    local nm = ''
+    pcall(function() nm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    return (nm ~= '') and nm or nil
+end
+
+-- The SPELL the aug grants. Not the item name, and not the aug name - "Veiled Bastion" for the Nightveil
+-- Emblem. This is the only handle that knows about the cooldown.
+function nv_spell()
+    local sp = ''
+    pcall(function() sp = tostring(mq.TLO.Me.Inventory('charm').Item(1).Spell.Name() or '') end)
+    return (sp ~= '' and sp ~= 'NULL') and sp or nil
+end
+
+-- DO WE CARRY A LOOSE COPY? Bags only, and deliberately NOT FindItemCount - that counts equipped gear
+-- and the augs inside it, so the socketed emblem would inflate it to 1 and we would trust a read that
+-- does not exist. Walks the same way my_count() does, which is proven on this build.
+function nv_loose()
+    local total = 0
+    pcall(function()
+        for pk = 1, 12 do
+            local slot = mq.TLO.Me.Inventory('pack' .. pk)
+            if (slot.ID() or 0) > 0 then
+                local cap = slot.Container() or 0
+                if cap > 0 then                                        -- a bag: count its contents
+                    for i = 1, cap do
+                        local it = slot.Item(i)
+                        if (it.ID() or 0) > 0 and (it.Name() or '') == NIGHTVEIL_ITEM then
+                            total = total + 1
+                        end
+                    end
+                elseif (slot.Name() or '') == NIGHTVEIL_ITEM then      -- loose in an inventory slot
+                    total = total + 1
+                end
+            end
+        end
+    end)
+    return total
+end
+
+-- WHO DO WE BELIEVE? A positive number is never a false positive - nothing on this build invents a
+-- countdown out of nowhere, so any reading above zero is real and is trusted immediately, spare or no
+-- spare. The only ambiguous reading is ZERO, which is either "genuinely ready" or the socketed copy
+-- lying the way it did all through the 2026-08-04 session.
+-- So the character proves its own read: the first time this emblem ever reports a nonzero here, we know
+-- the read works on this character and a later zero can be believed. Carrying a loose copy grants that
+-- trust up front, since a bagged emblem is known to read correctly.
+-- This replaces requiring a spare outright - the druid reads its cooldown across zones with no spare
+-- involved, so a hard spare requirement would have suppressed a read that works.
+-- The latch resets on reload and re-arms the first time a cooldown is seen. Until then the behaviour is
+-- the permissive one: allow the click and let the client refuse it.
+nvReadOK = false
+
+-- WHERE IS THE LOOSE COPY? Returns pack index and slot index, or nil. Needed because the refresh has to
+-- name the bagged copy by position - clicking "the emblem" by name would find the socketed one, which
+-- is equipped and would really fire.
+function nv_loose_slot()
+    local pk, si = nil, nil
+    pcall(function()
+        for p = 1, 12 do
+            local slot = mq.TLO.Me.Inventory('pack' .. p)
+            if (slot.ID() or 0) > 0 then
+                local cap = slot.Container() or 0
+                if cap > 0 then
+                    for i = 1, cap do
+                        local it = slot.Item(i)
+                        if (it.ID() or 0) > 0 and (it.Name() or '') == NIGHTVEIL_ITEM then
+                            pk, si = p, i
+                            return
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return pk, si
+end
+
+-- THE READ IS STALE UNTIL POKED. TimerReady on the loose copy sits at 0 through a live cooldown until
+-- something asks the client about that item; right-clicking it is what asks. The click is REFUSED - the
+-- emblem is EffectType 4 "Click Worn" and only fires from an equipped slot - so this costs nothing and
+-- cannot burn the two-hour pool. Confirmed in game 2026-08-05: the client says it cannot be clicked, and
+-- the timer appears immediately afterwards.
+-- `/itemnotify in packN M` reaches an item INSIDE a bag without opening it, so this does not disturb the
+-- UI mid-run.
+-- Rate limited because it is a refusal message in the chat window every time it fires.
+-- POKE RARELY, COUNT LOCALLY. The pool is two hours, so a reading every ten minutes is plenty of
+-- accuracy and costs one refusal line per character per ten minutes instead of one every thirty
+-- seconds. Between pokes the live read reverts to a stale 0, so we subtract elapsed time from the last
+-- trusted reading rather than believing it.
+NV_REFRESH_MS = 600000
+-- How long a click gets to prove itself before the next method is tried. Generous on purpose: the pool
+-- is two hours, so a discovery run gets ONE real shot and there is no value in rushing it.
+NV_METHOD_WAIT_MS = 4000
+nvNextRefresh = 0
+nvSecsVal     = -1        -- last reading we trust
+nvSecsAt      = 0         -- when it was taken
+
+-- GATED ON CAPABILITY, not on the mini-window checkbox. miniNightveil only decides whether the buttons
+-- are drawn, and workers run headless with SHOW_UI false - gating on it would silence every character
+-- except the driver. A toon with no emblem socketed in a charm, or no loose copy to poke, has nothing
+-- to refresh and returns early here, which is the same "don't do this at all" outcome by other means.
+function nv_refresh(force)
+    if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then return false end
+    local now = mq.gettime()
+    if not force and now < nvNextRefresh then return false end
+    local pk, si = nv_loose_slot()
+    if not pk then return false end
+    nvNextRefresh = now + NV_REFRESH_MS
+    pcall(function() mq.cmdf('/itemnotify in pack%d %d rightmouseup', pk, si) end)
+    return true
+end
+
+-- Seconds left on pool 71. Reads the loose copy, which is the only honest one - the socketed emblem and
+-- its charm both answer 0 straight through a live cooldown.
+-- A live 0 is NOT taken at face value while we are holding a countdown that has not run out: between
+-- pokes the field goes stale at 0, and believing it would flash the button green mid-cooldown. Our own
+-- count wins until it expires, and every poke overwrites it with the truth.
+-- FOR CHARACTERS WITH NO SPARE. A toon carrying only the socketed emblem has no honest read at all -
+-- FindItem answers about the equipped copy, which reports 0 straight through a live cooldown, so its
+-- button stays green for the full two hours. Nothing about the poke helps: there is nothing to poke.
+-- So count it ourselves from our own click. Two things make this trustworthy now that were not true
+-- when it was first proposed as a fallback: the click is confirmed to work, and the real duration has
+-- been measured off a character that CAN read it, rather than taken from Clicky.TimerID (which claims
+-- 7200 and is wrong by about fifteen minutes).
+-- Persisted, so a /lua reload does not hand back a green button on a live cooldown.
+-- Self-correcting: any real reading overrides the assumption, and if a real reading ever comes back
+-- LONGER than the constant, the constant was too small and is raised to match.
+NV_RECAST_SECS = 6300
+
+function nv_track_path()
+    local dir = ''
+    pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    local who = ''
+    pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
+    return (dir ~= '' and (dir .. '\\') or '') .. 'adventuretime_nightveil_' .. who .. '.txt'
+end
+
+-- Stored as an absolute expiry in os.time() seconds. mq.gettime() is uptime, which resets on reload and
+-- would make every stored value meaningless the moment it mattered.
+function nv_track_write(secs)
+    local fh = io.open(nv_track_path(), 'w')
+    if not fh then return end
+    fh:write(tostring(os.time() + (secs or 0)))
+    fh:close()
+end
+
+function nv_track_read()
+    local fh = io.open(nv_track_path(), 'r')
+    if not fh then return 0 end
+    local t = tonumber(fh:read('*a') or '') or 0
+    fh:close()
+    local left = t - os.time()
+    return (left > 0) and left or 0
+end
+
+-- Called when a click is believed to have gone off. On a toon that can read the timer this is redundant
+-- and harmless - the next poke overwrites it with the truth.
+function nv_mark_clicked()
+    nvSecsVal, nvSecsAt = NV_RECAST_SECS, mq.gettime()
+    nv_track_write(NV_RECAST_SECS)
+end
+
+function nv_secs()
+    local v = nil
+    pcall(function() v = mq.TLO.FindItem('=' .. NIGHTVEIL_ITEM).TimerReady() end)
+    local s   = timer_secs(v)
+    local now = mq.gettime()
+    if s > 0 then                                          -- a real countdown, believed on sight
+        nvReadOK, nvSecsVal, nvSecsAt = true, s, now
+        if s > NV_RECAST_SECS then NV_RECAST_SECS = s end   -- the constant was short; learn from the truth
+        return s
+    end
+    if nvSecsVal > 0 then
+        local left = nvSecsVal - math.floor((now - nvSecsAt) / 1000)
+        if left > 0 then return left end                   -- the 0 is stale; use our own count
+        nvSecsVal = -1                                     -- run out: genuinely ready
+    end
+    -- NOTHING IN MEMORY. Either this is a fresh load or we have never seen a cooldown - check the file
+    -- before believing a 0, because a reload mid-cooldown is exactly when the green button lies.
+    local disk = nv_track_read()
+    if disk > 0 then
+        nvSecsVal, nvSecsAt = disk, now
+        return disk
+    end
+    if s == 0 and (nvReadOK or nv_loose() > 0) then return 0 end
+    return -1                                              -- a zero we have no reason to trust yet
+end
+
+-- Usable and off cooldown. Where there is no spare to read, the honest answer is "unknown" - and the
+-- useful behaviour for unknown is to ALLOW the attempt, because the client's refusal costs nothing
+-- while a permanent false "not ready" would lock the button out forever on those characters.
+function nv_ready()
+    local s = nv_secs()
+    if s >= 0 then return s == 0 end
+    return true   -- unknown: let the click go and let the client refuse it
+end
+
+function nv_state()
+    local slot = find_aug(NIGHTVEIL_ITEM)
+    if slot ~= 'charm' then return -1 end
+    local s = nv_secs()
+    if s >= 0 then return s end     -- real countdown: 0 ready, >0 seconds left
+    -- NO SPARE CARRIED, so no read exists on this character - "up or down" is not even knowable here.
+    -- -2 says exactly that. Returning 1 as a placeholder was worse than useless: it displayed as "1s
+    -- left" on every character, which is a specific claim and a false one.
+    return -2
+end
 potLast  = {}
 -- Drink the best tier of `base` I actually hold. II is tried first; I is the fallback ONLY when no II
 -- is carried. If a tier is held but its timer is down we STOP rather than dropping to the lower one -
@@ -304,7 +562,30 @@ function pot_retry_tick()
     pcall(function() mq.cmdf('/queuecast me "%s"', potPending.nm) end)
 end
 
+-- DON'T RE-DRINK WHAT IS ALREADY UP, and don't re-drink too soon.
+-- Two guards, both per character, because each toon knows its own state and the driver's copy is only
+-- as fresh as the last refresh.
+--   * buff already running -> nothing to gain. pot_state asks once per LINE rather than per tier,
+--     because I and II land the same effect, so a II up correctly blocks a I as well.
+--   * drunk within POT_MIN_GAP -> refuse. The item's own cooldown is shorter than the interval these
+--     are actually worth spending at, so pressing the button on every 15 and 30 minute burn drank one
+--     every time it happened to be off cooldown. This is the "how often do I want to spend one"
+--     number, which is a different question from "can I".
+POT_MIN_GAP = 30 * 60 * 1000     -- 30 minutes between draughts of the same line
+potDrankAt  = {}                 -- [base] = when this character last got one down
+
 function pot_drink(base)
+    -- Already running: say so rather than failing silently, so a press that does nothing is explained.
+    local _, up, _, dsecs = pot_state(base)
+    if up == 1 then
+        return false, nil, string.format('%s is already up (%dm left)', base, math.floor((dsecs or 0) / 60))
+    end
+    local last = potDrankAt[base]
+    if last and (mq.gettime() - last) < POT_MIN_GAP then
+        local left = math.ceil((POT_MIN_GAP - (mq.gettime() - last)) / 60000)
+        return false, nil, string.format('%s drunk %dm ago - holding for another %dm',
+                                         base, math.floor((mq.gettime() - last) / 60000), left)
+    end
     for _, tier in ipairs({ 'II', 'I' }) do
         local nm = base .. ' ' .. tier
         local have, ready = 0, -1
@@ -318,6 +599,10 @@ function pot_drink(base)
             if ready == 0 then
                 mq.cmdf('/queuecast me "%s"', nm)
                 potPending = { base = base, nm = nm, at = mq.gettime(), tries = 1 }
+                -- Stamped on the ATTEMPT, not on confirmation. A queuecast that lands three seconds
+                -- later would otherwise leave the gap unstarted, and a second press in between would
+                -- drink another one.
+                potDrankAt[base] = mq.gettime()
                 return true, nm
             end
             return false, nm   -- held but on cooldown; the other tier shares that timer
@@ -1145,10 +1430,35 @@ rezAuto     = false   -- master auto-rez toggle (default OFF - flip on deliberat
 -- Cleared by ZONING, not a timer: zoning is the thing that actually means "we have regrouped and are
 -- coming back deliberately", which is exactly the condition to start rezzing again.
 rezWipe     = false
+-- FEIGN DEATH. A feigning monk or necro is alive, off the mob's list, and one cast away from being on it
+-- again - so it must not be elected rezzer and must not spend a DI. Nothing here checked for it, which
+-- means a feign that saved a character could be undone by the rez chain electing them a second later.
+-- Read live rather than broadcast: it changes constantly and the only decision that matters is the one
+-- this character makes about itself, right now.
+function am_feigning()
+    local fd = false
+    pcall(function() fd = tlo_true(mq.TLO.Me.Feigning()) end)
+    return fd
+end
+-- INVISIBILITY. Same shape as the feign gate and the same reasoning: casting drops invis, so an invis
+-- rezzer is one cast away from being visible to everything standing around the corpse - which is
+-- usually the exact reason they went invis mid-wipe. The chain has other members; let it move on.
+-- The bare Me.Invis rather than a specific type, because any form of it breaks on a cast.
+function am_invis()
+    local iv = false
+    pcall(function() iv = tlo_true(mq.TLO.Me.Invis()) end)
+    return iv
+end
 -- Call of the Wild: the shaman/druid rez AA. Renewable, short reuse, no reagent, and no debuff to hand
 -- out - so it is strictly cheaper than any clicky and fires AHEAD of the whole order. Globals, not
 -- locals: the main chunk is at 180 of Lua's 200-local ceiling and this is not worth spending two on.
 COTW_AA     = 'Call of the Wild'
+-- SHORT NAMES FOR CHAT. The announcement used to carry the full item name, and something else parsing
+-- group chat reacts to those strings - so a rez was setting off another script. Nothing here needs the
+-- real name: the point of the message is "somebody has this body", and Crown or Token says that.
+-- The LOG still carries the full name; only what goes out over /gsay is shortened.
+REZ_SHORT = { crown = 'Crown', token = 'Token', cotw = 'CotW', divine = 'Divine Rez' }
+function rez_short(kind) return REZ_SHORT[kind or ''] or 'rez' end
 -- Divine Resurrection: the cleric rez AA. Renewable, no reagent, and it returns more experience than
 -- either clicky - so it goes ahead of CotW and the whole clicky order.
 -- Globals, not locals: this chunk is at Lua's 200-local ceiling.
@@ -1851,6 +2161,7 @@ local function save_settings()
             f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
             f:write('miniPhantom=' .. (miniPhantom and '1' or '0') .. '\n')
             f:write('miniPlacate=' .. (miniPlacate and '1' or '0') .. '\n')
+            f:write('miniNightveil=' .. (miniNightveil and '1' or '0') .. '\n')
             f:write('epGem=' .. tostring(epGem or 8) .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
@@ -1903,6 +2214,7 @@ local function load_settings()
             if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
             if k == 'miniPhantom' then miniPhantom = (v == '1' or v:lower() == 'true') end
             if k == 'miniPlacate' then miniPlacate = (v == '1' or v:lower() == 'true') end
+            if k == 'miniNightveil' then miniNightveil = (v == '1' or v:lower() == 'true') end
             if k == 'epGem' then epGem = math.max(1, math.min(12, tonumber(v) or 8)) end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
@@ -2030,13 +2342,80 @@ function coth_anchor()
     return driverName
 end
 
-function coth_read_self()
-    local em = -1
-    pcall(function()
-        if (tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0) > 0 then
-            em = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or 0
+-- WHERE IS THE EMBLEM SOCKETED? An aug is readable as a sub-item of whatever it sits in -
+-- Me.Inventory[slot].Item[n] - so the equipped slots can be walked to find it.
+-- Worth knowing because the click only works from a CHARM. FindItem finds the aug wherever it is, so
+-- the current check says "you have it" for an emblem sitting in a primary, and then the summon quietly
+-- does nothing. That note in the settings tooltip is the only thing that has been enforcing it.
+-- Returns slot name and aug index, or nil.
+AUG_SLOTS = { 'charm', 'mainhand', 'offhand', 'ranged', 'head', 'chest', 'arms', 'wrist', 'hands',
+              'legs', 'feet', 'neck', 'back', 'waist', 'ear1', 'ear2', 'ring1', 'ring2',
+              'leftfinger', 'rightfinger', 'shoulder', 'face', 'powersource' }
+-- Find a named aug in any equipped slot. Returns slot, aug index, and the item carrying it.
+-- Generic because two things need it now: the CoTH emblem and the Nightveil emblem, both of which only
+-- fire from a charm and both of which FindItem will happily report from a bag.
+function find_aug(name)
+    for _, slot in ipairs(AUG_SLOTS) do
+        local carrier = ''
+        pcall(function() carrier = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+        if carrier ~= '' then
+            for a = 1, 6 do
+                local aug = ''
+                pcall(function() aug = tostring(mq.TLO.Me.Inventory(slot).Item(a).Name() or '') end)
+                if aug ~= '' and aug:lower() == (name or ''):lower() then
+                    return slot, a, carrier
+                end
+            end
         end
-    end)
+    end
+    return nil
+end
+function coth_find_aug() return find_aug(COTH.ITEM) end
+
+-- Say where it is and whether that will actually work. Called by /atcothaug and once at startup.
+function coth_aug_report(quiet)
+    local slot, idx, carrier = coth_find_aug()
+    if not slot then
+        local loose = 0
+        pcall(function() loose = tonumber(mq.TLO.FindItemCount('=' .. COTH.ITEM)()) or 0 end)
+        if loose > 0 then
+            log('\\ay[coth] %s is in your bags, not socketed - it must be in a CHARM to click\\ax', COTH.ITEM)
+        elseif not quiet then
+            log('[coth] no %s found on this character', COTH.ITEM)
+        end
+        return false
+    end
+    if slot == 'charm' then
+        if not quiet then
+            log('\\ag[coth] %s is aug %d in %s (charm) - good\\ax', COTH.ITEM, idx, carrier)
+        end
+        return true
+    end
+    -- Socketed, but somewhere the click will not reach.
+    log('\\ar[coth] %s is aug %d in %s (%s) - it must be in a CHARM to work\\ax',
+        COTH.ITEM, idx, carrier, slot)
+    return false
+end
+
+function coth_read_self()
+    -- OWNING IT IS NOT THE SAME AS BEING ABLE TO CLICK IT. FindItem finds the emblem wherever it is -
+    -- bags, a primary, a charm - so this reported "have it, ready" for an emblem that could never fire,
+    -- and the gather then picked that character as a summoner and got nothing.
+    -- Only a charm counts. Checked once and cached: augs do not move mid-fight, and walking twenty-odd
+    -- equipment slots every read would be silly.
+    local em = -1
+    if cothAugOk == nil then
+        local slot = coth_find_aug()
+        cothAugOk = (slot == 'charm')
+        if not cothAugOk then coth_aug_report(true) end
+    end
+    if cothAugOk then
+        pcall(function()
+            if (tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0) > 0 then
+                em = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or 0
+            end
+        end)
+    end
     local d, los = -1, 0
     local a = coth_anchor()
     if a and a:lower() == myName:lower() then
@@ -2771,6 +3150,19 @@ end
 
 local function di_tick()
     if not DI.auto then return end
+    -- Feigning: same reasoning as the rez chain. Casting DI stands the character up and undoes the feign,
+    -- and the whole point of a DI is to keep somebody alive - spending one at the cost of the caster's
+    -- own life is not a trade worth making. The election passes on.
+    if am_feigning() then
+        gate('feigning - not spending a DI, the chain moves on')
+        return
+    end
+    -- Invis: the same trade as feigning. Casting drops it, and a DI caster who becomes visible standing
+    -- over a dying group is usually about to join them. Mirrors the rez chain gate.
+    if am_invis() then
+        gate('invis - not spending a DI, the chain moves on')
+        return
+    end
     local now = mq.gettime()
 
     -- A CAST IN FLIGHT BLOCKS EVERYTHING. My own watch being open means I have a command out that has not
@@ -3313,9 +3705,12 @@ end
 -- item yet does not lock in the fallback forever.
 -- Do not even try beyond this. The clicky reports 200 of reach and we briefly attempted out to 300 on
 -- the theory that the reading might be stale - but with Distance3D on a 250ms tick it is current, and
--- every one of those long casts failed while burning a charge. 150 is inside the reach with room for
--- the boundary flicker that comes from a group moving.
-REZ_MAX_DIST = 150
+-- every one of those long casts failed while burning a charge.
+-- 100, NOT THE CLICKY'S REACH. The binding constraint is not how far the rez can be cast, it is how far
+-- a corpse can be DRAGGED - /corpse pulls a body from about 100 and does nothing beyond that. Rezzing
+-- from 150 casts fine and leaves the body where it fell, which is the case the drag exists to prevent.
+-- Gating on the shorter of the two means every rez we attempt is one where the corpse comes to us.
+REZ_MAX_DIST = 100
 -- ---------------------------------------------------------------------------
 -- Raid rezzes. Deliberately meaner than group rezzes on every axis:
 --   TOKENS ONLY   - the crown applies a debuff, and that is not ours to hand out to someone else's
@@ -3676,6 +4071,16 @@ end
 local function rez_tick()
     if #rezPriority == 0 then load_rez_priority() end   -- workers have no UI to load it; load here so their picker runs
     if rezWipe then return end        -- wipe called: nobody rezzes until this character zones
+    -- Feigning: standing up to cast would put this character straight back on the mob's list, which is
+    -- the exact thing the feign was for. The baton times out and moves to the next rezzer.
+    if am_invis() then
+        rezdbg('invis - not taking the rez, letting the chain move on')
+        return
+    end
+    if am_feigning() then
+        rezdbg('feigning - not taking the rez, letting the chain move on')
+        return
+    end
     if not rezAuto or #rezPriority == 0 then return end
     local now = mq.gettime()
 
@@ -3715,6 +4120,15 @@ local function rez_tick()
         if rez_kind_secs(rezCast.kind) == 0 and rezCast.tries < maxTries then   -- clicky still ready => it did not go off
             rezCast.tries = rezCast.tries + 1; rezCast.at = now
             rezlog('[rez] retry %d /nowcast me "%s" %d', rezCast.tries, rezCast.item, rezCast.id)
+            -- SUMMON AGAIN on the retry. A first cast that failed on range failed because the body was
+            -- too far, and going straight back to /nowcast repeats it from the same spot. /corpse needs
+            -- the corpse targeted, so re-target first - the picker's target may have moved on by now.
+            pcall(function() mq.cmdf('/target id %d', rezCast.id) end)
+            mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == rezCast.id end)
+            if (tonumber(mq.TLO.Target.ID()) or 0) == rezCast.id then
+                pcall(function() mq.cmd('/corpse') end)
+                mq.delay(250)
+            end
             pcall(function() mq.cmdf('/nowcast me "%s" %d', rezCast.item, rezCast.id) end)
             return
         end
@@ -4128,11 +4542,25 @@ local function rez_tick()
     -- needs the corpse targeted, which it is by this point.
     -- Deliberately NOT gated on distance. Reading a distance to decide whether to try is another read
     -- that can be wrong; issuing it unconditionally cannot be.
+    -- SAY WHETHER IT DID ANYTHING. This was issued silently, so a log could not distinguish "dragged the
+    -- body to my feet" from "did nothing at all" - and the answer matters, because /corpse only reaches a
+    -- short radius and needs the owner's consent for anyone else's corpse. Measured, not assumed.
+    local dBefore = tgtDist
+    pcall(function() dBefore = tonumber(mq.TLO.Spawn(tgtID).Distance()) or tgtDist end)
     pcall(function() mq.cmd('/corpse') end)
     mq.delay(250)
+    local dAfter = dBefore
+    pcall(function() dAfter = tonumber(mq.TLO.Spawn(tgtID).Distance()) or dBefore end)
+    if math.abs(dBefore - dAfter) >= 1 then
+        rezlog('[rez] /corpse pulled %s from %dm to %dm', tgtName, dBefore, dAfter)
+    else
+        rezlog('[rez] /corpse did nothing on %s (still %dm) - out of drag range, or no consent', tgtName, dAfter)
+    end
     rezlog('[rez] FIRING /nowcast me "%s" %d (target %s @%dm, reach %d)', item, tgtID, tgtName, tgtDist, rez_range())
     pcall(function() mq.cmdf('/nowcast me "%s" %d', item, tgtID) end)
-    pcall(function() mq.cmdf('/gsay %s %s on %s', (myClicky == 'cotw') and 'Cast' or 'Clicked', item, tgtName) end)   -- announce the rez in group chat
+    pcall(function() mq.cmdf('/gsay %s %s on %s',
+        (myClicky == 'cotw' or myClicky == 'divine') and 'Cast' or 'Clicked',
+        rez_short(myClicky), tgtName) end)   -- short name only: the full one trips other chat parsers
     lastRezFire = now
     -- kind is carried so the retry and died-mid-cast paths know which timer proves the cast went off
     rezCast = { id = tgtID, item = item, kind = myClicky, at = now, tries = 1, name = tgtName, far = tgtFar }
@@ -4297,11 +4725,12 @@ pcall(function()
     mq.bind('/at_epadd', function(id, nm)
         id = tonumber(id); if not id or ep_find(id) then return end
         epQueue[#epQueue + 1] = { id = id, name = (nm or '?'):gsub('_', ' '), oor = false }
+        ep_queue_log('peer add')
     end)
     mq.bind('/at_epdel', function(id)
         local i = ep_find(tonumber(id) or 0); if i then table.remove(epQueue, i) end
     end)
-    mq.bind('/at_epclear', function() epQueue, epDoneAt = {}, nil end)
+    mq.bind('/at_epclear', function() epQueue, epDoneAt = {}, nil; ep_queue_log('cleared') end)
     mq.bind('/at_epmark', function(id, st)
         local _, e = ep_find(tonumber(id) or 0)
         if e then e.state, e.oor = st, false end
@@ -4402,6 +4831,161 @@ pcall(function()
         local nm = (a and a ~= '') and a:gsub('_', ' ') or 'Diamond Coin'
         altReclaimWant = { name = nm }
     end)
+    -- WHAT DOES THIS CLIENT ACTUALLY CALL AN AUG? find_aug reads Me.Inventory[slot].Item[n], which is the
+    -- obvious shape and may simply be wrong here - the same way Me.Book was wrong for an AA earlier.
+    -- Tries several forms against the charm and prints all of them, so the right one is data rather than
+    -- another guess.
+    -- WHICH RANGE MEMBER ACTUALLY REFLECTS MY FOCUS? MyRange is documented as "YOUR actual cast range,
+    -- including extended range from focus effects" - so if it matches Range here, this build is not
+    -- applying the focus and something else has to be read.
+    -- Location and AERange are the only other distance-ish members on the spell type; both are printed
+    -- rather than guessed at.
+    mq.bind('/atrange', function(spellArg)
+        local sp = (spellArg and spellArg ~= '') and spellArg:gsub('_', ' ') or ep_spell()
+        if not sp then log('[range] no spell - mem placate or pass a name'); return end
+        log('[range] "%s"', sp)
+        for _, m in ipairs({ 'MyRange', 'Range', 'AERange', 'Location' }) do
+            local v = 'n/a'
+            pcall(function() v = tostring(mq.TLO.Spell(sp)[m]() or 'nil') end)
+            log('   %-9s %s', m, v)
+        end
+        log('   ep_range() currently returns %d', ep_range())
+        log('   focus ratio, from the memmed gems:')
+        for g = 1, 12 do
+            local gn = ''
+            pcall(function() gn = tostring(mq.TLO.Me.Gem(g).Name() or '') end)
+            if gn ~= '' and gn ~= 'NULL' then
+                local mr, rr = 0, 0
+                pcall(function() mr = tonumber(mq.TLO.Spell(gn).MyRange()) or 0 end)
+                pcall(function() rr = tonumber(mq.TLO.Spell(gn).Range()) or 0 end)
+                local ben = true
+                pcall(function() ben = (tostring(mq.TLO.Spell(gn).Beneficial()) == 'TRUE') end)
+                if rr > 0 then
+                    log('     gem %-2d %-26s %-5s Range %-5s MyRange %-5s %s', g, gn:sub(1, 26),
+                        ben and 'ben' or 'DET', tostring(rr), tostring(mr),
+                        (mr > rr) and string.format('= %.2fx', mr / rr) or '')
+                end
+            end
+        end
+    end)
+    -- BRUTE FORCE. The timer exists somewhere - the client knows perfectly well the thing is on cooldown -
+    -- and guessing member names one at a time has not found it. So try every plausible name against every
+    -- plausible object and print whatever answers.
+    -- Anything that returns a value at all is a lead; anything that errors or returns NULL is ruled out
+    -- for good. One command instead of another twenty rounds.
+    mq.bind('/atnvdump', function()
+        local charm = ''
+        pcall(function() charm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+        log('[nvdump] charm = "%s", aug = "%s"', charm, NIGHTVEIL_ITEM)
+
+        local MEMBERS = { 'TimerReady', 'Timer', 'Clicky', 'EffectType', 'Spell', 'CastTime',
+                          'ID', 'Name', 'Stackable', 'Type', 'Charges', 'MaxCharges',
+                          'ItemDelay', 'RecastTime', 'RecastTimerID', 'Ready', 'CanUse' }
+
+        local function try(label, get)
+            local ok, v = pcall(get)
+            if ok and v ~= nil then
+                local t = tostring(v)
+                if t ~= '' and t ~= 'NULL' then log('   %-46s = %s', label, t) end
+            end
+        end
+
+        log('[nvdump] --- the AUG, via the charm ---')
+        for _, m in ipairs(MEMBERS) do
+            try('Me.Inventory[charm].Item[1].' .. m,
+                function() return mq.TLO.Me.Inventory('charm').Item(1)[m]() end)
+        end
+        log('[nvdump] --- the AUG spell ---')
+        for _, m in ipairs({ 'Name', 'ID', 'RecastTime', 'RecastTimerID', 'Duration', 'MyDuration' }) do
+            try('...Item[1].Spell.' .. m,
+                function() return mq.TLO.Me.Inventory('charm').Item(1).Spell[m]() end)
+        end
+        log('[nvdump] --- the CHARM ---')
+        for _, m in ipairs(MEMBERS) do
+            try('Me.Inventory[charm].' .. m,
+                function() return mq.TLO.Me.Inventory('charm')[m]() end)
+        end
+        log('[nvdump] --- FindItem on each name ---')
+        for _, nm in ipairs({ charm, NIGHTVEIL_ITEM }) do
+            if nm ~= '' then
+                for _, m in ipairs({ 'TimerReady', 'Timer', 'ID', 'ItemSlot', 'ItemSlot2' }) do
+                    try(string.format('FindItem[=%s].%s', nm:sub(1, 22), m),
+                        function() return mq.TLO.FindItem('=' .. nm)[m]() end)
+                end
+                try('Me.ItemReady[' .. nm:sub(1, 22) .. ']', function() return mq.TLO.Me.ItemReady(nm)() end)
+                try('Cast.Ready[' .. nm:sub(1, 22) .. ']', function() return mq.TLO.Cast.Ready(nm)() end)
+            end
+        end
+        log('[nvdump] --- the spell it grants, as a spell ---')
+        local sp = ''
+        pcall(function() sp = tostring(mq.TLO.Me.Inventory('charm').Item(1).Spell.Name() or '') end)
+        if sp ~= '' then
+            for _, m in ipairs({ 'RecastTime', 'RecastTimerID', 'ID' }) do
+                try('Spell[' .. sp:sub(1, 20) .. '].' .. m, function() return mq.TLO.Spell(sp)[m]() end)
+            end
+            try('Me.Buff[' .. sp:sub(1, 20) .. '].Duration', function() return mq.TLO.Me.Buff(sp).Duration() end)
+            try('Me.Song[' .. sp:sub(1, 20) .. '].Duration', function() return mq.TLO.Me.Song(sp).Duration() end)
+            try('Me.SpellReady[' .. sp:sub(1, 20) .. ']', function() return mq.TLO.Me.SpellReady(sp)() end)
+        end
+        log('[nvdump] --- gem/recast timers, in case it shares one ---')
+        try('Me.CombatAbilityReady[' .. NIGHTVEIL_ITEM .. ']',
+            function() return mq.TLO.Me.CombatAbilityReady(NIGHTVEIL_ITEM)() end)
+        log('[nvdump] done - anything printed above exists; anything absent does not.')
+    end)
+    mq.bind('/atnv', function()
+        local nm = NIGHTVEIL_ITEM
+        log('[nv] probing "%s"', nm)
+        local charm = ''
+        pcall(function() charm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+        log('   charm item        : %s', (charm ~= '') and charm or '(empty)')
+        for a = 1, 6 do
+            local v1, v2 = '', ''
+            pcall(function() v1 = tostring(mq.TLO.Me.Inventory('charm').Item(a).Name() or '') end)
+            pcall(function() v2 = tostring(mq.TLO.Me.Inventory('charm').AugSlot(a)() or '') end)
+            if v1 ~= '' or v2 ~= '' then
+                log('   charm aug %d       : Item[%d]="%s"  AugSlot[%d]="%s"', a, a, v1, a, v2)
+            end
+        end
+        local cnt, rdy, itemslot = 0, -1, ''
+        pcall(function() cnt = tonumber(mq.TLO.FindItemCount('=' .. nm)()) or 0 end)
+        pcall(function() rdy = tonumber(mq.TLO.FindItem('=' .. nm).TimerReady()) or -1 end)
+        pcall(function() itemslot = tostring(mq.TLO.FindItem('=' .. nm).ItemSlot() or '') end)
+        log('   FindItemCount     : %d', cnt)
+        local ir, cr = 'n/a', 'n/a'
+        pcall(function() ir = tostring(mq.TLO.Me.ItemReady(nm)()) end)
+        pcall(function() cr = tostring(mq.TLO.Cast.Ready(nm)()) end)
+        log('   FindItem.TimerReady: %s   <- honest ONLY if a loose copy is carried', tostring(rdy))
+        log('   Me.ItemReady      : %s   <- what the working clicky macros use', ir)
+        log('   Cast.Ready        : %s   (MQ2Cast, if loaded)', cr)
+        -- The CHARM's own readings. An aug lends its clicky to the item it sits in, so these are the
+        -- ones most likely to reflect a real cooldown.
+        local cname, cready, ctimer = '', 'n/a', 'n/a'
+        pcall(function() cname = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+        if cname ~= '' then
+            pcall(function() cready = tostring(mq.TLO.Me.ItemReady(cname)()) end)
+            pcall(function() ctimer = tostring(mq.TLO.Me.Inventory('charm').TimerReady()) end)
+        end
+        log('   charm "%s":', (cname ~= '') and cname or 'none')
+        log('     Me.ItemReady    : %s', cready)
+        log('     charm.TimerReady: %s', ctimer)
+        log('   FindItem.ItemSlot : %s', (itemslot ~= '') and itemslot or 'n/a')
+        local slot, idx, carrier = find_aug(nm)
+        log('   find_aug()        : %s', slot and (slot .. ' aug ' .. tostring(idx) .. ' in ' .. tostring(carrier))
+                                              or 'NOT FOUND - this is why the button refuses')
+        local rpk, rsi = nv_loose_slot()
+        log('   nv_loose()        : %d   at pack%s slot%s', nv_loose(), tostring(rpk), tostring(rsi))
+        nv_refresh(true)
+        mq.delay(400)
+        log('   after poke        : TimerReady=%s ItemReady=%s',
+            tostring(mq.TLO.FindItem('=' .. nm).TimerReady()), tostring(mq.TLO.Me.ItemReady(nm)()))
+        log('   nvReadOK          : %s   (has this char ever reported a real countdown)', tostring(nvReadOK))
+        log('   nv_secs()         : %d   (-1 = no read available)', nv_secs())
+        log('   nv_state()        : %d   (-1 means unusable)', nv_state())
+    end)
+    mq.bind('/atcothaug', function()
+        cothAugOk = nil          -- re-check: this is the command you run after moving the aug
+        coth_aug_report(false)
+    end)
     mq.bind('/atcurrency', function()
         log('[currency] item counts vs alt-currency balances:')
         log('   window open: %s  (not required - the list reads either way)',
@@ -4498,6 +5082,196 @@ pcall(function()
             arcState[char] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
                                up = tonumber(up) or 0, updated = mq.gettime() }
         end
+    end)
+    mq.bind('/at_nvstate', function(char, secs)
+        if not char then return end
+        -- -1 means no emblem in a charm; -2 means it has one and it is down. Both are "not clickable",
+        -- but only the first means the character is not set up for this.
+        local n = tonumber(secs) or -1
+        nvState[char] = { ok = (n ~= -1) and 1 or 0, secs = n, updated = mq.gettime() }
+    end)
+    -- Click my own Nightveil. Sent by the driver's buttons; refuses rather than clicking a spare from a
+    -- bag, which is the whole reason this is aug-aware.
+-- THE CLICK METHODS, in the order they are tried. Hoisted out of the bind so /atnvtest can fire exactly
+-- one of them: a discovery run costs the whole two-hour pool, so being able to spend that shot on a
+-- single named method - and wait out the cooldown before spending the next - is worth more than an
+-- automatic sweep that has to guess which of eight actually landed.
+function nv_methods()
+    local myID = 0
+    pcall(function() myID = tonumber(mq.TLO.Me.ID()) or 0 end)
+    local carrier = nv_carrier()
+    local sp = nv_spell()
+    return {
+        -- CONFIRMED IN GAME 2026-08-05: E3's /nowcast with the aug BY NAME starts the cooldown. Two
+        -- beliefs in this file were wrong - that the aug's own name was the wrong object to ask about,
+        -- and that E3 could not resolve an aug. It resolves it fine.
+        -- The target id is NOT a differentiator either way: the effect lands on the caster whatever is
+        -- targeted, so passing one or omitting one cannot be what makes a method work. That also means
+        -- the other /nowcast forms below are probably fine too - they are simply unconfirmed. First
+        -- place here means observed to work, not proven uniquely correct.
+        { name = '/nowcast (E3), aug by name, no target id',
+          run  = function() mq.cmdf('/nowcast me "%s%s"', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS) end },
+            -- MQ2Cast FIRST. Cast.Ready answered correctly about the charm while everything else lied,
+            -- so it is the one thing here that demonstrably understands this item - which makes it the
+            -- most likely to be able to click it too.
+            { name = '/casting the charm, as an item',
+              run  = function() if carrier then mq.cmdf('/casting "%s" item', carrier) end end },
+            { name = '/casting the charm, by slot',
+              run  = function() if carrier then mq.cmdf('/casting "%s" charm', carrier) end end },
+            { name = '/casting the granted spell',
+              run  = function() if sp then mq.cmdf('/casting "%s"', sp) end end },
+            { name = '/itemnotify charm (the item the aug is in)',
+              run  = function() mq.cmd('/itemnotify charm rightmouseup') end },
+            { name = '/useitem the charm by name',
+              run  = function() if carrier then mq.cmdf('/useitem "%s"', carrier) end end },
+            { name = '/nowcast the charm by name',
+              run  = function()
+                  if carrier then mq.cmdf('/nowcast me "%s%s" %d', carrier, NIGHTVEIL_OPTS, myID) end
+              end },
+            { name = '/nowcast with my spawn id (as CoTH does)',
+              run  = function() mq.cmdf('/nowcast me "%s%s" %d', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS, myID) end },
+            { name = '/useitem by name',
+              run  = function() mq.cmdf('/useitem "%s"', NIGHTVEIL_ITEM) end },
+            { name = '/itemnotify aug in charm',
+              run  = function() mq.cmdf('/itemnotify "%s" rightmouseup', NIGHTVEIL_ITEM) end },
+            { name = '/casting by name, item',
+              run  = function() mq.cmdf('/casting "%s" item', NIGHTVEIL_ITEM) end },
+    }
+end
+
+    -- ONE METHOD, ONE SHOT, NO GUESSING. `/atnvtest` lists them; `/atnvtest 6` fires only number 6 and
+    -- reports what actually changed. The automatic sweep cannot attribute a success honestly when the
+    -- methods are seconds apart and a buff takes time to land - it credits whichever method happened to
+    -- be running when the buff from the previous one arrived. This spends the pool deliberately instead.
+    mq.bind('/atnvtest', function(which)
+        local methods = nv_methods()
+        local n = tonumber(which)
+        if not n then
+            log('[nvtest] %d methods - run /atnvtest <n> to fire exactly one:', #methods)
+            for i, m in ipairs(methods) do log('   %d. %s', i, m.name) end
+            log('[nvtest] loose copy to poke: %s', nv_loose_slot() and 'yes' or 'NO - result will rest on the buff alone')
+            return
+        end
+        if not methods[n] then log('\\ar[nvtest] no method %d\\ax', n); return end
+        if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then
+            log('\\ay[nvtest] %s is not in my charm - nothing to test\\ax', NIGHTVEIL_ITEM); return
+        end
+        -- BEFORE. Poked first so the number is current rather than the stale 0 the field decays to.
+        nv_refresh(true); mq.delay(400)
+        local before = nv_secs()
+        local bb = 0
+        pcall(function() bb = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
+        if bb == 0 then pcall(function() bb = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
+        if before > 0 then
+            log('\\ay[nvtest] already on cooldown (%ds left) - this proves nothing, wait it out\\ax', before)
+            return
+        end
+        log('[nvtest] %d. %s   before: secs=%d buff=%s', n, methods[n].name, before, (bb > 0) and 'up' or 'down')
+        pcall(methods[n].run)
+        -- A FULL SIX SECONDS. Long enough for a cast to finish and the buff to register, so a slow
+        -- success is not recorded as a failure.
+        mq.delay(6000)
+        nv_refresh(true); mq.delay(400)
+        local after = nv_secs()
+        local ab = 0
+        pcall(function() ab = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
+        if ab == 0 then pcall(function() ab = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
+        log('[nvtest] %d. %s   after : secs=%d buff=%s', n, methods[n].name, after, (ab > 0) and 'up' or 'down')
+        if after > 0 then
+            log('\\ag[nvtest] METHOD %d WORKS - cooldown started (%ds)\\ax', n, after)
+            nvMethod = n
+        elseif ab > 0 and bb == 0 then
+            log('\\ag[nvtest] METHOD %d landed the buff (no timer to confirm with - no loose copy)\\ax', n)
+            nvMethod = n
+        else
+            log('\\ar[nvtest] method %d did nothing\\ax', n)
+        end
+        nvLast = ''
+    end)
+
+    mq.bind('/at_nvclick', function()
+        local slot = find_aug(NIGHTVEIL_ITEM)
+        if slot ~= 'charm' then
+            log('\\ay[nv] %s is not in my charm%s - not clicking\\ax', NIGHTVEIL_ITEM,
+                slot and (' (it is in ' .. slot .. ')') or '')
+            return
+        end
+        -- POKE BEFORE ASKING. Between the ten-minute refreshes the loose copy's timer decays to a stale
+        -- 0, and a fresh session has never read it at all - so without this the gate can wave through a
+        -- click on a live cooldown, and the method loop then works its way through all eleven failing.
+        nv_refresh(true)
+        mq.delay(400)
+        local left = nv_secs()
+        if left > 0 then
+            log('[nv] %s is not ready - %dm %ds left', NIGHTVEIL_ITEM, math.floor(left / 60), left % 60)
+            nvLast = ''   -- push the real number out so the button matches what just happened
+            return
+        end
+        -- E3'S /nowcast IS THE ONE THAT WORKS - the opposite of what this comment used to claim. It was
+        -- ruled out on the theory that E3 cannot resolve an aug; it resolves it fine, by the aug's own
+        -- name, with no target id. The rest are kept as fallbacks for builds where it does not.
+        -- FOUR METHODS, TRIED IN ORDER, and whichever works is remembered. Guessing which one this build
+        -- supports has cost several rounds already; asking the client once and caching the answer costs
+        -- one slow first click.
+        -- Success is judged by the item going ON COOLDOWN, not by the command returning - a command that
+        -- does nothing returns just as happily as one that works.
+        log('[nv] clicking %s', NIGHTVEIL_ITEM)
+        local slotName, augIdx = find_aug(NIGHTVEIL_ITEM)
+        -- MY OWN SPAWN ID, because that is the one difference between this and the CoTH emblem - which is
+        -- also an aug, also in a charm, and works. It passes a target id; this did not. E3's /nowcast
+        -- appears to want one even for something that lands on the caster.
+        -- Tried FIRST for that reason: the working example next door is better evidence than any of the
+        -- alternatives below, all of which were guesses.
+        local methods = nv_methods()
+        -- All copies share pool 71, so reading by name is correct - a spare in a bag shows the same
+        -- timer as the charmed one. FindItem IS picking up the spare, and that is the only reason this
+        -- read works at all: the socketed copy has no readable timer. Where no spare is carried
+        -- nv_ready() returns true unconditionally, so success here rests on the BUFF check alone.
+        -- The BUFF is checked as well, because an effect that landed proves the click worked whatever a
+        -- timer says.
+        -- Success = no longer ready, OR the buff appeared. Judging by TimerReady alone is what made every
+        -- method look like a failure: it stayed at 0 throughout, so nothing could ever be seen to work.
+        local function on_cooldown()
+            -- POKE FIRST. The loose copy's timer is stale at 0 until right-clicked, so asking straight
+            -- after a click reads "still ready" even when the click landed - which is precisely how
+            -- every method came to look broken before the refresh existed.
+            nv_refresh(true)
+            mq.delay(400)
+            if nv_secs() > 0 then return true end
+            local b = 0
+            pcall(function() b = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
+            if b == 0 then pcall(function() b = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
+            return b > 0
+        end
+
+        local order = {}
+        if nvMethod then order[#order + 1] = methods[nvMethod] end       -- the one that worked last time
+        for i, m in ipairs(methods) do if i ~= nvMethod then order[#order + 1] = m end end
+
+        local worked = nil
+        for _, m in ipairs(order) do
+            pcall(m.run)
+            -- LONG ENOUGH FOR A BUFF TO LAND. At 1.5s a click that worked was still in flight when the
+            -- next method fired, and the buff arriving mid-window handed the credit to whichever method
+            -- happened to be running - which is how /nowcast came to look like the winner on Sebbun.
+            mq.delay(NV_METHOD_WAIT_MS, on_cooldown)
+            if on_cooldown() then worked = m.name; break end
+            log('[nv] %s did nothing, trying the next method', m.name)
+        end
+        if worked then
+            for i, m in ipairs(methods) do if m.name == worked then nvMethod = i end end
+            log('\\ag[nv] %s clicked via %s\\ax', NIGHTVEIL_ITEM, worked)
+            nv_mark_clicked()   -- the only cooldown a no-spare toon will ever know about
+        else
+            log('\\ar[nv] could not click %s - none of the %d methods put it on cooldown. It is aug %s in %s.\\ax',
+                NIGHTVEIL_ITEM, #methods, tostring(augIdx), tostring(slotName))
+        end
+        -- POKE IMMEDIATELY. Otherwise the fresh cooldown is invisible until the next scheduled refresh,
+        -- up to ten minutes of a button that says ready when it is not.
+        nv_refresh(true)
+        mq.delay(400)
+        nv_secs()     -- pick the new countdown up now so the push below carries it
+        nvLast = ''   -- force a fresh push so the button greys immediately
     end)
     mq.bind('/at_potstate', function(char, key, carries, up, secs, dsecs)
         if not char or not key then return end
@@ -4685,8 +5459,11 @@ pcall(function()
     mq.bind('/at_pot', function(key)   -- group draught button: drink the best tier I hold
         local base = pot_base_for(key)
         if not base then return end
-        local ok, nm = pot_drink(base)
+        local ok, nm, why = pot_drink(base)
         if ok then log('[pot] %s sent', nm)      -- "landed" only once pot_retry_tick has seen it
+        -- A refusal is a decision, not a failure, so it says which decision. A press that does nothing
+        -- and prints nothing is indistinguishable from a broken button.
+        elseif why then log('[pot] %s', why)
         elseif nm then log('[pot] %s on cooldown', nm)
         else log('[pot] no %s carried', base) end
     end)
@@ -4960,6 +5737,20 @@ pcall(function()
     -- three cast times spent proving something the first message already told us - and worse, it looks
     -- exactly like a resist, which IS worth retrying. This tells the two apart.
     -- Marks whichever queue currently has a cast in flight; both use the same "did it land" question.
+    -- THE CLIENT TELLING US IT IS DOWN. Catches the two cases self-tracking cannot see on its own: a
+    -- fresh session with no history, and a click made by hand outside the script. The message costs
+    -- nothing to provoke and settles the question absolutely - if the client refuses on recast, the pool
+    -- is down whatever our own bookkeeping says.
+    -- It cannot tell us HOW LONG is left, so it assumes a full cycle. That overshoots when the refusal
+    -- comes late in the cooldown, which is the safe direction to be wrong in: a button that greys too
+    -- long costs a few minutes, one that greys too little wastes the whole two hours on a refused click.
+    mq.event('at_nv_recast', 'Spell recast time not yet met#*#', function()
+        if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then return end
+        if nv_secs() > 0 then return end        -- already counting; the refusal tells us nothing new
+        log('[nv] the client refused on recast - marking %s down', NIGHTVEIL_ITEM)
+        nv_mark_clicked()
+        nvLast = ''
+    end)
     mq.event('at_ep_immune', 'Your target looks unaffected#*#', function()
         if epCast then
             rezlog('[placate] %s is immune - not retrying', epCast.name)
@@ -5382,9 +6173,12 @@ miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the min
 miniArcane      = false   -- show the Arcane Reprisal row in the mini window
 miniPhantom     = false   -- show the Phantom Whispers queue in the mini window
 miniPlacate     = false   -- show the enchanter Placate queue in the mini window
+miniNightveil   = false   -- show the Nightveil emblem buttons in the mini window
 epState         = {}      -- char -> true when that toon is the enchanter working the queue
 epLast          = 0
 epSaidGem       = nil     -- last gem contents we spoke about, so it is said once not every tick
+epGemSaidAt     = 0       -- rate-limit for the 'waiting on the gem' line
+epOorSaidAt     = 0       -- rate-limit for the 'out of range' line
 epMemAt         = nil     -- when we last issued a /memspell, so we do not stack attempts
 epPrevTarget    = 0       -- the caller's target when the run started; put back when the queue finishes
 epTestWant      = nil     -- set by /atplacatetest; the MAIN LOOP runs the soak, not the bind callback
@@ -7049,7 +7843,9 @@ function group_pot(key)
     local base, label = pot_base_for(key)
     if not base then return end
     log('[pot] %s', label)
-    pot_drink(base)
+    local ok2, nm2, why2 = pot_drink(base)
+    if not ok2 and why2 then log('[pot] %s', why2)
+    elseif not ok2 and nm2 then log('[pot] %s on cooldown', nm2) end
     for _, nm in ipairs(group_members()) do
         if nm:lower() ~= myName:lower() then peer_cmdf(nm, '/at_pot %s', key) end
     end
@@ -8076,6 +8872,10 @@ epCast     = nil         -- { id, name, at, tries }
 epDoneAt   = nil
 EP_RECAST  = 1500        -- gap between casts; placate is quick, this is just breathing room
 EP_CHECK_AFTER = 1000    -- pause after the cast completes before looking at the mob
+-- How many ticks we will spend trying to get back onto a mob to READ it. Separate from EP_RETRY, which
+-- counts re-CASTS: failing to look is not the same as failing to cast, and spending a cast because the
+-- target slipped is the bug this exists to avoid.
+EP_CHECK_TRIES = 8
 EP_RETRY   = 3
 EP_LINGER  = 8000
 
@@ -8250,10 +9050,95 @@ function ep_ensure_gem()
     return true
 end
 
+-- CAST RANGE FOR PLACATE. Read from the spell, cached, exactly as the phantom line does.
+-- This was missing entirely, and the 2026-08-03 log shows what that costs: a queue where the first three
+-- mobs landed and the last three each burned three casts and were marked failed. Nothing was wrong with
+-- them - they were simply further away, because they were clicked later while the group moved.
+-- Three wasted casts per mob, and a red (--) against a mob that was never given a fair attempt.
+EP_RANGE_FALLBACK = 200
+-- How long a mob may sit out of reach before it is given up on. Long enough for a pull to close the
+-- distance, short enough that one stuck mob cannot hold the gear off indefinitely.
+EP_FAR_MAX = 45000
+epRangeCache = nil
+function ep_range()
+    if epRangeCache then return epRangeCache end
+    local sp = ep_spell(); if not sp then return EP_RANGE_FALLBACK end
+    -- DERIVE THE FOCUS FROM A SPELL THAT REPORTS IT. MyRange is documented to include focus effects and
+    -- does so for other spells on this build - Mind Shatter reads 279 against a smaller base - but for
+    -- Placate it comes back at the base value. So the focus IS readable, just not through this spell.
+    -- Walk the memmed gems, find any spell where MyRange exceeds Range, and take that ratio: the focus is
+    -- a property of the CHARACTER, not of the individual spell, so it applies to placate too.
+    -- Self-calibrating and needs no configuration - it re-reads whenever the cache is cleared, so
+    -- swapping a focus item corrects itself.
+    local base = 0
+    for _, m in ipairs({ 'MyRange', 'Range', 'Location' }) do
+        local v = 0
+        pcall(function() v = tonumber(mq.TLO.Spell(sp)[m]()) or 0 end)
+        if v > base then base = v end
+    end
+
+    -- DETRIMENTAL SPELLS ONLY. Extended range is a different focus for beneficial and detrimental
+    -- spells, so a ratio taken from a heal or a buff would be the wrong number for placate - which is
+    -- detrimental. Sampling the wrong kind would give a confident answer that is simply not ours.
+    -- Highest ratio among them wins: erring long means occasionally casting at something a little out
+    -- of reach, erring short means skipping mobs we could have placated.
+    local ratio, from = 1.0, nil
+    for g = 1, 12 do
+        local gn = ''
+        pcall(function() gn = tostring(mq.TLO.Me.Gem(g).Name() or '') end)
+        if gn ~= '' and gn ~= 'NULL' then
+            local ben = true
+            pcall(function() ben = (tostring(mq.TLO.Spell(gn).Beneficial()) == 'TRUE') end)
+            if not ben then
+                local mr, rr = 0, 0
+                pcall(function() mr = tonumber(mq.TLO.Spell(gn).MyRange()) or 0 end)
+                pcall(function() rr = tonumber(mq.TLO.Spell(gn).Range()) or 0 end)
+                if rr > 0 and mr > rr then
+                    local this = mr / rr
+                    if this > ratio then ratio, from = this, gn end
+                end
+            end
+        end
+    end
+
+    local r = base
+    if from then
+        r = math.floor(base * ratio)
+        rezlog('[placate] range focus %.2fx read from %s - %d base becomes %d', ratio, from, base, r)
+    end
+    if r > 0 then
+        epRangeCache = r
+        rezlog('[placate] cast range resolved to %d from %s', r, sp)
+        return r
+    end
+    return EP_RANGE_FALLBACK
+end
+
 function ep_gem_ready()
     local t = -1
     pcall(function() t = tonumber(mq.TLO.Me.GemTimer(epGem).TotalSeconds()) or -1 end)
     return t == 0
+end
+
+-- A ONE-LINE SNAPSHOT OF THE QUEUE, logged whenever it CHANGES. Reports of placate "jumping around the
+-- list" are impossible to chase from the cast lines alone: those say what was targeted, not what the
+-- queue looked like when it chose. This prints the whole thing with every state, so a session log can be
+-- read back as a sequence rather than inferred from which mob happened to be cast at.
+-- Change-gated, not every tick, so it costs nothing when the queue is stable.
+epQueueSig = ''
+function ep_queue_log(why)
+    local parts = {}
+    for i, e in ipairs(epQueue) do
+        -- ID as well as name. A zone full of lavaspinners produces a queue of identically-named
+        -- entries, and a log that cannot tell two of them apart is a log that makes the queue look like
+        -- it jumped backwards when it did nothing of the sort.
+        parts[#parts + 1] = string.format('%d:%s#%d=%s', i, (e.name or '?'):sub(1, 14),
+                                          e.id or 0, e.state or 'pending')
+    end
+    local sig = table.concat(parts, ' | ')
+    if sig == epQueueSig then return end
+    epQueueSig = sig
+    rezlog('[placate] queue (%s): %s', why or 'changed', (sig ~= '') and sig or '(empty)')
 end
 
 function ep_find(id)
@@ -8265,7 +9150,8 @@ function ep_mark(id, state, why)
     local _, e = ep_find(id)
     if not e or e.state then return end
     e.state, e.oor = state, false
-    rezlog('[placate] %s - %s', e.name or ('id ' .. id), why)
+    rezlog('[placate] %s#%d - %s', e.name or '?', id or 0, why)
+    ep_queue_log('after mark')
     pcall(function() peer_bcast('/at_epmark %d %s', id, state) end)
 end
 
@@ -8305,9 +9191,32 @@ function ep_stow_cursor()
     return false
 end
 
+-- RE-ENTRANT ON PURPOSE, up to EP_STRIP_PASSES. Conceding a slot after three pickup attempts and then
+-- refusing to cast because that slot is occupied is a deadlock: the strip will not try again and the
+-- cast guard will not relent, so the run spins until the 180s backstop tears it down and the next run
+-- walks into the same wall. Observed on Shela 2026-08-05 - the offhand needed three attempts and got
+-- them, the mainhand needed a fourth and did not.
+-- Re-running is safe as long as epSaved is not clobbered: a slot stripped on pass one now reads empty,
+-- and overwriting its saved name with '' would lose the item's identity for the restore.
+EP_STRIP_PASSES = 3
+epStripPass     = 0
+epNotReadyAt    = 0
+
 function ep_strip()
-    if epSaved then return true end
-    epSaved, epStripAt = {}, mq.gettime()
+    if epSaved then
+        local stuck = false
+        for _, sl in ipairs(EP_SLOTS) do
+            local w = ''
+            pcall(function() w = tostring(mq.TLO.Me.Inventory(sl).Name() or '') end)
+            if w ~= '' then stuck = true; break end
+        end
+        if not stuck then return true end
+        if epStripPass >= EP_STRIP_PASSES then return true end   -- caller decides what to do about it
+        epStripPass = epStripPass + 1
+        rezlog('[placate] a slot is still equipped - strip pass %d of %d', epStripPass, EP_STRIP_PASSES)
+    else
+        epSaved, epStripAt, epStripPass = {}, mq.gettime(), 1
+    end
     -- PAUSE E3 FOR THE WHOLE RUN. Everything from here to the re-equip is cursor work and casting, and a
     -- live E3 grabs the cursor, re-targets and re-equips underneath it - it will happily put the weapons
     -- straight back on while we are trying to take them off, and re-target mid-placate.
@@ -8331,13 +9240,15 @@ function ep_strip()
     for _, slot in ipairs(EP_SLOTS) do
         local nm0 = ''
         pcall(function() nm0 = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
-        epSaved[slot] = nm0
+        -- Only record it the first time. On a re-strip pass an already-removed slot reads empty, and
+        -- writing that over the saved name is how the restore forgets what to put back.
+        if (epSaved[slot] or '') == '' then epSaved[slot] = nm0 end
     end
     ep_recovery_write()
     for _, slot in ipairs(EP_SLOTS) do
         local nm = ''
         pcall(function() nm = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
-        epSaved[slot] = nm
+        if (epSaved[slot] or '') == '' then epSaved[slot] = nm end   -- never clobber on a re-strip pass
         -- SAY WHAT WE READ AND WHAT WE DID, per slot. Two attempts at this have failed silently: first
         -- because the slot names were wrong and every read came back empty, then again for a reason the
         -- logs could not show because nothing logged the intermediate steps. A strip that does nothing
@@ -8345,26 +9256,64 @@ function ep_strip()
         if nm == '' then
             rezlog('[placate]   %s: reads empty - nothing to take off', slot)
         else
+            -- VERIFY EVERY STEP, one slot at a time. This used to fire the commands and check the slot
+            -- afterwards, which is fast and wrong: the client can be mid-move when the next command
+            -- arrives, and three items going through one cursor is exactly where that bites.
+            -- Pick up -> confirm THE RIGHT ITEM is on the cursor -> stow -> confirm the cursor is empty.
+            -- Slower by a fraction of a second per item, against an epic in the wrong place.
             clear_cursor()
-            local before = (mq.TLO.Cursor.ID() or 0)
-            pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
-            mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
-            local onCursor = ''
-            pcall(function() onCursor = tostring(mq.TLO.Cursor.Name() or '') end)
-            if onCursor == '' then
-                rezlog('\\ar[placate]   %s: held %s but /itemnotify put nothing on the cursor\\ax', slot, nm)
-            else
-                rezlog('[placate]   %s: picked up %s, stowing', slot, onCursor)
+            mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+            if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                rezlog('\\ar[placate]   %s: cursor will not clear before pickup - skipping this slot\\ax', slot)
+                goto continue_slot
             end
-            ep_stow_cursor()   -- into a bag slot by name, never /autoinventory
+
+            -- SIX, NOT THREE. The offhand took three attempts on Shela and the mainhand ran out of
+            -- budget at three - the pickup is flaky timing rather than a refusal, so the fix is to keep
+            -- asking. Costs nothing when the first attempt works, which is the normal case.
+            local picked = false
+            for tryN = 1, 6 do
+                pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                mq.delay(900, function()
+                    return tostring(mq.TLO.Cursor.Name() or '') == nm
+                end)
+                if tostring(mq.TLO.Cursor.Name() or '') == nm then picked = true; break end
+                rezlog('[placate]   %s: pickup did not take, retry %d of 6', slot, tryN)
+                mq.delay(400)
+            end
+            if not picked then
+                local got = tostring(mq.TLO.Cursor.Name() or '')
+                rezlog('\\ar[placate]   %s: wanted %s on the cursor, got "%s" - leaving it equipped\\ax',
+                       slot, nm, (got ~= '') and got or 'nothing')
+                clear_cursor()
+                goto continue_slot
+            end
+            rezlog('[placate]   %s: picked up %s, stowing', slot, nm)
+
+            local stowed = false
+            for tryN = 1, 3 do
+                ep_stow_cursor()   -- into a bag slot by name, never /autoinventory
+                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+                if (mq.TLO.Cursor.ID() or 0) == 0 then stowed = true; break end
+                rezlog('[placate]   %s: stow did not take, retry %d of 3', slot, tryN)
+                mq.delay(300)
+            end
+            if not stowed then
+                rezlog('\\ar[placate]   %s: %s is stuck on the cursor - putting it back on\\ax', slot, nm)
+                pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                mq.delay(700)
+                clear_cursor()
+                goto continue_slot
+            end
+
             mq.delay(200)      -- let the equipment slot catch up before we judge it
             local after = ''
             pcall(function() after = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
             if after ~= '' then
                 rezlog('\\ar[placate]   %s: still holds %s after the attempt\\ax', slot, after)
             end
-            local _ = before
         end
+        ::continue_slot::
     end
     -- Say what actually came off, not what we intended to take off. The previous line announced all
     -- three unconditionally, which is how a strip that removed nothing still read as a success.
@@ -8427,15 +9376,34 @@ function ep_restore(why)
         local now = ''
         pcall(function() now = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
         if now ~= original then
+            -- SAME VERIFY-EACH-STEP AS THE STRIP, in reverse. Pick it up, confirm the RIGHT item is on the
+            -- cursor, seat it, confirm the slot reads it back. Firing the two commands and hoping is what
+            -- let a run finish with a weapon still sitting in a bag.
             clear_cursor()
+            mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
             if original ~= '' then
-                pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', original) end)
-                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) ~= 0 end)
-                if (mq.TLO.Cursor.ID() or 0) ~= 0 then
-                    pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
-                    mq.delay(700, function()
-                        return (mq.TLO.Me.Inventory(slot).Name() or '') == original
-                    end)
+                local held = false
+                for tryN = 1, 3 do
+                    pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', original) end)
+                    mq.delay(900, function() return tostring(mq.TLO.Cursor.Name() or '') == original end)
+                    if tostring(mq.TLO.Cursor.Name() or '') == original then held = true; break end
+                    rezlog('[placate]   %s: could not pick up %s, retry %d of 3', slot, original, tryN)
+                    mq.delay(300)
+                end
+                if held then
+                    for tryN = 1, 3 do
+                        pcall(function() mq.cmdf('/itemnotify %s leftmouseup', slot) end)
+                        mq.delay(900, function()
+                            return (mq.TLO.Me.Inventory(slot).Name() or '') == original
+                        end)
+                        local seated = ''
+                        pcall(function() seated = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+                        if seated == original then break end
+                        rezlog('[placate]   %s: %s did not seat, retry %d of 3', slot, original, tryN)
+                        mq.delay(300)
+                    end
+                else
+                    rezlog('\\ar[placate]   %s: %s is not findable in bags\\ax', slot, original)
                 end
             end
             ep_stow_cursor()
@@ -8540,6 +9508,14 @@ end
 epTestRuns = 0
 epTestOK   = 0
 function ep_soak_test(times)
+    -- ENCHANTER ONLY, like the real thing. ep_tick is gated on class so the placate strip can only ever
+    -- touch an enchanter - but this command called ep_strip directly, so /atplacatetest on a monk would
+    -- have taken a monk's weapons off. A test that can do the damage it exists to rule out is no good.
+    if not ep_is_enchanter() then
+        log('\\ay[placate test] this is an enchanter routine - not stripping a %s\\ax',
+            tostring(mq.TLO.Me.Class.ShortName() or '?'))
+        return
+    end
     times = math.max(1, math.min(50, math.floor(tonumber(times) or 10)))
     if epSaved then
         log('\\ay[placate test] weapons are already stripped - run /atregear first\\ax')
@@ -8643,9 +9619,16 @@ function ep_tick()
         -- A beat after the cast ends, because the debuff does not appear on the same frame.
         if (mq.gettime() - epCast.at) < EP_CHECK_AFTER then return end
 
-        -- STILL TARGETED, so just read it. We targeted this mob before casting at it, and with E3 paused
-        -- nothing else moves the target - so there is no need to re-target it here, and no settle wait.
-        -- This used to target the mob, read, then hand the target back, per mob.
+        -- RE-TARGET IF IT MOVED, then read. "E3 is paused so nothing moves the target" was wrong: the
+        -- cast ITSELF goes out through E3 via /nowcast, and E3 targets to cast. So the target had almost
+        -- always moved by the time we looked, the read was skipped, and a placate that had landed
+        -- perfectly well was recast - three times, then marked as a failure. 1180 placate lines in one
+        -- session, most of them re-doing work.
+        -- Cheap to fix and cheap to run: one target call, only when it is not already on the mob.
+        if (tonumber(mq.TLO.Target.ID()) or 0) ~= epCast.id then
+            pcall(function() mq.cmdf('/target id %d', epCast.id) end)
+            mq.delay(600, function() return (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id end)
+        end
         local landed = false
         if (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id then
             local sp = ep_spell()
@@ -8653,10 +9636,34 @@ function ep_tick()
                 pcall(function() landed = (tonumber(mq.TLO.Target.Buff(sp).ID()) or 0) > 0 end)
             end
         else
-            -- Something moved it anyway. Rare with E3 held, but say so rather than silently reporting
-            -- a failure that was really a lost target.
-            rezlog('\\ay[placate] target moved off %s before the check - cannot tell if it landed\\ax',
-                   epCast.name)
+            -- STILL NOT ON IT. Do not assume either way - keep trying. Assuming it landed marks a mob
+            -- placated that may not be; assuming it failed re-casts one that already is. Both are guesses
+            -- and the mob is right there to be read.
+            -- Is it even still alive? A dead or despawned mob is the one case with a real answer.
+            local ty, hp = '', 0
+            pcall(function() ty = tostring(mq.TLO.Spawn(epCast.id).Type() or '') end)
+            pcall(function() hp = tonumber(mq.TLO.Spawn(epCast.id).PctHPs()) or 0 end)
+            if ty ~= 'NPC' or hp <= 0 then
+                rezlog('[placate] %s is gone - nothing left to check', epCast.name)
+                ep_mark(epCast.id, 'done', 'died or despawned')
+                epCast = nil
+                return
+            end
+            -- Alive and we cannot get on it yet. Come back next tick WITHOUT spending a retry: the cast
+            -- is not in question, only our ability to look at the result.
+            epCast.checkTries = (epCast.checkTries or 0) + 1
+            if epCast.checkTries <= EP_CHECK_TRIES then
+                rezlog('[placate] could not target %s to check (%d of %d) - trying again',
+                       epCast.name, epCast.checkTries, EP_CHECK_TRIES)
+                return
+            end
+            -- Out of attempts, still alive, still unreadable. Say so plainly and leave it UNRESOLVED in
+            -- the queue rather than claiming an outcome we never observed.
+            rezlog('\\ay[placate] gave up trying to read %s after %d attempts - state unknown\\ax',
+                   epCast.name, EP_CHECK_TRIES)
+            ep_mark(epCast.id, 'unknown', 'could not be read')
+            epCast = nil
+            return
         end
         -- Deliberately NOT restoring here: the next mob in the queue gets targeted a moment later
         -- anyway, and the caller's target goes back once when the queue finishes.
@@ -8668,8 +9675,8 @@ function ep_tick()
         end
         if epCast.tries < EP_RETRY then
             epCast.tries = epCast.tries + 1
-            epCast.at, epCast.sawCast = mq.gettime(), false
-            rezlog('[placate] did not land on %s - retry %d of %d', epCast.name, epCast.tries, EP_RETRY)
+            epCast.at, epCast.sawCast, epCast.checkTries = mq.gettime(), false, 0
+            rezlog('[placate] did not land on %s#%d - retry %d of %d', epCast.name, epCast.id or 0, epCast.tries, EP_RETRY)
             if (tonumber(mq.TLO.Target.ID()) or 0) ~= epCast.id then
                 pcall(function() mq.cmdf('/target id %d', epCast.id) end)
                 mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id end)
@@ -8677,15 +9684,43 @@ function ep_tick()
             pcall(function() mq.cmdf('/nowcast me "%s" %d', ep_spell() or '', epCast.id) end)
             return
         end
-        rezlog('\\ay[placate] gave up on %s after %d tries\\ax', epCast.name, epCast.tries)
+        rezlog('\\ay[placate] gave up on %s#%d after %d tries\\ax', epCast.name, epCast.id or 0, epCast.tries)
         ep_mark(epCast.id, 'failed', 'would not land')
         epCast = nil
         return
     end
 
     -- Anything left to do?
-    local next_e
-    for _, q in ipairs(epQueue) do if not q.state then next_e = q; break end end
+    -- PICK THE FIRST REACHABLE ONE, not simply the first pending one. Stalling on a far mob blocked
+    -- everything behind it - a Stillmoon novice sat at 210m for a minute while three reachable mobs
+    -- waited their turn, and the enchanter stayed stripped throughout.
+    -- Far entries are kept in the queue and retried; they just do not hold up the ones we can reach.
+    local next_e, reach = nil, ep_range()
+    local farOnes = 0
+    for _, q in ipairs(epQueue) do
+        if not q.state then
+            local d = 9999
+            pcall(function() d = math.floor(tonumber(mq.TLO.Spawn(q.id).Distance()) or 9999) end)
+            if d <= reach then
+                q.oor = false
+                next_e = q
+                break
+            end
+            q.oor = true
+            farOnes = farOnes + 1
+            -- GIVE UP ON ONE THAT NEVER CLOSES. Without this the queue can never finish, so the gear
+            -- never goes back on and only the 3-minute backstop saves it.
+            q.farSince = q.farSince or mq.gettime()
+            if (mq.gettime() - q.farSince) > EP_FAR_MAX then
+                ep_mark(q.id, 'failed', string.format('stayed out of range (%dm) for %ds', d, EP_FAR_MAX / 1000))
+            end
+        end
+    end
+    ep_queue_log('choosing')
+    if not next_e and farOnes > 0 and (mq.gettime() - (epOorSaidAt or 0)) > 5000 then
+        epOorSaidAt = mq.gettime()
+        rezlog('[placate] %d queued mob(s) out of reach (%d) - waiting', farOnes, reach)
+    end
     if not next_e then
         -- Queue finished. Put the weapons back - this is the "once everything is placated" half.
         if epSaved then ep_restore('queue finished') end
@@ -8721,7 +9756,23 @@ function ep_tick()
     end
 
     if (mq.gettime() - (epLast or 0)) < EP_RECAST then return end
-    if not ep_gem_ready() then return end
+    -- THE GEM COOLDOWN, SAID OUT LOUD. This returned silently, so a queue waiting on the spell's recast
+    -- is indistinguishable from a queue that has stopped - and with several mobs the third cast is
+    -- typically the first to hit it, which is exactly when "it stops after a few" gets reported.
+    -- Rate-limited to once every 5s so a long recast does not fill the log.
+    if not ep_gem_ready() then
+        local t = -1
+        pcall(function() t = tonumber(mq.TLO.Me.GemTimer(epGem).TotalSeconds()) or -1 end)
+        if (mq.gettime() - (epGemSaidAt or 0)) > 5000 then
+            epGemSaidAt = mq.gettime()
+            rezlog('[placate] waiting on the gem - %ss left, %d still queued', tostring(t), (function()
+                local n = 0
+                for _, q in ipairs(epQueue) do if not q.state then n = n + 1 end end
+                return n
+            end)())
+        end
+        return
+    end
 
     -- Dead or gone while it waited its turn.
     local ty, hp = '', 0
@@ -8729,21 +9780,58 @@ function ep_tick()
     pcall(function() hp = tonumber(mq.TLO.Spawn(next_e.id).PctHPs()) or 0 end)
     if ty ~= 'NPC' or hp <= 0 then ep_mark(next_e.id, 'failed', 'dead or gone'); return end
 
+    -- Range was already checked when this one was chosen, so nothing to re-test here.
+
     -- STRIP BEFORE THE FIRST CAST, not before each one. Nothing above this point casts, so by the time
     -- we get here we know there is real work to do and it is worth paying for.
+    -- CONFIRM WE ARE ACTUALLY STRIPPED BEFORE CASTING. The strip reports per slot, but reports are what
+    -- it BELIEVES; this reads the slots and the cursor one last time. Casting with a weapon still on
+    -- defeats the whole point - the proc breaks the placate - and casting with something on the cursor
+    -- is how items end up somewhere unexpected.
+    -- Checked here rather than inside ep_strip so it also covers a queue resumed after a stall.
+    local function ep_ready_to_cast()
+        for _, slot in ipairs(EP_SLOTS) do
+            local worn = ''
+            pcall(function() worn = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
+            if worn ~= '' then return false, slot .. ' still holds ' .. worn end
+        end
+        if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+            return false, 'something is on the cursor: ' .. tostring(mq.TLO.Cursor.Name() or '?')
+        end
+        return true
+    end
+
     -- ep_strip returns false when something came off and cannot be found again. Do not cast in that
     -- state: it has already put back what it could, and pressing on would mean casting a queue while an
     -- item is unaccounted for.
     if not ep_strip() then return end
+
+    local ready, why = ep_ready_to_cast()
+    if not ready then
+        -- THROTTLED, AND IT GIVES UP. This printed twice a second for three minutes on Shela and then
+        -- the backstop tore the run down, which is the worst of both - a wall of identical lines and no
+        -- progress. Once ep_strip has spent its passes the slot is not coming off, so say so once and
+        -- stand down rather than waiting out the backstop repeating ourselves.
+        if (mq.gettime() - (epNotReadyAt or 0)) > 5000 then
+            epNotReadyAt = mq.gettime()
+            rezlog('\\ay[placate] not casting: %s\\ax', why)
+        end
+        if epStripPass >= EP_STRIP_PASSES then
+            rezlog('\\ar[placate] giving up: %s after %d strip passes. Gear is going back on; the queue is '
+                .. 'held, not lost - fix the slot and re-run.\\ax', why, EP_STRIP_PASSES)
+            ep_restore('could not strip')
+        end
+        return
+    end
 
     epLast = mq.gettime()
     -- Target it BEFORE the cast, once. It stays there for the verification read afterwards because E3
     -- is paused for the whole run - one target per mob rather than one to cast plus one to check.
     pcall(function() mq.cmdf('/target id %d', next_e.id) end)
     mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == next_e.id end)
-    rezlog('[placate] %s on %s', sp, next_e.name)
+    rezlog('[placate] %s on %s#%d', sp, next_e.name, next_e.id or 0)
     pcall(function() mq.cmdf('/nowcast me "%s" %d', sp, next_e.id) end)
-    epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false }
+    epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false, checkTries = 0 }
 end
 
 -- ===== PHANTOM LINE (placate) =====
@@ -8942,6 +10030,79 @@ function pw_tick()
     pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev }
 end
 
+-- NIGHTVEIL EMBLEMS, grouped by role. One button per character plus an All per row, because the two
+-- things you actually want are "everybody now" and "that one specific toon" - and a flat list of six
+-- names makes you find the healers by reading rather than by looking.
+-- Colour is the state: green ready, amber counting down, grey unusable (no emblem in a charm). A name
+-- that is grey is not a missing button, it is a character whose emblem is in the wrong place.
+function draw_nightveil()
+    local rows = { Tank = {}, Healer = {}, DPS = {} }
+    for _, nm in ipairs(ordered_members()) do
+        local r = role_of(member_class(nm))
+        rows[r][#rows[r] + 1] = nm
+    end
+
+    local function click(nm)
+        if nm:lower() == myName:lower() then
+            pcall(function() mq.cmd('/at_nvclick') end)
+        else
+            pcall(function() peer_cmdf(nm, '/at_nvclick') end)
+        end
+    end
+
+    for _, role in ipairs({ 'Tank', 'Healer', 'DPS' }) do
+        local list = rows[role]
+        if #list > 0 then
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, role .. ':')
+            ImGui.SameLine()
+            -- All first, and only when at least one of them can actually fire - an All that clicks
+            -- nothing is worse than no All.
+            local anyReady = false
+            for _, nm in ipairs(list) do
+                local st = nvState[nm]
+                if st and st.ok == 1 and st.secs == 0 then anyReady = true; break end
+            end
+            -- NO 'All' FOR A ROW OF ONE. With a single tank, All and the name are the same button, and
+            -- two buttons that do the same thing is just something else to look at.
+            if #list > 1 and anyReady then
+                if ImGui.SmallButton('All##nvall_' .. role) then
+                    for _, nm in ipairs(list) do
+                        local st = nvState[nm]
+                        if st and st.ok == 1 and st.secs == 0 then click(nm) end
+                    end
+                    log('[nv] %s: clicking all ready emblems', role)
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip('Click every ready ' .. NIGHTVEIL_ITEM ..
+                        ' in the ' .. role .. ' row.\nSkips anyone on cooldown or without one in a charm.') end)
+                end
+            elseif #list > 1 then
+                ImGui.TextDisabled('All')      -- placeholder keeps the names aligned across rows
+            end
+            for _, nm in ipairs(list) do
+                ImGui.SameLine()
+                local st = nvState[nm]
+                local secs = st and st.secs or nil
+                local usable = st and st.ok == 1
+                if not usable then      ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0)
+                elseif secs == 0 then   ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
+                else                    ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.62, 0.25, 1.0) end
+                if ImGui.SmallButton(nm:sub(1, 8) .. '##nv_' .. nm) then click(nm) end
+                ImGui.PopStyleColor(1)
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    local why
+                    if not st then            why = 'no report yet'
+                    elseif st.ok ~= 1 then    why = 'no ' .. NIGHTVEIL_ITEM .. ' socketed in a charm'
+                    elseif (secs or 0) == 0 then why = 'ready'
+                    elseif secs == -2 then    why = 'on cooldown\n(this build reports no countdown for augs)'
+                    else                      why = string.format('%ds left', secs) end
+                    pcall(function() ImGui.SetTooltip(nm .. '\n' .. why) end)
+                end
+            end
+        end
+    end
+end
+
 function draw_placate()
     local holder = nil
     for _, nm in ipairs(group_members()) do
@@ -8959,8 +10120,9 @@ function draw_placate()
         elseif ep_find(id) then
             log('[placate] %s is already queued', nm)
         else
-            epQueue[#epQueue + 1] = { id = id, name = nm, oor = false }
+            epQueue[#epQueue + 1] = { id = id, name = nm, oor = false, farSince = nil }
             log('[placate] queued %s (%d in the list)', nm, #epQueue)
+            ep_queue_log('added here')
             pcall(function() peer_bcast('/at_epadd %d %s', id, nm:gsub(' ', '_')) end)
         end
     end
@@ -8969,6 +10131,7 @@ function draw_placate()
         epQueue, epDoneAt = {}, nil
         pcall(function() peer_bcast('/at_epclear') end)
         log('[placate] queue cleared')
+        ep_queue_log('cleared here')
     end
     -- Say when the weapons are off, because it is a state with a cost and it should never be a surprise.
     if epSaved then
@@ -8989,12 +10152,24 @@ function draw_placate()
         if e.state == 'done' then
             ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (cast)')
             tip = e.name .. '\nplacate was cast at it'
+        elseif e.state == 'unknown' then
+            -- Deliberately its own colour and word. "We could not tell" is not the same as landed or
+            -- failed, and showing it as either would be inventing a result.
+            ImGui.TextColored(0.62, 0.62, 0.85, 1.0, e.name .. '  (?)')
+            tip = e.name .. '\nthe cast went out, but the mob could not be targeted to check'
         elseif e.state == 'immune' then
             ImGui.TextColored(0.85, 0.30, 0.30, 1.0, e.name .. '  (immune)')
             tip = e.name .. '\nthe game says it looks unaffected - it cannot be placated'
         elseif e.state == 'failed' then
             ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
             tip = e.name .. '\ngave up - dead, gone, or the cast would not go off'
+        elseif e.oor then
+            -- RED and spelled out. This was amber, on the reasoning that it is not a failure - but the
+            -- thing being communicated is "this one is not happening right now", and amber next to a
+            -- grey pending entry does not say that loudly enough. A queue that looks frozen is the
+            -- complaint that started this, so the entry that is holding says so in red.
+            ImGui.TextColored(0.93, 0.42, 0.42, 1.0, e.name .. '  OOR')
+            tip = e.name .. '\nOUT OF RANGE - skipped for now, retried as it closes'
         else
             ImGui.TextColored(0.80, 0.80, 0.80, 1.0, e.name)
             tip = e.name .. '\nwaiting its turn'
@@ -9006,6 +10181,7 @@ function draw_placate()
         if ImGui.SmallButton('x##epdel' .. i) then
             pcall(function() peer_bcast('/at_epdel %d', e.id) end)
             table.remove(epQueue, i)
+            ep_queue_log('removed here')
             break
         end
     end
@@ -9017,6 +10193,9 @@ function draw_placate()
         if left <= 0 then
             epQueue, epDoneAt = {}, nil
             pcall(function() peer_bcast('/at_epclear') end)
+            -- Worth logging precisely because nobody pressed anything: a queue that empties on a timer
+            -- is the most likely thing to look like it "jumped".
+            ep_queue_log('linger expired')
         end
     else
         epDoneAt = nil
@@ -9216,6 +10395,8 @@ MINI_SECTIONS = {
       get = function() return miniArcane end, set = function(v) miniArcane = v end },
     { key = 'phantom', label = 'Phantom (placate)',     draw = draw_phantom,
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
+    { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
+      get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
     { key = 'placate', label = 'Placate (enchanter)',    draw = draw_placate,
       get = function() return miniPlacate end, set = function(v) miniPlacate = v end },
 }
@@ -10075,6 +11256,21 @@ elseif driverName then
     pcall(function() peer_cmdf(driverName, '/at_rezorder? %s', myName) end)   -- late joiner (e.g. crash relaunch): ask for the live order
 end
 
+-- SEED THE NIGHTVEIL TIMER AT STARTUP. A fresh session has never poked the loose copy, so the field
+-- reads a stale 0 and the emblem looks ready even mid-cooldown - the button comes up green and the
+-- first press burns eleven failing methods finding out otherwise. One poke here costs a single refusal
+-- line and means the very first state push carries the truth.
+-- Top level, not inside the driver branch above: the workers are the ones whose state the driver draws.
+pcall(function()
+    nv_refresh(true)
+    mq.delay(400)
+    local left = nv_secs()
+    if left > 0 then
+        log('[nv] %s is on cooldown at startup - %dm %ds left', NIGHTVEIL_ITEM,
+            math.floor(left / 60), left % 60)
+    end
+end)
+
 -- SKIP EVERYTHING WHILE THE CLIENT IS NOT IN A FIT STATE TO BE ASKED. During a zone the client tears
 -- down and rebuilds its spawn, buff and inventory structures, and a TLO read landing in that window
 -- dereferences pointers that are briefly null. Three minidumps on 2026-08-01 were all the same fault -
@@ -10735,6 +11931,21 @@ while running do
     -- IMMEDIATE push on the edge INTO the event, because a stale first tick is precisely the failure
     -- the heartbeat was added to prevent. Slow is a keepalive, not silence: a toon that stopped
     -- talking entirely could not be told apart from one whose script died.
+    -- NIGHTVEIL, OUTSIDE THE REZ GATE. This used to sit inside the auto-rez heartbeat because that is
+    -- where the other clicky state is reported - but the emblem has nothing to do with rezzing, and
+    -- riding along meant it stopped being polled entirely whenever auto-rez was off or a give-out was
+    -- running. The symptom is a button that never leaves whatever colour it was when the gate closed.
+    -- Change-gated the same way, so a stable state still costs one comparison rather than a message.
+    do
+        nv_refresh()            -- rate-limited; the read is stale until the bagged copy is poked
+        local nv = nv_state()
+        local nk = tostring(nv)
+        if nvLast ~= nk then
+            nvLast = nk
+            if SHOW_UI then nvState[myName] = { ok = (nv ~= -1) and 1 or 0, secs = nv, updated = mq.gettime() }
+            elseif driverName then peer_cmdf(driverName, '/at_nvstate %s %d', myName, nv) end
+        end
+    end
     if rezAuto and not distributing then
         -- ON CHANGE, plus a slow keepalive. This used to be a flat 2-5s heartbeat because the baton read
         -- the raw cooldown number; now that peers count it down themselves (rez_peer_secs), the only
@@ -10743,6 +11954,13 @@ while running do
         -- never heard of me learns I exist.
         local cr, tk, cw = my_rez_secs(CROWN_ITEM), my_rez_secs(TOKEN_ITEM), my_cotw_secs()
         local dv = my_divine_secs()
+        -- REPORT AS UNAVAILABLE WHILE FEIGNING, rather than leaving peers to discover it by timeout. The
+        -- chain is built from these numbers, so saying "nothing ready" here is what actually keeps a
+        -- feigned character out of it - the local gates above only stop this toon acting, they do not
+        -- stop it being elected and holding the baton for the full wait first.
+        -- Invis rides with feigning here, not just in the local gate. The local gate stops this toon
+        -- acting; it does not stop the chain electing it and holding the baton for the full wait first.
+        if am_feigning() or am_invis() then cr, tk, cw, dv = -1, -1, -1, -1 end
         local dead = false; pcall(function() dead = tlo_true(mq.TLO.Me.Dead()) end)
         local zone = 0; pcall(function() zone = tonumber(mq.TLO.Zone.ID()) or 0 end)
         local al = dead and 0 or 1
@@ -10863,6 +12081,10 @@ pcall(function() mq.unbind('/atregear') end)
 pcall(function() mq.unbind('/atslots') end)
 pcall(function() mq.unbind('/atsongs') end)
 pcall(function() mq.unbind('/atcurrency') end)
+pcall(function() mq.unbind('/atcothaug') end)
+pcall(function() mq.unbind('/atnv') end)
+pcall(function() mq.unbind('/atnvdump') end)
+pcall(function() mq.unbind('/atrange') end)
 pcall(function() mq.unbind('/atreclaim') end)
 pcall(function() mq.unbind('/attab') end)
 pcall(function() mq.unbind('/attribute') end)
@@ -10893,6 +12115,8 @@ pcall(function() mq.unbind('/at_mgbclick') end)
 pcall(function() mq.unbind('/at_pot') end)
 pcall(function() mq.unbind('/at_potprobe') end)
 pcall(function() mq.unbind('/at_potstate') end)
+pcall(function() mq.unbind('/at_nvclick') end)
+pcall(function() mq.unbind('/at_nvstate') end)
 pcall(function() mq.unbind('/at_quiet') end)
 pcall(function() mq.unbind('/at_resync') end)
 pcall(function() mq.unbind('/at_rezaccept') end)
