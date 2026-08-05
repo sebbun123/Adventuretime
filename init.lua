@@ -319,6 +319,19 @@ function timer_secs(v)
     return -1
 end
 
+-- A ~105 MINUTE COOLDOWN READS BADLY IN SECONDS. "6275s left" is a number nobody can act on; 1:44:35 is
+-- read at a glance. Minutes are zero-padded so the width does not jump as it counts down.
+-- Drops the hours field entirely under an hour rather than showing 0:44:35.
+function nv_hms(secs)
+    local n = math.floor(tonumber(secs) or 0)
+    if n < 0 then n = 0 end
+    local h = math.floor(n / 3600)
+    local m = math.floor((n % 3600) / 60)
+    local sec = n % 60
+    if h > 0 then return string.format('%d:%02d:%02d', h, m, sec) end
+    return string.format('%d:%02d', m, sec)
+end
+
 function nv_carrier()
     local slot = find_aug(NIGHTVEIL_ITEM)
     if slot ~= 'charm' then return nil end
@@ -532,15 +545,21 @@ end
 potLast  = {}
 -- Drink the best tier of `base` I actually hold. II is tried first; I is the fallback ONLY when no II
 -- is carried. If a tier is held but its timer is down we STOP rather than dropping to the lower one -
--- I and II share one recast, so the lesser tier is on cooldown too and queuecasting it just burns a
--- slot in the queue for a cast that cannot fire.
+-- I and II share one recast, so the lesser tier is on cooldown too and firing it just spends a command
+-- on a cast that cannot go.
+-- NOWCAST, NOT QUEUECAST, since 2026-08-05. A queued cast does not fail - it WAITS, and E3 holds it until
+-- it can go, which means a press can discharge at a moment nobody chose. That was seen with the Nightveil
+-- emblems firing by themselves across several characters long after the button was pressed, and a potion
+-- queued behind a long cast has the same shape even if the stakes are lower.
+-- The cost is real and accepted: /nowcast interrupts whatever that toon is already casting. Pressing this
+-- mid-fight can clip a heal. It is a deliberate trade of "might go off later, unbidden" for "goes now or
+-- not at all", and the second is the one that can be reasoned about.
 -- DRAUGHTS GET THE SAME TREATMENT AS THE STAFF. pot_drink used to fire and log "[pot] <name>" in the same
 -- breath, claiming a success nobody had checked - the exact habit that made the DI logs disagree with the
--- fight for a whole night. And these go out via /queuecast, which QUEUES behind whatever that toon is
--- already casting, so a draught genuinely can sit and never happen.
+-- fight for a whole night.
 -- Confirmation is free: pot_state already reports both the buff being up and the item going on cooldown,
 -- and either one proves it went.
-POT_RETRY_AFTER = 4000     -- generous, because queuecast waits its turn
+POT_RETRY_AFTER = 4000     -- a nowcast either goes or it does not, so this is now slack, not queue wait
 POT_RETRY_MAX   = 3
 potPending      = nil      -- { base, nm, at, tries }
 
@@ -559,7 +578,7 @@ function pot_retry_tick()
     end
     potPending.tries = potPending.tries + 1
     log('[pot] no sign of %s - retry %d of %d', potPending.nm, potPending.tries, POT_RETRY_MAX)
-    pcall(function() mq.cmdf('/queuecast me "%s"', potPending.nm) end)
+    pcall(function() mq.cmdf('/nowcast me "%s"', potPending.nm) end)
 end
 
 -- DON'T RE-DRINK WHAT IS ALREADY UP, and don't re-drink too soon.
@@ -597,11 +616,11 @@ function pot_drink(base)
         end)
         if have > 0 then
             if ready == 0 then
-                mq.cmdf('/queuecast me "%s"', nm)
+                mq.cmdf('/nowcast me "%s"', nm)
                 potPending = { base = base, nm = nm, at = mq.gettime(), tries = 1 }
-                -- Stamped on the ATTEMPT, not on confirmation. A queuecast that lands three seconds
-                -- later would otherwise leave the gap unstarted, and a second press in between would
-                -- drink another one.
+                -- Stamped on the ATTEMPT, not on confirmation. A cast that lands a few seconds later
+                -- would otherwise leave the gap unstarted, and a second press in between would drink
+                -- another one.
                 potDrankAt[base] = mq.gettime()
                 return true, nm
             end
@@ -4979,7 +4998,7 @@ pcall(function()
         log('   after poke        : TimerReady=%s ItemReady=%s',
             tostring(mq.TLO.FindItem('=' .. nm).TimerReady()), tostring(mq.TLO.Me.ItemReady(nm)()))
         log('   nvReadOK          : %s   (has this char ever reported a real countdown)', tostring(nvReadOK))
-        log('   nv_secs()         : %d   (-1 = no read available)', nv_secs())
+        log('   nv_secs()         : %d (%s)   (-1 = no read available)', nv_secs(), nv_hms(nv_secs()))
         log('   nv_state()        : %d   (-1 means unusable)', nv_state())
     end)
     mq.bind('/atcothaug', function()
@@ -5111,6 +5130,15 @@ function nv_methods()
         -- place here means observed to work, not proven uniquely correct.
         { name = '/nowcast (E3), aug by name, no target id',
           run  = function() mq.cmdf('/nowcast me "%s%s"', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS) end },
+        -- THE SAME THING, QUEUED INSTEAD OF IMMEDIATE. /nowcast interrupts whatever is casting, which is
+        -- correct for a rez or a DI and questionable for a two-hour buff - the All button fires this on
+        -- six characters at once, and on a cleric that lands mid-heal.
+        -- Second, not first: the nowcast form is confirmed to work and this one is not. Test it with
+        -- /atnvtest 2 and promote it if it fires. If the queue swallows it, nothing is lost - the sweep
+        -- falls through to the proven form.
+        { name = '/queuecast (E3), aug by name - TEST ONLY, does not interrupt',
+          sweep = false,
+          run  = function() mq.cmdf('/queuecast me "%s%s"', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS) end },
             -- MQ2Cast FIRST. Cast.Ready answered correctly about the charm while everything else lied,
             -- so it is the one thing here that demonstrably understands this item - which makes it the
             -- most likely to be able to click it too.
@@ -5163,10 +5191,10 @@ end
         pcall(function() bb = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
         if bb == 0 then pcall(function() bb = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
         if before > 0 then
-            log('\\ay[nvtest] already on cooldown (%ds left) - this proves nothing, wait it out\\ax', before)
+            log('\\ay[nvtest] already on cooldown (%s left) - this proves nothing, wait it out\\ax', nv_hms(before))
             return
         end
-        log('[nvtest] %d. %s   before: secs=%d buff=%s', n, methods[n].name, before, (bb > 0) and 'up' or 'down')
+        log('[nvtest] %d. %s   before: %s buff=%s', n, methods[n].name, nv_hms(before), (bb > 0) and 'up' or 'down')
         pcall(methods[n].run)
         -- A FULL SIX SECONDS. Long enough for a cast to finish and the buff to register, so a slow
         -- success is not recorded as a failure.
@@ -5176,9 +5204,9 @@ end
         local ab = 0
         pcall(function() ab = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
         if ab == 0 then pcall(function() ab = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
-        log('[nvtest] %d. %s   after : secs=%d buff=%s', n, methods[n].name, after, (ab > 0) and 'up' or 'down')
+        log('[nvtest] %d. %s   after : %s buff=%s', n, methods[n].name, nv_hms(after), (ab > 0) and 'up' or 'down')
         if after > 0 then
-            log('\\ag[nvtest] METHOD %d WORKS - cooldown started (%ds)\\ax', n, after)
+            log('\\ag[nvtest] METHOD %d WORKS - cooldown started (%s)\\ax', n, nv_hms(after))
             nvMethod = n
         elseif ab > 0 and bb == 0 then
             log('\\ag[nvtest] METHOD %d landed the buff (no timer to confirm with - no loose copy)\\ax', n)
@@ -5203,7 +5231,7 @@ end
         mq.delay(400)
         local left = nv_secs()
         if left > 0 then
-            log('[nv] %s is not ready - %dm %ds left', NIGHTVEIL_ITEM, math.floor(left / 60), left % 60)
+            log('[nv] %s is not ready - %s left', NIGHTVEIL_ITEM, nv_hms(left))
             nvLast = ''   -- push the real number out so the button matches what just happened
             return
         end
@@ -5244,12 +5272,18 @@ end
             return b > 0
         end
 
-        local order = {}
-        if nvMethod then order[#order + 1] = methods[nvMethod] end       -- the one that worked last time
-        for i, m in ipairs(methods) do if i ~= nvMethod then order[#order + 1] = m end end
+        -- ONE COMMAND, NOT ELEVEN. The cascade was a discovery tool and discovery is finished - method 1
+        -- is confirmed. Leaving it in place is actively harmful: E3 does not necessarily discard a cast
+        -- it cannot perform right now, it HOLDS it, so a sweep run while the pool is down parks a stack
+        -- of requests that all discharge together the moment it comes up. That is exactly what was seen
+        -- on 2026-08-05 - emblems firing by themselves on several characters at once, long after the
+        -- button was pressed.
+        -- Entries marked sweep = false are never fired automatically at all; they exist for /atnvtest.
+        local order = { methods[nvMethod or 1] }
 
         local worked = nil
         for _, m in ipairs(order) do
+            if m.sweep == false then break end   -- never fire a queuing method automatically
             pcall(m.run)
             -- LONG ENOUGH FOR A BUFF TO LAND. At 1.5s a click that worked was still in flight when the
             -- next method fired, and the buff arriving mid-window handed the credit to whichever method
@@ -5263,8 +5297,9 @@ end
             log('\\ag[nv] %s clicked via %s\\ax', NIGHTVEIL_ITEM, worked)
             nv_mark_clicked()   -- the only cooldown a no-spare toon will ever know about
         else
-            log('\\ar[nv] could not click %s - none of the %d methods put it on cooldown. It is aug %s in %s.\\ax',
-                NIGHTVEIL_ITEM, #methods, tostring(augIdx), tostring(slotName))
+            log('\\ar[nv] %s did not fire (method %d). NOT trying the others - a failed cast can sit in '
+                .. 'E3\'s queue and go off on its own later. Use /atnvtest <n> to try another. It is aug %s in %s.\\ax',
+                NIGHTVEIL_ITEM, nvMethod or 1, tostring(augIdx), tostring(slotName))
         end
         -- POKE IMMEDIATELY. Otherwise the fresh cooldown is invisible until the next scheduled refresh,
         -- up to ten minutes of a button that says ready when it is not.
@@ -10095,7 +10130,7 @@ function draw_nightveil()
                     elseif st.ok ~= 1 then    why = 'no ' .. NIGHTVEIL_ITEM .. ' socketed in a charm'
                     elseif (secs or 0) == 0 then why = 'ready'
                     elseif secs == -2 then    why = 'on cooldown\n(this build reports no countdown for augs)'
-                    else                      why = string.format('%ds left', secs) end
+                    else                      why = nv_hms(secs) .. ' left' end
                     pcall(function() ImGui.SetTooltip(nm .. '\n' .. why) end)
                 end
             end
@@ -11266,8 +11301,7 @@ pcall(function()
     mq.delay(400)
     local left = nv_secs()
     if left > 0 then
-        log('[nv] %s is on cooldown at startup - %dm %ds left', NIGHTVEIL_ITEM,
-            math.floor(left / 60), left % 60)
+        log('[nv] %s is on cooldown at startup - %s left', NIGHTVEIL_ITEM, nv_hms(left))
     end
 end)
 
