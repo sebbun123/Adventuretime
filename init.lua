@@ -51,7 +51,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.03'
-local BUILD_TAG = 'at-1.03-release-2026-08-05'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-1.03i-reclaimshow-2026-08-06'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -385,7 +385,6 @@ end
 -- involved, so a hard spare requirement would have suppressed a read that works.
 -- The latch resets on reload and re-arms the first time a cooldown is seen. Until then the behaviour is
 -- the permissive one: allow the click and let the client refuse it.
-nvReadOK = false
 
 -- WHERE IS THE LOOSE COPY? Returns pack index and slot index, or nil. Needed because the refresh has to
 -- name the bagged copy by position - clicking "the emblem" by name would find the socketed one, which
@@ -412,57 +411,40 @@ function nv_loose_slot()
     return pk, si
 end
 
--- THE READ IS STALE UNTIL POKED. TimerReady on the loose copy sits at 0 through a live cooldown until
--- something asks the client about that item; right-clicking it is what asks. The click is REFUSED - the
--- emblem is EffectType 4 "Click Worn" and only fires from an equipped slot - so this costs nothing and
--- cannot burn the two-hour pool. Confirmed in game 2026-08-05: the client says it cannot be clicked, and
--- the timer appears immediately afterwards.
--- `/itemnotify in packN M` reaches an item INSIDE a bag without opening it, so this does not disturb the
--- UI mid-run.
--- Rate limited because it is a refusal message in the chat window every time it fires.
--- POKE RARELY, COUNT LOCALLY. The pool is two hours, so a reading every ten minutes is plenty of
--- accuracy and costs one refusal line per character per ten minutes instead of one every thirty
--- seconds. Between pokes the live read reverts to a stale 0, so we subtract elapsed time from the last
--- trusted reading rather than believing it.
-NV_REFRESH_MS = 600000
--- How long a click gets to prove itself before the next method is tried. Generous on purpose: the pool
--- is two hours, so a discovery run gets ONE real shot and there is no value in rushing it.
-NV_METHOD_WAIT_MS = 4000
-nvNextRefresh = 0
-nvSecsVal     = -1        -- last reading we trust
-nvSecsAt      = 0         -- when it was taken
+-- NIGHTVEIL STATE. Globals, not locals - the main chunk sits at Lua's 200-local ceiling.
+-- These were lost in a comment cleanup on 2026-08-05: the edit deleted from one marker to the next and
+-- took the declarations sitting between them, leaving nv_secs comparing nil to a number on every pulse.
+-- The worker died on load, the driver's own pulse threw at the same line, and the whole thing came down.
+nvSecsVal         = -1     -- seconds left as of nvSecsAt; -1 means nothing on record
+nvSecsAt          = 0      -- mq.gettime() when nvSecsVal was set
+nvNextRefresh     = 0      -- retained for the nv_refresh stub; nothing schedules a poke any more
+NV_METHOD_WAIT_MS = 4000   -- how long a click gets to resolve before the result is read
 
--- GATED ON CAPABILITY, not on the mini-window checkbox. miniNightveil only decides whether the buttons
--- are drawn, and workers run headless with SHOW_UI false - gating on it would silence every character
--- except the driver. A toon with no emblem socketed in a charm, or no loose copy to poke, has nothing
--- to refresh and returns early here, which is the same "don't do this at all" outcome by other means.
+-- DEAD ON PURPOSE. This used to right-click the loose copy to freshen the timer read. That is not a
+-- read - on a ready pool it FIRES THE SOCKETED EMBLEM. Every path that called it was a way to set off a
+-- two hour clicky by accident: a ten minute background timer, a startup seed, the readiness gate, and
+-- the /atnv probe. Several were "safe" only because of a guard one edit away from being relaxed.
+-- ALL SIX CHARACTERS ARE TREATED THE SAME NOW: nothing is ever clicked to find out. The cooldown is
+-- inferred from the recorded button press and nothing else.
+-- Kept as a stub rather than deleted so any call left anywhere is harmless instead of a syntax error.
 function nv_refresh(force)
-    if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then return false end
-    local now = mq.gettime()
-    if not force and now < nvNextRefresh then return false end
-    local pk, si = nv_loose_slot()
-    if not pk then return false end
-    nvNextRefresh = now + NV_REFRESH_MS
-    pcall(function() mq.cmdf('/itemnotify in pack%d %d rightmouseup', pk, si) end)
-    return true
+    return false
 end
 
--- Seconds left on pool 71. Reads the loose copy, which is the only honest one - the socketed emblem and
--- its charm both answer 0 straight through a live cooldown.
--- A live 0 is NOT taken at face value while we are holding a countdown that has not run out: between
--- pokes the field goes stale at 0, and believing it would flash the button green mid-cooldown. Our own
--- count wins until it expires, and every poke overwrites it with the truth.
--- FOR CHARACTERS WITH NO SPARE. A toon carrying only the socketed emblem has no honest read at all -
--- FindItem answers about the equipped copy, which reports 0 straight through a live cooldown, so its
--- button stays green for the full two hours. Nothing about the poke helps: there is nothing to poke.
--- So count it ourselves from our own click. Two things make this trustworthy now that were not true
--- when it was first proposed as a fallback: the click is confirmed to work, and the real duration has
--- been measured off a character that CAN read it, rather than taken from Clicky.TimerID (which claims
--- 7200 and is wrong by about fifteen minutes).
--- Persisted, so a /lua reload does not hand back a green button on a live cooldown.
--- Self-correcting: any real reading overrides the assumption, and if a real reading ever comes back
--- LONGER than the constant, the constant was too small and is raised to match.
-NV_RECAST_SECS = 6300
+-- EVERY CHARACTER IS TREATED THE SAME: THE COOLDOWN IS INFERRED, NEVER MEASURED.
+-- There is no read worth having. The socketed emblem and its charm answer 0 straight through a live
+-- cooldown, and the one thing that made a loose copy report honestly - right-clicking it - is not a
+-- query at all, it FIRES the socketed emblem. So a spare in the bags buys nothing now, and the driver
+-- gets no special treatment just because it happens to be the toon in front of you.
+-- A live 0 is never taken at face value while a recorded countdown is still running; our own count wins
+-- until it expires. A nonzero reading, if the client volunteers one unprompted, is believed.
+-- The duration is an assumption, not a measurement. Persisted to disk, so a /lua reload does not hand
+-- back a green button on a live cooldown.
+-- TWO HOURS. A sample once read 6275 shortly after a click, suggesting ~6300 - but that reading came
+-- through the same broken path as everything else here, and overshooting is the safe direction: a button
+-- that greys slightly too long costs minutes, one that greys too little offers a click that gets refused
+-- and wastes the whole cycle. Anything older than this is treated as ready.
+NV_RECAST_SECS = 7200
 
 function nv_track_path()
     local dir = ''
@@ -490,46 +472,54 @@ function nv_track_read()
     return (left > 0) and left or 0
 end
 
--- Called when a click is believed to have gone off. On a toon that can read the timer this is redundant
--- and harmless - the next poke overwrites it with the truth.
+-- Called when the button has been pressed. This is the ONLY thing that ever starts a countdown - there
+-- is no measurement anywhere to correct it, so the recorded press is the whole source of truth.
 function nv_mark_clicked()
     nvSecsVal, nvSecsAt = NV_RECAST_SECS, mq.gettime()
     nv_track_write(NV_RECAST_SECS)
 end
 
+-- TRACKING FIRST, READING SECOND. The whole read path is only trustworthy in one narrow case: when the
+-- pool is already down, the refused click on the loose copy surfaces a real number. Everywhere else the
+-- reads are worthless - the socketed copy always claims ready, and asking the loose one costs a charge.
+-- So the source of truth is now OUR OWN RECORD of when the button last fired, persisted to disk.
+-- Returns seconds left, or -1 for GENUINELY UNKNOWN - which is a real answer here, not a failure. A
+-- character that has never clicked through AT, or last clicked more than two hours ago, has no way to
+-- know its state and should say so rather than pick a side.
 function nv_secs()
-    local v = nil
-    pcall(function() v = mq.TLO.FindItem('=' .. NIGHTVEIL_ITEM).TimerReady() end)
-    local s   = timer_secs(v)
     local now = mq.gettime()
-    if s > 0 then                                          -- a real countdown, believed on sight
-        nvReadOK, nvSecsVal, nvSecsAt = true, s, now
-        if s > NV_RECAST_SECS then NV_RECAST_SECS = s end   -- the constant was short; learn from the truth
-        return s
-    end
     if nvSecsVal > 0 then
         local left = nvSecsVal - math.floor((now - nvSecsAt) / 1000)
-        if left > 0 then return left end                   -- the 0 is stale; use our own count
-        nvSecsVal = -1                                     -- run out: genuinely ready
+        if left > 0 then
+            -- A FREE LOOK, NEVER A CLICK. If the client happens to be showing a real number we take it;
+            -- we just never provoke one. On most characters this reads 0 forever and the count stands.
+            local v = nil
+            pcall(function() v = mq.TLO.FindItem('=' .. NIGHTVEIL_ITEM).TimerReady() end)
+            local real = timer_secs(v)
+            if real > 0 then
+                nvSecsVal, nvSecsAt = real, now
+                return real
+            end
+            return left
+        end
+        nvSecsVal = -1                                     -- run out
+        pcall(function() os.remove(nv_track_path()) end)
+        return -1                                          -- back to unknown, not to a claimed "ready"
     end
-    -- NOTHING IN MEMORY. Either this is a fresh load or we have never seen a cooldown - check the file
-    -- before believing a 0, because a reload mid-cooldown is exactly when the green button lies.
+    -- NOTHING IN MEMORY - fresh load, or we have never seen it fire. The file is the only history there
+    -- is. Older than a full cycle and it tells us nothing, which is unknown rather than ready.
     local disk = nv_track_read()
     if disk > 0 then
         nvSecsVal, nvSecsAt = disk, now
         return disk
     end
-    if s == 0 and (nvReadOK or nv_loose() > 0) then return 0 end
-    return -1                                              -- a zero we have no reason to trust yet
+    return -1
 end
 
--- Usable and off cooldown. Where there is no spare to read, the honest answer is "unknown" - and the
--- useful behaviour for unknown is to ALLOW the attempt, because the client's refusal costs nothing
--- while a permanent false "not ready" would lock the button out forever on those characters.
+-- Nothing here can prove readiness, so the click is always allowed. An emblem that is actually down
+-- refuses harmlessly and the refusal event marks it, which is how an unknown resolves itself.
 function nv_ready()
-    local s = nv_secs()
-    if s >= 0 then return s == 0 end
-    return true   -- unknown: let the click go and let the client refuse it
+    return nv_secs() <= 0
 end
 
 function nv_state()
@@ -932,6 +922,66 @@ end
 -- is why this read "not listed" for every currency while the list plainly had 10 rows in it.
 -- The July probe got this right by design: it walked columns 1..6 and reported only the non-empty ones.
 -- Matches on CONTAINS rather than equals, because a row label may carry a count or padding with it.
+-- SHOW THE TAB BEFORE READING THE LIST. IW_AltCurr_PointList only populates while the Alt. Currency
+-- subwindow is the one on screen; on any other tab it reads 0 rows, and altcur_balance() then falls
+-- through its loop and reports "not listed at all" for a currency the character plainly has.
+-- altcur_find_tab() cannot be used for this: it calls altcur_row() first, which needs the list to be
+-- readable already - so it can only find the tab when the tab is already showing. Probe on the ROW
+-- COUNT instead, which is exactly the thing that changes when the right tab comes up.
+-- Cached, so the sweep happens once per session rather than on every balance read.
+altcurListTab = nil
+
+function altcur_list_rows()
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
+    return n
+end
+
+-- ROWS TWICE, 150ms APART. A single row-count read is not enough: the list keeps its previous contents
+-- for a moment after the tab changes, so the first tab tried can report rows that belong to the tab we
+-- just left. Stylin found "tab 5" and then "tab 1" seconds later on 2026-08-06 for exactly that reason.
+function altcur_rows_stable()   -- global: the main chunk is at Lua's 200-local ceiling
+    if altcur_list_rows() <= 0 then return false end
+    mq.delay(150)
+    return altcur_list_rows() > 0
+end
+
+function altcur_show_tab()
+    if altcur_rows_stable() then return true end
+    -- TABSELECT DOES NOTHING TO A CLOSED WINDOW, so without this every one of the ten tabs "fails" in
+    -- the same way and the message blames the tab control. Sunetoo reported exactly that three times
+    -- over while her inventory was simply not open.
+    local open = false
+    pcall(function() open = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+    if not open then
+        pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
+        mq.delay(800, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
+        pcall(function() open = (mq.TLO.Window(ALTCUR_WND).Open() == true) end)
+        if not open then
+            log('\\ay[altcur] %s will not open - cannot read the currency list\\ax', ALTCUR_WND)
+            return false
+        end
+        altcurCloseAfter = true
+    end
+    local tabs = {}
+    if altcurListTab then tabs[1] = altcurListTab end
+    for t = 1, 10 do if t ~= altcurListTab then tabs[#tabs + 1] = t end end
+    for _, t in ipairs(tabs) do
+        pcall(function() mq.cmdf('/notify %s IW_Subwindows tabselect %d', ALTCUR_WND, t) end)
+        mq.delay(300, function() return altcur_list_rows() > 0 end)
+        if altcur_rows_stable() then
+            if altcurListTab ~= t then
+                log('[altcur] the currency list is on tab %d', t)
+                altcurListTab, ALTCUR_TAB = t, t
+            end
+            return true
+        end
+    end
+    log('\\ay[altcur] no tab 1-10 makes the currency list readable - the tab control may not be '
+        .. 'IW_Subwindows. Run /atcurrency to see what is there.\\ax')
+    return false
+end
+
 function altcur_balance(name)
     -- NO WINDOW-OPEN GATE. This used to refuse to read unless InventoryWindow was open, on the strength
     -- of a note that "the rows only populate on that page". The log disproved it in passing:
@@ -952,10 +1002,10 @@ function altcur_balance(name)
         pcall(function() mq.TLO.Window(ALTCUR_WND).DoOpen() end)
         mq.delay(600, function() return mq.TLO.Window(ALTCUR_WND).Open() == true end)
         altcurCloseAfter = true
-        mq.delay(200)   -- let the list populate before reading it
     end
-    local rows = 0
-    pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
+    -- The window being open is not enough; the right tab has to be showing.
+    altcur_show_tab()
+    local rows = altcur_list_rows()
     local want = name:lower()
     for i = 1, rows do
         local cells, hit = {}, false
@@ -1007,7 +1057,11 @@ function query_alt_currency(peers, name)
             mq.delay(60)   -- spacing: bunched fires are what DanNet drops
         end
         -- Give them a moment, pumping events so replies actually land.
-        local deadline = mq.gettime() + 900
+        -- 2.5s, NOT 900ms. A peer whose inventory is on the wrong tab has to open the window and sweep
+        -- for the right one before it can read anything, which costs seconds - so the old window timed
+        -- out on precisely the characters that most needed asking. Sunetoo "never answered" three
+        -- rounds running on 2026-08-06 while doing exactly this work.
+        local deadline = mq.gettime() + 2500
         while mq.gettime() < deadline do
             mq.doevents(); mq.delay(50)
             local still = {}
@@ -1261,7 +1315,15 @@ local TANK_CLASS   = { WAR = true, PAL = true, SHD = true }
 local lastXTankKey = nil   -- last list this toon set (for the on-change announce)
 local lastGroupKey  = nil   -- group roster as last seen, so a membership change can re-test the network
 local lastGroupList = {}    -- the actual names, so we know WHO left and can shut their worker down
+pendingClose = {}          -- lowercase name -> when to close their worker if they have not returned
+                           -- GLOBAL, not local: this file sits at 200 locals in the main chunk, which is
+                           -- Lua's hard ceiling, and one more will not compile.
+GROUP_CLOSE_GRACE = 120000 -- how long a departed character keeps its worker before being shut down
 local resyncAt     = 0     -- when to resync after a roster change (0 = nothing pending)
+local resyncFirstAt = 0    -- when the current run of churn began, so the debounce cannot defer forever
+local lastResyncAt  = 0    -- last time the network half actually ran
+RESYNC_MIN_GAP   = 15000   -- floor between full re-reports
+RESYNC_MAX_DEFER = 12000   -- stop deferring once churn has run this long
 local lastRevive   = 0     -- last crash-watch sweep
 
 -- OTHER groups' raid tanks, minus me and minus my OWN group's tank (he's already covered by the group
@@ -1423,6 +1485,7 @@ local burnRefreshRequested = false   -- Burns tab 'Refresh' - re-parse the INI a
 burnPollOn = true            -- /atburnpoll off to silence the burn poll on this toon (crash test)
 tribLast   = nil             -- last tribute state sent to the driver, so we only send on change
 local burnStartAt    = 0     -- first poll is delayed: reporting before the driver's binds exist loses items
+lastResyncHonored = 0        -- last /at_resync this worker actually acted on
 local lastBurnResync = 0     -- slow full re-report; reports only fire on CHANGE, so a dropped one is
                              -- otherwise lost until that item next flips. This heals it.
 local lastBurnSend   = 0     -- rate limiter for burn reports (their own lane - see the dribble below)
@@ -2398,7 +2461,7 @@ function coth_aug_report(quiet)
         local loose = 0
         pcall(function() loose = tonumber(mq.TLO.FindItemCount('=' .. COTH.ITEM)()) or 0 end)
         if loose > 0 then
-            log('\\ay[coth] %s is in your bags, not socketed - it must be in a CHARM to click\\ax', COTH.ITEM)
+            log('[coth] %s is in your bags rather than socketed - that is fine, it clicks from there', COTH.ITEM)
         elseif not quiet then
             log('[coth] no %s found on this character', COTH.ITEM)
         end
@@ -2422,10 +2485,20 @@ function coth_read_self()
     -- and the gather then picked that character as a summoner and got nothing.
     -- Only a charm counts. Checked once and cached: augs do not move mid-fight, and walking twenty-odd
     -- equipment slots every read would be silly.
+    -- USABLE FROM A BAG. This used to require the aug to sit in an EQUIPPED charm, mirroring the rule
+    -- the Nightveil emblem really does have (EffectType 4, "Click Worn"). The Wayfarers emblem does not
+    -- share that rule - it fires perfectly well from a charm sitting in a bag, and the click at the
+    -- bottom of this file has always used FindItem by name, which reaches into bags.
+    -- So the gate was stricter than the click: find_aug walks equipped slots only, returned nil for a
+    -- bagged charm, and this character reported "no emblem" while being entirely capable of summoning.
+    -- The test now is simply whether the client can find the item at all.
+    -- NOT CACHED WHEN FALSE. The old cache latched on the first look and never re-checked, so moving the
+    -- charm into a bag disabled the character until a reload - and moving it back did not bring it back.
     local em = -1
-    if cothAugOk == nil then
-        local slot = coth_find_aug()
-        cothAugOk = (slot == 'charm')
+    if cothAugOk ~= true then
+        local found = 0
+        pcall(function() found = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0 end)
+        cothAugOk = (found > 0)
         if not cothAugOk then coth_aug_report(true) end
     end
     if cothAugOk then
@@ -2525,7 +2598,15 @@ local function coth_tick()
             rezlog('[coth] %s arrived', pn)
             COTH.pending = nil
         elseif (now - COTH.pending.at) > 20000 then
-            rezlog('[coth] %s never arrived - releasing', pn)
+            -- REPORT WHAT WE ACTUALLY KNOW ABOUT THEM. "never arrived" on its own does not say whether
+            -- they moved at all, whether their report is stale, or whether they are simply out of range.
+            local st = COTH.state[pn]
+            if st then
+                rezlog('[coth] %s never arrived - releasing (their last report: %ds away, los=%d, %dms old)',
+                       pn, st.dist or -1, st.los or 0, now - (st.updated or now))
+            else
+                rezlog('[coth] %s never arrived - releasing (NO report from them at all)', pn)
+            end
             COTH.claims[pn] = nil
             peer_bcast('/at_cothfail %s', pn)
             COTH.pending = nil
@@ -2566,8 +2647,29 @@ local function coth_tick()
                 COTH.castAt = now
                 COTH.pending = { name = nm, at = now }
                 peer_bcast('/at_cothclaim %s', nm)
-                rezlog('[coth] summoning %s (%d) via "%s%s"', nm, tid, COTH.ITEM, COTH.OPTS)
+                -- SAY WHAT STATE WE FIRED FROM. "never arrived" covers two completely different failures -
+                -- the cast never went, or it went and the arrival was not seen - and the log could not
+                -- tell them apart. Observed 2026-08-05: every FIRST summon of a gather failed and every
+                -- retry worked, on the same character, which fits an interrupted cast far better than a
+                -- detection problem. The emblem has a cast time and NoInterrupt does not stop MOVEMENT
+                -- from breaking it, and the first summon fires while the group is still settling.
+                local emT, mv = -1, 0
+                pcall(function() emT = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
+                pcall(function() mv = tonumber(mq.TLO.Me.Speed()) or 0 end)
+                rezlog('[coth] summoning %s (%d) - my emblem timer %s, my speed %.1f', nm, tid,
+                       (emT == 0) and 'ready' or tostring(emT), mv)
                 pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, tid) end)
+                -- DID A CAST ACTUALLY START? One look shortly after. If nothing is being cast the click
+                -- never took, and no amount of waiting for an arrival will help.
+                mq.delay(600)
+                local castingNow, castName = 0, ''
+                pcall(function() castingNow = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+                pcall(function() castName = tostring(mq.TLO.Me.Casting.Name() or '') end)
+                if castingNow > 0 then
+                    rezlog('[coth]   cast started: %s', (castName ~= '') and castName or tostring(castingNow))
+                else
+                    rezlog('\\ay[coth]   NO CAST STARTED - the click did not take (moving? interrupted? on cooldown?)\\ax')
+                end
                 pcall(function() mq.cmdf('/gsay Call of the Hero on %s', nm) end)
                 return
             end
@@ -4993,11 +5095,14 @@ pcall(function()
                                               or 'NOT FOUND - this is why the button refuses')
         local rpk, rsi = nv_loose_slot()
         log('   nv_loose()        : %d   at pack%s slot%s', nv_loose(), tostring(rpk), tostring(rsi))
-        nv_refresh(true)
-        mq.delay(400)
-        log('   after poke        : TimerReady=%s ItemReady=%s',
+        -- DELIBERATELY DOES NOT POKE. A probe that fires the thing it is probing is not a probe. On a
+        -- ready pool the right-click on the loose copy casts the socketed emblem, so /atnv reads whatever
+        -- the client happens to be showing and nothing more.
+        log('   raw read (no poke): TimerReady=%s ItemReady=%s',
             tostring(mq.TLO.FindItem('=' .. nm).TimerReady()), tostring(mq.TLO.Me.ItemReady(nm)()))
-        log('   nvReadOK          : %s   (has this char ever reported a real countdown)', tostring(nvReadOK))
+        log('   tracked           : %s', (nv_secs() > 0) and nv_hms(nv_secs()) or 'nothing on record')
+        log('   tracking          : %s', (nv_secs() > 0) and (nv_hms(nv_secs()) .. ' left (from the recorded press)')
+                                          or 'nothing on record - treated as unknown, button green')
         log('   nv_secs()         : %d (%s)   (-1 = no read available)', nv_secs(), nv_hms(nv_secs()))
         log('   nv_state()        : %d   (-1 means unusable)', nv_state())
     end)
@@ -5011,7 +5116,10 @@ pcall(function()
             tostring(mq.TLO.Window(ALTCUR_WND).Open()))
         local rows = 0
         pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
-        log('   currency list rows: %d  (0 = inventory closed, or not on the Alt. Currency tab)', rows)
+        log('   currency list rows: %d  (before selecting a tab)', rows)
+        altcur_show_tab()
+        rows = altcur_list_rows()
+        log('   currency list rows: %d  (after altcur_show_tab, tab=%s)', rows, tostring(altcurListTab))
         -- EVERY row, and every column that has anything in it. The previous version printed a row only
         -- when column 1 was non-empty, so a list whose names live in column 2 printed nothing at all -
         -- which is exactly what happened: 10 rows reported and not one shown.
@@ -5177,15 +5285,15 @@ end
         if not n then
             log('[nvtest] %d methods - run /atnvtest <n> to fire exactly one:', #methods)
             for i, m in ipairs(methods) do log('   %d. %s', i, m.name) end
-            log('[nvtest] loose copy to poke: %s', nv_loose_slot() and 'yes' or 'NO - result will rest on the buff alone')
+            log('[nvtest] result rests on the buff and the recorded press - the emblem is never clicked to check')
             return
         end
         if not methods[n] then log('\\ar[nvtest] no method %d\\ax', n); return end
         if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then
             log('\\ay[nvtest] %s is not in my charm - nothing to test\\ax', NIGHTVEIL_ITEM); return
         end
-        -- BEFORE. Poked first so the number is current rather than the stale 0 the field decays to.
-        nv_refresh(true); mq.delay(400)
+        -- BEFORE. From the record only. Poking here would fire the emblem and the test would be
+        -- measuring its own side effect.
         local before = nv_secs()
         local bb = 0
         pcall(function() bb = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
@@ -5199,7 +5307,8 @@ end
         -- A FULL SIX SECONDS. Long enough for a cast to finish and the buff to register, so a slow
         -- success is not recorded as a failure.
         mq.delay(6000)
-        nv_refresh(true); mq.delay(400)
+        nv_mark_clicked()
+        mq.delay(400)
         local after = nv_secs()
         local ab = 0
         pcall(function() ab = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
@@ -5224,11 +5333,9 @@ end
                 slot and (' (it is in ' .. slot .. ')') or '')
             return
         end
-        -- POKE BEFORE ASKING. Between the ten-minute refreshes the loose copy's timer decays to a stale
-        -- 0, and a fresh session has never read it at all - so without this the gate can wave through a
-        -- click on a live cooldown, and the method loop then works its way through all eleven failing.
-        nv_refresh(true)
-        mq.delay(400)
+        -- NO POKE IN THE GATE. This used to right-click the loose copy to freshen the read before
+        -- deciding whether to allow the click - which fires the emblem, meaning the gate could set off
+        -- the very thing it was checking on. The record is the gate now.
         local left = nv_secs()
         if left > 0 then
             log('[nv] %s is not ready - %s left', NIGHTVEIL_ITEM, nv_hms(left))
@@ -5257,55 +5364,39 @@ end
         -- nv_ready() returns true unconditionally, so success here rests on the BUFF check alone.
         -- The BUFF is checked as well, because an effect that landed proves the click worked whatever a
         -- timer says.
-        -- Success = no longer ready, OR the buff appeared. Judging by TimerReady alone is what made every
-        -- method look like a failure: it stayed at 0 throughout, so nothing could ever be seen to work.
-        local function on_cooldown()
-            -- POKE FIRST. The loose copy's timer is stale at 0 until right-clicked, so asking straight
-            -- after a click reads "still ready" even when the click landed - which is precisely how
-            -- every method came to look broken before the refresh existed.
-            nv_refresh(true)
-            mq.delay(400)
-            if nv_secs() > 0 then return true end
-            local b = 0
-            pcall(function() b = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
-            if b == 0 then pcall(function() b = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
-            return b > 0
-        end
+        -- TWO STEPS, IN THIS ORDER, ALWAYS.
+        --   1. Use the EQUIPPED emblem. This is the one that actually casts.
+        --   2. Use the one in the BAG. With the pool now down it is refused rather than executed, and
+        --      the refusal is what makes the client publish a real countdown.
+        -- Step 2 is only safe because step 1 already happened. Run it on a ready pool and it fires the
+        -- socketed emblem itself - which is what the old ten minute background poke was doing.
+        -- The single method is the confirmed one. No cascade: every extra command is another cast that
+        -- can be held and discharged later.
+        local m = methods[nvMethod or 1]
+        pcall(m.run)
 
-        -- ONE COMMAND, NOT ELEVEN. The cascade was a discovery tool and discovery is finished - method 1
-        -- is confirmed. Leaving it in place is actively harmful: E3 does not necessarily discard a cast
-        -- it cannot perform right now, it HOLDS it, so a sweep run while the pool is down parks a stack
-        -- of requests that all discharge together the moment it comes up. That is exactly what was seen
-        -- on 2026-08-05 - emblems firing by themselves on several characters at once, long after the
-        -- button was pressed.
-        -- Entries marked sweep = false are never fired automatically at all; they exist for /atnvtest.
-        local order = { methods[nvMethod or 1] }
+        -- Recorded on the ATTEMPT. Nothing here can confirm a cast went - the socketed copy always
+        -- claims ready - so waiting for proof means never writing the timestamp at all. Two hours is the
+        -- assumption until step 2 replaces it with a real number.
+        nv_mark_clicked()
+        log('[nv] used %s via %s - reading the bagged copy for the real timer', NIGHTVEIL_ITEM, m.name)
 
-        local worked = nil
-        for _, m in ipairs(order) do
-            if m.sweep == false then break end   -- never fire a queuing method automatically
-            pcall(m.run)
-            -- LONG ENOUGH FOR A BUFF TO LAND. At 1.5s a click that worked was still in flight when the
-            -- next method fired, and the buff arriving mid-window handed the credit to whichever method
-            -- happened to be running - which is how /nowcast came to look like the winner on Sebbun.
-            mq.delay(NV_METHOD_WAIT_MS, on_cooldown)
-            if on_cooldown() then worked = m.name; break end
-            log('[nv] %s did nothing, trying the next method', m.name)
-        end
-        if worked then
-            for i, m in ipairs(methods) do if m.name == worked then nvMethod = i end end
-            log('\\ag[nv] %s clicked via %s\\ax', NIGHTVEIL_ITEM, worked)
-            nv_mark_clicked()   -- the only cooldown a no-spare toon will ever know about
-        else
-            log('\\ar[nv] %s did not fire (method %d). NOT trying the others - a failed cast can sit in '
-                .. 'E3\'s queue and go off on its own later. Use /atnvtest <n> to try another. It is aug %s in %s.\\ax',
-                NIGHTVEIL_ITEM, nvMethod or 1, tostring(augIdx), tostring(slotName))
-        end
-        -- POKE IMMEDIATELY. Otherwise the fresh cooldown is invisible until the next scheduled refresh,
-        -- up to ten minutes of a button that says ready when it is not.
-        nv_refresh(true)
+        -- Let the cast resolve before asking. Asking too early was what made every method look broken.
+        mq.delay(NV_METHOD_WAIT_MS)
+
+        -- STEP 2 IS GONE. It used to click the bagged copy to measure the real cooldown. Even though the
+        -- pool is down by this point and the click should be refused, it is the same action that fires
+        -- the emblem when the pool is up - and one wrong assumption about the order of events turns it
+        -- into an accidental cast. Not worth a more precise number.
         mq.delay(400)
-        nv_secs()     -- pick the new countdown up now so the push below carries it
+        local real = nv_secs()
+        if real > 0 and real < NV_RECAST_SECS then
+            nv_track_write(real)   -- solidify: persist the measured value, not the guess
+            log('\\ag[nv] %s down for %s (measured)\\ax', NIGHTVEIL_ITEM, nv_hms(real))
+        else
+            log('\\ay[nv] %s marked down for %s - the bagged copy gave no number, so this is the '
+                .. 'two hour assumption\\ax', NIGHTVEIL_ITEM, nv_hms(NV_RECAST_SECS))
+        end
         nvLast = ''   -- force a fresh push so the button greys immediately
     end)
     mq.bind('/at_potstate', function(char, key, carries, up, secs, dsecs)
@@ -5811,6 +5902,14 @@ pcall(function()
     end)
     mq.bind('/at_pong', function(peer) if peer then alive[peer:lower()] = true end end)
     mq.bind('/at_resync', function()   -- driver says the group changed: re-report EVERYTHING
+        -- A FLOOR HERE TOO, not just on the driver. This clears every last-reported cache, so the next
+        -- few polls push the full state of this character back across the wire - burns, pots, heals,
+        -- cures, magic, tribute. Cheap once. Three times in ten seconds, on six characters, is a flood
+        -- for no new information: nothing about this toon changed just because the roster did.
+        -- The driver rate limits its sending, but a worker should not depend on the driver being the
+        -- build it thinks it is.
+        if (mq.gettime() - lastResyncHonored) < 10000 then return end
+        lastResyncHonored = mq.gettime()
         burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}; tribLast = nil
         potLast = {}; healLast = {}; cureLast = {}; magicLast = {}
         lastBurnPoll, lastClickPoll = 0, 0   -- poll on the next tick rather than waiting out the 2s
@@ -6267,7 +6366,11 @@ local collectRequested = false   -- set by the Collect-all button; MAIN LOOP run
 local showStatus = false          -- toggle: show each toon's count per item (green if >= target, red if <)
 local refreshRequested = false    -- set to re-read the group's counts for the status view
 local statusResize = false        -- widen the window once when status is turned on
-local statusCounts = {}           -- peerlower -> { item -> count } (cached)
+-- GLOBAL, NOT LOCAL. /at_altbags at line ~4916 writes to this, which is ABOVE this line - so as a local
+-- it was not yet in scope there and the name resolved to a nil global, crashing the bind every time a
+-- peer reported its bag count. Declaring it global also gives a local slot back, and the main chunk is
+-- at Lua's 200 ceiling.
+statusCounts = {}                 -- peerlower -> { item -> count } (cached)
 local statusNames = {}            -- ordered display names for the status columns
 
 
@@ -6726,8 +6829,8 @@ local function render_group(label, color, items, altCurrency)
             for _, nm in ipairs(statusNames) do
                 if ((counts[nm:lower()] or {})[altCurrency] or 0) > 0 then anyItem = true; break end
             end
+            ImGui.SameLine()
             if anyItem then
-                ImGui.SameLine()
                 if ImGui.SmallButton('Reclaim All##altrec_' .. altCurrency) then
                     altReclaimAllWant = { name = altCurrency }
                 end
@@ -6735,6 +6838,12 @@ local function render_group(label, color, items, altCurrency)
                     pcall(function() ImGui.SetTooltip(
                         'Will put all ' .. altCurrency .. ' in bags back into Alt Currency,\non every character holding any.') end)
                 end
+            else
+                -- SAY THE SPACE IS EMPTY rather than drawing nothing. With no else branch the button
+                -- simply vanished whenever nobody held any in bags - which is the normal state right
+                -- after a tribute run - and a control that disappears reads as broken, not as idle.
+                -- The Withdraw side above already does this; the two now behave the same way.
+                ImGui.TextDisabled('nothing to reclaim')
             end
 
         end
@@ -8215,6 +8324,7 @@ function altcur_find_tab(name)
         log('[altcur] already know the tab: %d', altcurTabFound)
         return altcurTabFound
     end
+    altcur_show_tab()   -- altcur_row() below cannot read the list until the tab is up
     local row, rows = altcur_row(name)
     if not row then
         -- Say WHY. This returned nil in silence, which from the outside is indistinguishable from the
@@ -10119,17 +10229,23 @@ function draw_nightveil()
                 local st = nvState[nm]
                 local secs = st and st.secs or nil
                 local usable = st and st.ok == 1
-                if not usable then      ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0)
-                elseif secs == 0 then   ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
-                else                    ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.62, 0.25, 1.0) end
+                -- Unknown (-2) is drawn GREEN alongside a true ready. The tooltip carries the caveat;
+                -- the colour should not withhold a two hour cooldown that is probably up.
+                if not usable then          ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0)
+                elseif (secs or 0) <= 0 then ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
+                else                        ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.62, 0.25, 1.0) end
                 if ImGui.SmallButton(nm:sub(1, 8) .. '##nv_' .. nm) then click(nm) end
                 ImGui.PopStyleColor(1)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     local why
                     if not st then            why = 'no report yet'
                     elseif st.ok ~= 1 then    why = 'no ' .. NIGHTVEIL_ITEM .. ' socketed in a charm'
+                    -- -2 IS THE HONEST UNKNOWN: no click on record, or the last one was over two hours
+                    -- ago. It used to read "on cooldown", which was a claim we could not support -
+                    -- nothing on this build can tell us, and asking costs a charge. Say we do not know
+                    -- and leave the button live.
+                    elseif secs == -2 then    why = 'not sure on current cooldown\nwill adjust next time you click'
                     elseif (secs or 0) == 0 then why = 'ready'
-                    elseif secs == -2 then    why = 'on cooldown\n(this build reports no countdown for augs)'
                     else                      why = nv_hms(secs) .. ' left' end
                     pcall(function() ImGui.SetTooltip(nm .. '\n' .. why) end)
                 end
@@ -10459,6 +10575,52 @@ end
 --   invisible to a driver that has never heard from it until the 120s burn resync came round.
 --   DEPARTED characters leave entries in every state table. Mostly harmless because the draws all
 --   iterate group_members(), but it keeps stale numbers around to resurface if they rejoin.
+-- THE LOCAL HALF ON ITS OWN. Dropping a departed character's entries costs nothing and should never be
+-- rate limited - a stale row in the UI is the thing a roster change most needs cleaned up. Split out so
+-- churn can be answered cheaply without pinging, launching and asking five toons to re-report.
+-- DROP ONE CHARACTER'S ROWS. Needed because the grace-period close happens on a TIMER, not on a roster
+-- change - so nothing else would ever run a prune afterwards, and the worker's last reported state would
+-- sit in the UI until the next time somebody joined or left. Closing the worker stops new reports; this
+-- clears the ones already on the board.
+function prune_one(name)
+    local key = tostring(name or ''):lower()
+    if key == '' then return end
+    local function drop(t)
+        if type(t) ~= 'table' then return end
+        for k in pairs(t) do
+            if type(k) == 'string' and k:lower() == key then t[k] = nil end
+        end
+    end
+    drop(burnState); drop(potState); drop(healState); drop(cureState)
+    drop(DI.state);  drop(rezReady); drop(tributeState)
+    drop(counts);    drop(nvState)
+    -- COTH.state IS DELIBERATELY NOT DROPPED HERE. coth_can_summon() reads false when a character has no
+    -- entry, so clearing one is the same as declaring that toon unable to summon - and this path can run
+    -- WITHOUT the re-report that would refill it: the grace-period close is a timer, not a roster change.
+    -- The original code pruned it only inside resync_group, where a fresh round of reports always
+    -- follows. Left that way.
+end
+
+function resync_prune_only()
+    local inGroup = {}
+    for _, nm in ipairs(group_members()) do inGroup[nm:lower()] = true end
+    local function prune(t)
+        if type(t) ~= 'table' then return 0 end
+        local n = 0
+        for k in pairs(t) do
+            if type(k) == 'string' and not inGroup[k:lower()] and k:sub(1, 2) ~= '__' then
+                t[k] = nil; n = n + 1
+            end
+        end
+        return n
+    end
+    -- COTH.state left alone; see prune_one. This runs on every roster change including the ones the
+    -- rate limit stops from re-reporting, so anything cleared here can stay cleared.
+    return prune(burnState) + prune(potState) + prune(healState) + prune(cureState)
+         + prune(DI.state) + prune(rezReady) + prune(tributeState)
+         + prune(counts) + prune(nvState)
+end
+
 function resync_group()
     local inGroup, peers = {}, {}
     for _, nm in ipairs(group_members()) do
@@ -11211,6 +11373,10 @@ pcall(function()
 end)
 else
     log('AdventureTime %s ready [%s] (worker - headless; obeying the driver).', VERSION, BUILD_TAG)
+    -- FIND THE CURRENCY TAB ONCE, NOW, while nothing is waiting on an answer. The sweep costs up to
+    -- three seconds; paying that inside a balance query is what made peers miss the reply window.
+    -- Cached in altcurListTab afterwards, so every later read is immediate.
+    pcall(function() altcur_show_tab(); altcur_done() end)
 end
 -- DRIVER ONLY. This populates the Pots status columns, which only exist on the driver - but it used to
 -- run unconditionally, so all six toons each fired a full peers x items query pass at startup. Six
@@ -11291,17 +11457,17 @@ elseif driverName then
     pcall(function() peer_cmdf(driverName, '/at_rezorder? %s', myName) end)   -- late joiner (e.g. crash relaunch): ask for the live order
 end
 
--- SEED THE NIGHTVEIL TIMER AT STARTUP. A fresh session has never poked the loose copy, so the field
--- reads a stale 0 and the emblem looks ready even mid-cooldown - the button comes up green and the
--- first press burns eleven failing methods finding out otherwise. One poke here costs a single refusal
--- line and means the very first state push carries the truth.
--- Top level, not inside the driver branch above: the workers are the ones whose state the driver draws.
+-- SEED THE NIGHTVEIL TIMER AT STARTUP - FROM DISK ONLY, NEVER BY POKING. This used to right-click the
+-- loose copy to refresh the read. That is not a read: on a ready pool it FIRES the socketed emblem, so
+-- every character with a spare set its own emblem off at load.
+-- nv_refresh is a no-op stub now and nothing anywhere clicks the emblem to find out its state.
+-- The file is the whole history. Nothing needs to be asked of the client.
 pcall(function()
-    nv_refresh(true)
-    mq.delay(400)
     local left = nv_secs()
     if left > 0 then
         log('[nv] %s is on cooldown at startup - %s left', NIGHTVEIL_ITEM, nv_hms(left))
+    else
+        log('[nv] no %s cooldown on record - assuming ready until the button is used', NIGHTVEIL_ITEM)
     end
 end)
 
@@ -11366,10 +11532,27 @@ while running do
             if not firstLook and SHOW_UI then
                 local stillHere = {}
                 for _, m in ipairs(now) do stillHere[m:lower()] = true end
+                -- ANYONE BACK IN THE GROUP IS OFF THE HOOK. Checked before the departure sweep so an
+                -- exit and re-entry inside the grace window cancels cleanly and nothing is sent at all.
+                for m in pairs(pendingClose) do
+                    if stillHere[m] then
+                        pendingClose[m] = nil
+                        log('[sync] %s came back within the grace period - worker left running', m)
+                    end
+                end
                 for _, m in ipairs(lastGroupList) do
                     if not stillHere[m:lower()] and m:lower() ~= myName:lower() then
-                        peer_cmdf(m, '/at_close')
-                        log('[sync] %s left the group - closing its worker', m)
+                        -- NOT CLOSED ON THE SPOT. Closing costs a script shutdown and a relaunch on
+                        -- rejoin, and people bounce out of groups for reasons that resolve in seconds -
+                        -- a zone, a corpse run, a mis-click. Two minutes of grace turns the common case
+                        -- into nothing happening at all.
+                        -- The cost of waiting: their rows keep updating in the UI while they are gone,
+                        -- because a live worker still knows the driver name and keeps reporting.
+                        if not pendingClose[m:lower()] then
+                            pendingClose[m:lower()] = mq.gettime() + GROUP_CLOSE_GRACE
+                            log('[sync] %s left the group - closing its worker in %ds unless it returns',
+                                m, math.floor(GROUP_CLOSE_GRACE / 1000))
+                        end
                     end
                 end
             end
@@ -11378,7 +11561,16 @@ while running do
             if peerCheckAt == 0 then peerCheckAt = mq.gettime() + 8000 end
             -- Not on the first look: startup already brings the group up, and doing it twice would
             -- fire a second round of pings and launches for no reason.
-            if not firstLook and SHOW_UI then resyncAt = mq.gettime() + 3000 end
+            -- DEBOUNCED, BUT WITH A CEILING. Each change used to push the resync 3s further out, so a
+            -- roster that keeps churning defers it forever and the driver never re-reads anyone.
+            -- resyncFirstAt remembers when the churn STARTED; once RESYNC_MAX_DEFER has passed we stop
+            -- deferring and run one, however much the group is still moving.
+            if not firstLook and SHOW_UI then
+                local nowms = mq.gettime()
+                if resyncFirstAt == 0 then resyncFirstAt = nowms end
+                if (nowms - resyncFirstAt) >= RESYNC_MAX_DEFER then resyncAt = nowms
+                else resyncAt = nowms + 3000 end
+            end
         end
         if driverResyncAt > 0 and mq.gettime() >= driverResyncAt then
             driverResyncAt = 0
@@ -11387,9 +11579,36 @@ while running do
             end
             log('[sync] asked the group to re-report (driver just started)')
         end
+        -- GRACE EXPIRY. Deliberately re-checks the live roster rather than trusting the pending list:
+        -- a rejoin that happened while no other roster change fired would otherwise still get closed.
+        if SHOW_UI and next(pendingClose) then
+            local hereNow = {}
+            for _, m in ipairs(now) do hereNow[m:lower()] = true end
+            for m, due in pairs(pendingClose) do
+                if hereNow[m] then pendingClose[m] = nil
+                elseif mq.gettime() >= due then
+                    pendingClose[m] = nil
+                    peer_cmdf(m, '/at_close')
+                    prune_one(m)   -- no roster change is coming to clean this up; do it here
+                    log('[sync] %s did not return - closing its worker and clearing its rows', m)
+                end
+            end
+        end
         if resyncAt > 0 and mq.gettime() >= resyncAt then
-            resyncAt = 0
-            pcall(resync_group)
+            resyncAt, resyncFirstAt = 0, 0
+            -- A FLOOR ON HOW OFTEN THIS CAN COST ANYTHING. resync_group prunes, pings, launches missing
+            -- workers and asks all five for a full re-report. Enter/exit/enter spaced a few seconds
+            -- apart used to buy three of those back to back.
+            -- The prune still runs every time - it is local, free, and dropping a departed character's
+            -- entries promptly is the whole point. Only the network half is rate limited.
+            if (mq.gettime() - lastResyncAt) >= RESYNC_MIN_GAP then
+                lastResyncAt = mq.gettime()
+                pcall(resync_group)
+            else
+                pcall(resync_prune_only)
+                log('[sync] roster changed again within %ds - pruned locally, skipped the re-report',
+                    math.floor(RESYNC_MIN_GAP / 1000))
+            end
         end
         -- Crash watch every 5s. The per-character gates inside (a silence limit derived from the
         -- beacons, two failed pings, a 2 minute cooldown) are what stop this becoming a launch loop.
@@ -11970,8 +12189,15 @@ while running do
     -- riding along meant it stopped being polled entirely whenever auto-rez was off or a give-out was
     -- running. The symptom is a button that never leaves whatever colour it was when the gate closed.
     -- Change-gated the same way, so a stable state still costs one comparison rather than a message.
-    do
-        nv_refresh()            -- rate-limited; the read is stale until the bagged copy is poked
+    -- WRAPPED, BECAUSE OF WHAT IT SITS IN FRONT OF. Moving this ahead of the rez heartbeat put a purely
+    -- cosmetic button indicator upstream of the load-bearing part of the pulse - so when nv_state() threw
+    -- on a nil (2026-08-05, missing declarations), the error took the pulse down before the rez state
+    -- broadcast ran. rezReady never filled, and the visible symptom was "we aren't parsing rez items",
+    -- which points nowhere near the actual fault.
+    -- A rez chain must not be able to stop because a button could not decide what colour to be.
+    pcall(function()
+        -- NO POKE HERE. It used to sit on a ten minute timer and it was firing the emblems. nv_secs()
+        -- counts down from the recorded click without needing to ask the client anything.
         local nv = nv_state()
         local nk = tostring(nv)
         if nvLast ~= nk then
@@ -11979,7 +12205,7 @@ while running do
             if SHOW_UI then nvState[myName] = { ok = (nv ~= -1) and 1 or 0, secs = nv, updated = mq.gettime() }
             elseif driverName then peer_cmdf(driverName, '/at_nvstate %s %d', myName, nv) end
         end
-    end
+    end)
     if rezAuto and not distributing then
         -- ON CHANGE, plus a slow keepalive. This used to be a flat 2-5s heartbeat because the baton read
         -- the raw cooldown number; now that peers count it down themselves (rez_peer_secs), the only
