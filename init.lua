@@ -51,7 +51,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.03'
-local BUILD_TAG = 'at-1.03i-reclaimshow-2026-08-06'   -- bump on every change; prints on startup
+local BUILD_TAG = 'at-1.03q-tsbag-2026-08-06'   -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -474,6 +474,11 @@ end
 
 -- Called when the button has been pressed. This is the ONLY thing that ever starts a countdown - there
 -- is no measurement anywhere to correct it, so the recorded press is the whole source of truth.
+-- How long after our own click a recast refusal can still be assumed to be about the emblem. Generous
+-- enough for a slow client, short enough that an unrelated refusal a moment later is not ours.
+NV_ATTEMPT_WINDOW = 5000
+nvAttemptAt = nil
+
 function nv_mark_clicked()
     nvSecsVal, nvSecsAt = NV_RECAST_SECS, mq.gettime()
     nv_track_write(NV_RECAST_SECS)
@@ -2243,6 +2248,13 @@ local function save_settings()
             f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
             f:write('miniPhantom=' .. (miniPhantom and '1' or '0') .. '\n')
             f:write('miniPlacate=' .. (miniPlacate and '1' or '0') .. '\n')
+            f:write('epCaster=' .. tostring(epCaster or '') .. '\n')
+            do
+                local fold = {}
+                for fk, fv in pairs(miniFold) do if fv then fold[#fold + 1] = fk end end
+                table.sort(fold)
+                f:write('miniFold=' .. table.concat(fold, ',') .. '\n')
+            end
             f:write('miniNightveil=' .. (miniNightveil and '1' or '0') .. '\n')
             f:write('epGem=' .. tostring(epGem or 8) .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
@@ -2296,6 +2308,12 @@ local function load_settings()
             if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
             if k == 'miniPhantom' then miniPhantom = (v == '1' or v:lower() == 'true') end
             if k == 'miniPlacate' then miniPlacate = (v == '1' or v:lower() == 'true') end
+            if k == 'epCaster' then epCaster = tostring(v or '') end
+            if k == 'miniFold' then
+                miniFold = miniFold or {}
+                for fname in pairs(miniFold) do miniFold[fname] = nil end   -- clear in place, keep the table
+                for n in tostring(v or ''):gmatch('[^,]+') do if n ~= '' then miniFold[n] = true end end
+            end
             if k == 'miniNightveil' then miniNightveil = (v == '1' or v:lower() == 'true') end
             if k == 'epGem' then epGem = math.max(1, math.min(12, tonumber(v) or 8)) end
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
@@ -4857,6 +4875,12 @@ pcall(function()
         if e then e.state, e.oor = st, false end
     end)
     mq.bind('/at_ephave', function(who) if who and who ~= '' then epState[who] = true end end)
+    -- The pin has to reach every toon: each one decides locally whether it is the elected caster, so a
+    -- pin known only to the driver would leave the others still electing by class order.
+    mq.bind('/at_epcaster', function(who)
+        epCaster = (who and who ~= '-' ) and who or ''
+        save_settings()
+    end)
     mq.bind('/at_epgem', function(n)
         local g = math.max(1, math.min(12, math.floor(tonumber(n) or 8)))
         if g ~= epGem then
@@ -5351,6 +5375,9 @@ end
         -- Success is judged by the item going ON COOLDOWN, not by the command returning - a command that
         -- does nothing returns just as happily as one that works.
         log('[nv] clicking %s', NIGHTVEIL_ITEM)
+        -- STAMP THE ATTEMPT. The recast-refusal event below has no way of knowing WHICH item the client
+        -- was talking about, so it needs to know whether we just asked for one.
+        nvAttemptAt = mq.gettime()
         local slotName, augIdx = find_aug(NIGHTVEIL_ITEM)
         -- MY OWN SPAWN ID, because that is the one difference between this and the CoTH emblem - which is
         -- also an aug, also in a charm, and works. It passes a target id; this did not. E3's /nowcast
@@ -5873,6 +5900,17 @@ pcall(function()
     mq.event('at_nv_recast', 'Spell recast time not yet met#*#', function()
         if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then return end
         if nv_secs() > 0 then return end        -- already counting; the refusal tells us nothing new
+        -- ONLY IF WE JUST ASKED. This message does NOT name the item - it is the client's generic recast
+        -- refusal - so without this guard ANY refused clicky was attributed to the emblem. E3 retries
+        -- things constantly, so the moment our own timer expired something unrelated would be refused
+        -- and reset it for another full cycle.
+        -- Sebbun's log shows the loop perfectly: refusals at 05:20, 07:20, 09:20, 11:20, 13:20, 15:20,
+        -- 17:20, 19:21 - exactly two hours apart, with no click of ours anywhere near them. The emblem
+        -- was never actually coming up.
+        -- The cost of the guard is that a click made BY HAND outside the script is no longer noticed.
+        -- That is the lesser problem: the file already carries the history across sessions, and a missed
+        -- manual click greys the button too little rather than locking it out forever.
+        if not nvAttemptAt or (mq.gettime() - nvAttemptAt) > NV_ATTEMPT_WINDOW then return end
         log('[nv] the client refused on recast - marking %s down', NIGHTVEIL_ITEM)
         nv_mark_clicked()
         nvLast = ''
@@ -7226,20 +7264,27 @@ end
 
 -- DI staff, kept OUT of the crown/token table so that stays exactly as it was. The tank's save state
 -- comes first (it is the thing you actually want to know), then the staff cooldowns underneath.
-function draw_di_mini()
+-- Whether the tank is covered, as one line. Shared so it can sit on the section HEADER as well as in
+-- the panel: it is the thing you actually want to know from the DI section, and it should not disappear
+-- because the section happens to be folded.
+function draw_di_save_line()
     local tank = di_tank()
     if not tank then
         ImGui.TextDisabled('no tank in group')
-    else
-        local ds = DI.state[tank]
-        if not ds then
-            ImGui.TextDisabled(tank .. ': no report')
-        elseif ds.saveUp == 1 then
-            ImGui.TextColored(0.35, 0.90, 1.00, 1.0, tank .. ' has a save')
-        else
-            ImGui.TextDisabled(tank .. ': no save')
-        end
+        return
     end
+    local ds = DI.state[tank]
+    if not ds then
+        ImGui.TextDisabled(tank .. ': no report')
+    elseif ds.saveUp == 1 then
+        ImGui.TextColored(0.35, 0.90, 1.00, 1.0, tank .. ' has a save')
+    else
+        ImGui.TextDisabled(tank .. ': no save')
+    end
+end
+
+function draw_di_mini()
+    -- Drawn on the header now, so the panel does not repeat it. See the mini render loop.
 
     local cols = {}
     for _, nm in ipairs(rezPriority) do
@@ -7735,9 +7780,8 @@ local function draw_rez_mini()
         if rr and ((rr.crown or -1) >= 0 or (rr.token or -1) >= 0
                    or (rr.cotw or -1) >= 0 or (rr.divine or -1) >= 0) then cols[#cols + 1] = nm end
     end
-    -- Above the table, because a rez system that has deliberately stopped looks exactly like a broken
-    -- one, and this is the answer to "why is nobody rezzing".
-    draw_wipe_button('mini')
+    -- The wipe button used to sit here. It is on the section HEADER now, so it stays reachable when the
+    -- section is folded - which is exactly when you would still want it. One button, one place.
     if #cols == 0 then ImGui.TextDisabled('rez: no crown/token reports'); return end
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
@@ -8582,16 +8626,19 @@ function altcur_pull(name, qty)
     if (mq.TLO.Cursor.ID() or 0) ~= 0 then
         -- COUNT THE FREE SLOTS rather than claim the bags are full. They were not, the last time this
         -- said so, and a message that asserts the wrong cause sends the next hour in the wrong direction.
+        -- Counted through bag_usable, so a tradeskill bag's empty slots are not reported as room. Saying
+        -- "47 free slots" about slots that cannot take the item is worse than saying nothing.
         local free = 0
         for b = 1, 10 do
-            local slots = 0
-            pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
-            for sl = 1, slots do
-                local occupied = true
-                pcall(function()
-                    occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
-                end)
-                if not occupied then free = free + 1 end
+            local usable, slots = bag_usable(b)
+            if usable then
+                for sl = 1, slots do
+                    local occupied = true
+                    pcall(function()
+                        occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
+                    end)
+                    if not occupied then free = free + 1 end
+                end
             end
         end
         log('\\ar[altcur] %s will not leave the cursor after 3 tries (%d free bag slot(s)). STOPPING.\\ax',
@@ -9079,11 +9126,55 @@ function ep_resume(why)
     rezlog('[placate] E3 resumed (%s)', why or 'done')
 end
 
-function ep_is_enchanter()
+-- WHO CAN WORK THE PLACATE QUEUE. Enchanters and clerics both get a placate line, and everything
+-- downstream is already class-agnostic: ep_best_placate scans THIS character's spellbook for the Calm
+-- line and takes the highest rank it owns, ep_ensure_gem mems whatever that turns out to be, and the
+-- range comes from the resolved spell. So adding a class is genuinely this one list.
+-- Still a CLASS check rather than "owns a placate spell": several classes get one, and only these two
+-- have the augment-proc problem the strip exists for. Gating on the spell would rope in a druid who has
+-- one and does not need any of this.
+EP_CLASSES = { ENC = true, CLR = true, PAL = true }
+-- WHO ACTUALLY WORKS THE QUEUE when more than one character can. Without this every capable toon in the
+-- group strips its weapons and casts at the same mob - three characters doing one job, three sets of
+-- gear off, and the mob placated twice over.
+-- Class order, best first. Enchanter leads because placate is their line and the rank they carry is
+-- normally the highest; cleric next; paladin last, since theirs tends to be the shortest-ranged.
+EP_CLASS_ORDER = { 'ENC', 'CLR', 'PAL' }
+-- `or ''` not `= ''`, same reason as miniFold: this sits above load_settings() today, and a plain
+-- assignment would silently discard a loaded pin if either ever moved.
+epCaster = epCaster or ''   -- a character name pins it; empty means pick by class order
+-- Who the group has elected. Every toon computes this from the SAME inputs - the reported capability
+-- list and the class order - so they all reach the same answer without a negotiation.
+-- Ties are broken by name, for the same reason the rez chain sorts its pins: two toons of the same class
+-- must not disagree about which of them is first.
+function ep_elected()
+    if epCaster ~= '' then return epCaster end
+    local best, bestRank = nil, 99
+    for _, nm in ipairs(group_members()) do
+        if epState[nm] then
+            local cls = ''
+            pcall(function() cls = tostring(member_class(nm) or ''):upper() end)
+            for i, c in ipairs(EP_CLASS_ORDER) do
+                if c == cls then
+                    if i < bestRank or (i == bestRank and best and nm:lower() < best:lower()) then
+                        best, bestRank = nm, i
+                    end
+                    break
+                end
+            end
+        end
+    end
+    return best
+end
+
+function ep_can_placate()
     local c = ''
     pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or ''):upper() end)
-    return c == 'ENC'
+    return EP_CLASSES[c] == true
 end
+-- Kept as an alias: the name is wrong now but it is referenced from several places and a rename that
+-- misses one would fail silently as "this character cannot placate".
+function ep_is_enchanter() return ep_can_placate() end
 
 -- The spell currently memmed in the placate gem. Read rather than configured: the user picks the gem,
 -- and whatever is in it is what gets cast, so upgrading the spell needs no settings change.
@@ -9313,20 +9404,43 @@ end
 -- torch bagged fine because nothing wanted to equip it, which is why two of three slots failed and one
 -- appeared to work.
 -- Naming a destination slot removes the choice.
+-- BAGS THAT WILL NOT TAKE A WEAPON. A tradeskill-only container reports free slots like any other bag,
+-- so a stow aimed at one silently does nothing and the item stays on the cursor - which then reads as
+-- "bags are full" and stops the run.
+-- Checked by the container's own flag where the client offers one, and by name as a backstop, because
+-- the flag is exactly the sort of thing that reads wrong on this build.
+STOW_SKIP_BAGS = {
+    ["artisan's adept attache"] = true,
+}
+function bag_usable(b)
+    local slots = 0
+    pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
+    if slots <= 0 then return false, 0 end
+    local nm = ''
+    pcall(function() nm = tostring(mq.TLO.Me.Inventory('pack' .. b).Name() or '') end)
+    if nm ~= '' and STOW_SKIP_BAGS[nm:lower()] then return false, slots end
+    -- Some clients expose this directly. Treated as advisory: a true here is trusted, a nil is ignored.
+    local tsOnly = false
+    pcall(function() tsOnly = (tostring(mq.TLO.Me.Inventory('pack' .. b).TradeskillsOnly()) == 'TRUE') end)
+    if tsOnly then return false, slots end
+    return true, slots
+end
+
 function ep_stow_cursor()
     if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
     for b = 1, 10 do
-        local slots = 0
-        pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
-        for sl = 1, slots do
-            local occupied = true
-            pcall(function()
-                occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
-            end)
-            if not occupied then
-                pcall(function() mq.cmdf('/itemnotify in pack%d %d leftmouseup', b, sl) end)
-                mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-                if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
+        local usable, slots = bag_usable(b)
+        if usable then
+            for sl = 1, slots do
+                local occupied = true
+                pcall(function()
+                    occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
+                end)
+                if not occupied then
+                    pcall(function() mq.cmdf('/itemnotify in pack%d %d leftmouseup', b, sl) end)
+                    mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+                    if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
+                end
             end
         end
     end
@@ -9657,7 +9771,7 @@ function ep_soak_test(times)
     -- touch an enchanter - but this command called ep_strip directly, so /atplacatetest on a monk would
     -- have taken a monk's weapons off. A test that can do the damage it exists to rule out is no good.
     if not ep_is_enchanter() then
-        log('\\ay[placate test] this is an enchanter routine - not stripping a %s\\ax',
+        log('\\ay[placate test] placate is an enchanter/cleric routine - not stripping a %s\\ax',
             tostring(mq.TLO.Me.Class.ShortName() or '?'))
         return
     end
@@ -9730,6 +9844,10 @@ end
 
 function ep_tick()
     if not ep_is_enchanter() then return end
+    -- ELECTED ONLY. Capability is not permission: with an enchanter, a cleric and a paladin in one group
+    -- all three pass the class check, and all three would strip and cast at the same mob.
+    local who = ep_elected()
+    if who and who:lower() ~= myName:lower() then return end
 
     -- BACKSTOP FIRST, before anything else can return early. Being stripped is a state with a real cost -
     -- an enchanter with no weapons is an enchanter not meleeing and not proccing anything useful - and a
@@ -10260,6 +10378,43 @@ function draw_placate()
         if epState[nm] then holder = nm; break end
     end
 
+    -- WHO IS CASTING. Click a name to pin it, click the pinned one again to go back to automatic.
+    -- Shown whenever more than one character can placate, because that is exactly when the automatic
+    -- choice might not be the one you want - and hidden when there is only one, since a picker with a
+    -- single option is just a line of clutter.
+    do
+        local able = {}
+        for _, nm in ipairs(group_members()) do if epState[nm] then able[#able + 1] = nm end end
+        if #able > 1 then
+            local elected = ep_elected()
+            ImGui.TextDisabled('caster:')
+            for _, nm in ipairs(able) do
+                ImGui.SameLine()
+                local pinned = (epCaster ~= '' and epCaster:lower() == nm:lower())
+                local isElected = elected and elected:lower() == nm:lower()
+                if pinned then          ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
+                elseif isElected then   ImGui.PushStyleColor(ImGuiCol.Text, 0.80, 0.80, 0.80, 1.0)
+                else                    ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0) end
+                if ImGui.SmallButton(nm:sub(1, 8) .. '##epcaster_' .. nm) then
+                    epCaster = pinned and '' or nm
+                    save_settings()
+                    pcall(function() peer_bcast('/at_epcaster %s', (epCaster ~= '') and epCaster or '-') end)
+                    rezlog('[placate] caster %s', (epCaster ~= '') and ('pinned to ' .. epCaster)
+                                                                    or 'back to automatic')
+                end
+                ImGui.PopStyleColor(1)
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    local cls = tostring(member_class(nm) or '?')
+                    pcall(function() ImGui.SetTooltip(string.format('%s (%s)\n%s\n\nclick to %s',
+                        nm, cls,
+                        pinned and 'PINNED - always this one'
+                                or (isElected and 'chosen automatically by class order' or 'can placate, not chosen'),
+                        pinned and 'go back to automatic' or 'pin the placate queue to this character')) end)
+                end
+            end
+        end
+    end
+
     if ImGui.Button('Placate##epadd', 160, 0) then
         local id, nm, ty, hp = 0, '', '', 0
         pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
@@ -10498,8 +10653,20 @@ MINI_HELP = {
     rez  = 'Configure the rez order under the Rez tab.',
     combos = 'Group MGB heals with class combinations,\nso you only need to click one button.',
     phantom = 'Monk placate line. Click mobs to queue them;\nthe monk works down the list.',
-    placate = 'Enchanter placate. Strips weapons first so augment\nprocs cannot break it, then puts them back.',
+    placate = 'Enchanter or cleric placate. Strips weapons first so\naugment procs cannot break it, then puts them back.',
 }
+
+-- Which mini sections are folded shut. Persisted, because a fold you have to redo every session is
+-- worse than no fold at all.
+-- `or {}` rather than `= {}`: this line sits above load_settings() today, but a plain assignment would
+-- silently wipe the loaded folds if either ever moved - and it would fail as a missing fold rather than
+-- an error, which is the hardest kind to notice.
+miniFold = miniFold or {}
+-- ONLY THE BULKY SECTIONS FOLD. A fold header costs a line, so for a section that is two rows of
+-- buttons it takes up more room than it saves - header plus panel is bigger than the panel was.
+-- These three are tables that can run many rows deep; everything else is a button strip and is better
+-- served by the Settings on/off box, which removes it entirely rather than trading one line for another.
+MINI_FOLDABLE = { rez = true, di = true, burns = true }
 
 MINI_SECTIONS = {
     { key = 'rez',    label = 'Rez',                   draw = draw_rez_mini,
@@ -10548,7 +10715,7 @@ MINI_SECTIONS = {
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
     { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
       get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
-    { key = 'placate', label = 'Placate (enchanter)',    draw = draw_placate,
+    { key = 'placate', label = 'Placate',                draw = draw_placate,
       get = function() return miniPlacate end, set = function(v) miniPlacate = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
@@ -10951,11 +11118,46 @@ local function render()
             -- the same box in Settings persisted. One control per setting, and it saves.
             ImGui.Spacing()
             draw_tribute_mini()
+            -- COLLAPSE PER SECTION. Separate from the Settings on/off box on purpose: that decides
+            -- whether a section EXISTS and stops it rendering at all, this is "not right now" for one
+            -- you still want a moment later. Turning Rez off in Settings to stop looking at it means
+            -- going back to Settings to get it back, which is too much friction for a glance.
+            -- A folded section draws only its title, so it costs a line rather than a panel.
             for _, k in ipairs(miniOrder) do
                 local sec = mini_section(k)
                 if sec and sec.get and sec.get() and sec.draw then
                     ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                    sec.draw()
+                    local folded = false
+                    if MINI_FOLDABLE[k] then
+                        folded = miniFold[k] and true or false
+                        -- The caret IS the button, so the title line is the hit target rather than a
+                        -- separate widget crowding the row.
+                        if ImGui.SmallButton((folded and '> ' or 'v ') .. (sec.label or k) .. '##fold_' .. k) then
+                            miniFold[k] = (not folded) or nil
+                            save_settings()
+                        end
+                        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                            pcall(function() ImGui.SetTooltip(folded
+                                and 'Click to show this section'
+                                or  'Click to fold it away - it stays on, just out of the way') end)
+                        end
+                        -- WIPE LIVES ON THE HEADER, always - not just when folded. It is the one control
+                        -- in the rez section you reach for in a hurry, and having it move depending on
+                        -- whether the panel happens to be open is worse than it simply being in one
+                        -- place. Folding the section is exactly when you would still want it.
+                        -- draw_wipe_button already handles both states and is shared with the Rez tab.
+                        if k == 'rez' then
+                            ImGui.SameLine()
+                            draw_wipe_button('minihdr')
+                        end
+                        -- Same reasoning as the wipe button: "is the tank covered" is the one fact the
+                        -- DI section exists to tell you, so it belongs where folding cannot hide it.
+                        if k == 'di' then
+                            ImGui.SameLine()
+                            draw_di_save_line()
+                        end
+                    end
+                    if not folded then sec.draw() end
                 end
             end
         end
@@ -11128,7 +11330,7 @@ local function render()
                                     end
                                     pcall(function() ImGui.SetTooltip(
                                         'which gem holds placate' ..
-                                        (who and ('\nenchanter: ' .. who) or '\nno enchanter has reported in yet') ..
+                                        (who and ('\ncaster: ' .. who) or '\nnobody who can placate has reported in yet') ..
                                         (sp and ('\nin that gem here: ' .. sp ..
                                                  (ep_spell_ok(sp) and '  (looks right)' or '  (NOT a placate)'))
                                              or '')) end)
@@ -11730,7 +11932,8 @@ while running do
             epSaidHave = true
             epState[myName] = true
             pcall(function() peer_bcast('/at_ephave %s', myName) end)
-            log('[placate] I am the enchanter - I will work the placate queue')
+            log('[placate] I can placate (%s) - I will work the queue',
+                tostring(mq.TLO.Me.Class.ShortName() or '?'))
         end
         if not pwSaidHave and pw_have() then
             pwSaidHave = true
@@ -12356,6 +12559,7 @@ pcall(function() mq.unbind('/atpull') end)
 pcall(function() mq.unbind('/atplacatetest') end)
 pcall(function() mq.unbind('/atplacategem') end)
 pcall(function() mq.unbind('/at_ephave') end)
+pcall(function() mq.unbind('/at_epcaster') end)
 pcall(function() mq.unbind('/at_epgem') end)
 pcall(function() mq.unbind('/at_epmark') end)
 pcall(function() mq.unbind('/at_epclear') end)
