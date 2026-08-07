@@ -1,4 +1,7 @@
-# AdventureTime manifest - generated 2026-08-06 07:48
-# Do not hand-edit the hashes; re-run make-manifest.ps1 instead.
-build	at-1.03i-reclaimshow-2026-08-06
-file	init.lua	aa3f1811ac194b8ad255711fbdd35efdaf1650b13bc2386961491c6c39f1bc98
+# AdventureTime manifest
+# The updater compares this build line against BUILD_TAG inside the installed
+# init.lua, so this MUST match the tag in the file listed below or it will
+# either never update or update on every run.
+build at-1.04-2026-08-06
+
+file init.lua 21c13175c87b45b3340934b37864d94f5fcb441d67605bd1e01337335159dc82
