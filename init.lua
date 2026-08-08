@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.04'
-local BUILD_TAG = 'at-1.04-2026-08-06'   -- bump on every change; prints on startup
+VERSION = '1.05'
+local BUILD_TAG = '1.05'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -1517,6 +1517,9 @@ rezAuto     = false   -- master auto-rez toggle (default OFF - flip on deliberat
 -- Cleared by ZONING, not a timer: zoning is the thing that actually means "we have regrouped and are
 -- coming back deliberately", which is exactly the condition to start rezzing again.
 rezWipe     = false
+-- Which corpse the rezzer said it was casting on, so the loot afterwards goes to THAT body rather than
+-- whichever one a name search happens to return. Cleared once used.
+rezCorpseID = nil
 -- FEIGN DEATH. A feigning monk or necro is alive, off the mob's list, and one cast away from being on it
 -- again - so it must not be elected rezzer and must not spend a DI. Nothing here checked for it, which
 -- means a feign that saved a character could be undone by the rez chain electing them a second later.
@@ -2248,6 +2251,17 @@ local function save_settings()
             f:write('miniArcane=' .. (miniArcane and '1' or '0') .. '\n')
             f:write('miniPhantom=' .. (miniPhantom and '1' or '0') .. '\n')
             f:write('miniPlacate=' .. (miniPlacate and '1' or '0') .. '\n')
+            f:write('miniPacify=' .. (miniPacify and '1' or '0') .. '\n')
+            do
+                local po = {}
+                for pn, pv in pairs(pacOff) do if pv then po[#po + 1] = pn end end
+                table.sort(po)
+                f:write('pacOff=' .. table.concat(po, ',') .. '\n')
+                local pg = {}
+                for pn, pv in pairs(pacGem) do pg[#pg + 1] = pn .. ':' .. tostring(pv) end
+                table.sort(pg)
+                f:write('pacGem=' .. table.concat(pg, ',') .. '\n')
+            end
             f:write('epCaster=' .. tostring(epCaster or '') .. '\n')
             do
                 local fold = {}
@@ -2308,6 +2322,20 @@ local function load_settings()
             if k == 'miniArcane' then miniArcane = (v == '1' or v:lower() == 'true') end
             if k == 'miniPhantom' then miniPhantom = (v == '1' or v:lower() == 'true') end
             if k == 'miniPlacate' then miniPlacate = (v == '1' or v:lower() == 'true') end
+            if k == 'miniPacify' then miniPacify = (v == '1' or v:lower() == 'true') end
+            if k == 'pacOff' then
+                pacOff = pacOff or {}
+                for pn in pairs(pacOff) do pacOff[pn] = nil end
+                for n in tostring(v or ''):gmatch('[^,]+') do if n ~= '' then pacOff[n:lower()] = true end end
+            end
+            if k == 'pacGem' then
+                pacGem = pacGem or {}
+                for pn in pairs(pacGem) do pacGem[pn] = nil end
+                for ent in tostring(v or ''):gmatch('[^,]+') do
+                    local pn, pv = ent:match('^(.-):(%d+)$')
+                    if pn then pacGem[pn:lower()] = tonumber(pv) end
+                end
+            end
             if k == 'epCaster' then epCaster = tostring(v or '') end
             if k == 'miniFold' then
                 miniFold = miniFold or {}
@@ -2655,6 +2683,34 @@ local function coth_tick()
     local em = select(1, coth_read_self())
     if em ~= 0 then COTH.dbg = (em < 0) and 'no emblem' or 'emblem on cooldown'; return end
 
+    -- ONE SUMMONER AT A TIME, DECIDED THE SAME WAY BY EVERYONE.
+    -- The claim below is set locally and THEN broadcast, which is a race: on 2026-08-06 Sebbun, Sunetoo
+    -- and Nityrc all fired at Lunafeet within 400ms, each seeing no claim because none of the broadcasts
+    -- had landed yet. Three emblems spent on one summon.
+    -- A claim cannot fix that on its own - whoever checks first still wins, and "first" is decided by
+    -- network timing. So the choice is COMPUTED instead: every toon sorts the ready holders the same way
+    -- and only the top one acts. Nothing has to arrive in time, because nothing is sent.
+    -- The cascade still works: as each summoner's emblem goes on cooldown it drops out of the list and
+    -- the next one takes over, which is the same order it would have happened in anyway.
+    do
+        local ready = {}
+        for _, nm in ipairs(group_members()) do
+            if coth_gathered(nm) then
+                local st = COTH.state[nm]
+                -- Fresh reports only. A stale one would keep electing a toon that has since spent its
+                -- emblem, and the gather would stall waiting on somebody who cannot act.
+                if st and (now - (st.updated or 0)) < 6000 and (st.emblem or -1) == 0 then
+                    ready[#ready + 1] = nm
+                end
+            end
+        end
+        table.sort(ready, function(a, b) return a:lower() < b:lower() end)
+        if #ready > 0 and ready[1]:lower() ~= myName:lower() then
+            COTH.dbg = 'summoner is ' .. ready[1]
+            return
+        end
+    end
+
     for _, nm in ipairs(left) do
         local c = COTH.claims[nm]
         if not (c and now < c) then
@@ -2676,6 +2732,9 @@ local function coth_tick()
                 pcall(function() mv = tonumber(mq.TLO.Me.Speed()) or 0 end)
                 rezlog('[coth] summoning %s (%d) - my emblem timer %s, my speed %.1f', nm, tid,
                        (emT == 0) and 'ready' or tostring(emT), mv)
+                -- Same cursor rule before the emblem click. Best effort only here: a CoTH that does not
+                -- go out strands somebody, which is worse than the risk of clicking while holding.
+                cursor_stow('coth')
                 pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, tid) end)
                 -- DID A CAST ACTUALLY START? One look shortly after. If nothing is being cast the click
                 -- never took, and no amount of waiting for an arrival will help.
@@ -3510,6 +3569,12 @@ local function di_tick()
     -- is a one-line change. :format on a string with no %s is a no-op, so an empty OPTS is safe.
     local spec = DI.STAFF .. ((DI.OPTS ~= '') and DI.OPTS:format(tank) or '')
     rezlog('[di] target check: %s', di_target_desc(tid, tank))
+    -- Same cursor rule. The staff is the tank's last-ditch save, so a click that goes astray here costs
+    -- more than most - and skipping only means the chain tries again on the next pass.
+    -- Best effort. The staff is the tank's last-ditch save - not firing it is the worse failure.
+    if not cursor_stow('di') then
+        rezlog('\\ay[di] cursor will not clear - firing the staff anyway\\ax')
+    end
     rezlog('[di] FIRING /nowcast me "%s" %d', spec, tid)
     pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
     -- NOT ANNOUNCED HERE. Saying "DI staff on X" at fire time claims something we do not know yet: the
@@ -4128,6 +4193,15 @@ local function rez_autoaccept()
         if rezBoxAt > 0 then
             rezlog('[rez] rez box gone after %dms%s', now - rezBoxAt,
                    rezBoxClicked and ' (we clicked it)' or ' (NOT clicked by us)')
+            -- ARM THE CORPSE WATCHER HERE TOO. It normally arms on the dead->alive transition, but a
+            -- healer who rezzes the instant you drop means the tick never SEES you dead - there is no
+            -- transition to catch, and the corpse is left lying there.
+            -- Accepting a rez box is the other moment we know a rez just happened, and it is the one
+            -- that survives being rezzed faster than we poll.
+            if rezBoxClicked then
+                corpseLootUntil = mq.gettime() + 60000
+                rezlog('[corpse] rez accepted - watching for my corpse')
+            end
             rezBoxAt, rezBoxClicked = 0, false
         end
         return
@@ -4194,6 +4268,16 @@ local function rez_announce_ready()
     if zoning then return end
     if rezWasDead and not dead then          -- just got back up
         rezWasDead = false
+        -- LOOT MY OWN CORPSE. A rez leaves the body on the floor with everything in it, and the character
+        -- carries on fighting in whatever they were wearing when they died - which after a wipe is
+        -- nothing. Doing it here, on the dead->alive transition, is the one moment we know for certain
+        -- it just happened.
+        -- WATCH FOR THE CORPSE rather than waiting a fixed time. A delay is a guess about how long a
+        -- zone-in takes, and a character still loading when it expires would find nothing and give up
+        -- silently. The corpse APPEARING is the actual signal, so we look for it instead.
+        -- A window rather than forever: if no corpse turns up in a minute there is nothing to loot -
+        -- somebody else dragged it, or the rez was accepted somewhere else entirely.
+        corpseLootUntil = mq.gettime() + 60000
         rezExpectFrom  = mq.gettime()
         rezExpectUntil = mq.gettime() + 15000
         -- Two '/at_rezrdy!' broadcasts used to go from here - one now, one 1.2s later against loss -
@@ -4267,6 +4351,12 @@ local function rez_tick()
             if (tonumber(mq.TLO.Target.ID()) or 0) == rezCast.id then
                 pcall(function() mq.cmd('/corpse') end)
                 mq.delay(250)
+            end
+            -- A retry is MORE exposed than the first attempt: seconds have passed and a loot window, a
+            -- summoned item or a trade has had time to put something on the cursor since.
+            -- Best effort on the retry too - same reasoning as the first attempt.
+            if not cursor_stow('rez') then
+                rezlog('\\ay[rez] cursor will not clear - retrying anyway rather than lose the rez\\ax')
             end
             pcall(function() mq.cmdf('/nowcast me "%s" %d', rezCast.item, rezCast.id) end)
             return
@@ -4673,7 +4763,10 @@ local function rez_tick()
         pcall(function() mq.cmdf('/say ATREZ %d %s', tgtID, tgtName) end)
         rezlog('[rez] RAID token on %s @%dm (not in my group)', tgtName, tgtDist)
     end
-    pcall(function() peer_cmdf(tgtName, '/at_rezinc %s', myName) end)
+    -- SEND THE CORPSE ID, not just who is casting. The target uses it to loot the RIGHT body afterwards:
+    -- 'pccorpse <name>' returns whichever the client feels like, and after a wipe with more than one
+    -- death of yours on the floor that is a coin toss. The rezzer is holding the exact id already.
+    pcall(function() peer_cmdf(tgtName, '/at_rezinc %s %d', myName, tgtID) end)
     -- PULL THE CORPSE FIRST. /corpse drags a nearby body to your feet, and a corpse just out of reach is
     -- the difference between a rez and a wasted charge - which matters most exactly when it is hardest
     -- to walk, mid-wipe with things still up.
@@ -4692,8 +4785,32 @@ local function rez_tick()
     pcall(function() dAfter = tonumber(mq.TLO.Spawn(tgtID).Distance()) or dBefore end)
     if math.abs(dBefore - dAfter) >= 1 then
         rezlog('[rez] /corpse pulled %s from %dm to %dm', tgtName, dBefore, dAfter)
+    elseif dAfter <= CORPSE_NEAR then
+        -- ALREADY AT HAND. This used to be reported as "/corpse did nothing - out of drag range, or no
+        -- consent", which is true about the drag and wrong about the reason: a body at 1m has nowhere to
+        -- be dragged TO, so it cannot move a measurable amount and the command is ignored rather than
+        -- failing. Every observed case was 0-5m - all in reach, all reported as failures.
+        -- It sent two separate investigations down a consent rabbit hole while corpse clearing was in
+        -- fact working. A message that says "failed" when nothing was wrong is worse than no message.
+        rezlog('[rez] %s is already at hand (%dm) - no drag needed', tgtName, dAfter)
     else
         rezlog('[rez] /corpse did nothing on %s (still %dm) - out of drag range, or no consent', tgtName, dAfter)
+    end
+    -- NOTHING ON THE CURSOR BEFORE A CLICK. The rule the placate queue learned the hard way: an item held
+    -- while a click goes out is how it ends up somewhere nobody expects. Rez is the likeliest of all of
+    -- them to collide - deaths and looting happen in the same minute - and it fires on its own.
+    -- Skipping is cheap: the baton comes back round and another rezzer or another pass takes it.
+    -- BEST EFFORT, then fire anyway. Stow it if it will go - that is the whole point - but do NOT skip
+    -- the rez if it will not. A rez that does not go out costs a corpse run and possibly the pull; an
+    -- item that stays on the cursor through a click is a risk, not a certainty. Bags do fill up, and
+    -- four "will not stow" events in one session say this path gets taken for real.
+    -- Same call the CoTH click makes, for the same reason: stranding someone is the worse outcome.
+    do
+        local ok, held = cursor_stow('rez')
+        if not ok then
+            rezlog('\\ay[rez] %s is stuck on the cursor (bags full?) - firing anyway rather than lose the rez\\ax',
+                   tostring(held or '?'))
+        end
     end
     rezlog('[rez] FIRING /nowcast me "%s" %d (target %s @%dm, reach %d)', item, tgtID, tgtName, tgtDist, rez_range())
     pcall(function() mq.cmdf('/nowcast me "%s" %d', item, tgtID) end)
@@ -4730,8 +4847,12 @@ pcall(function()
     mq.bind('/at_expecttrade', function(ms)
         expectTradeUntil = mq.gettime() + (tonumber(ms) or 60000)
     end)
-    mq.bind('/at_close', function() mq.cmd('/e3p off'); running = false end)   -- broadcast close: resume E3, then exit
-    mq.bind('/at_e3', function(mode) mq.cmd('/e3p ' .. (mode == 'on' and 'on' or 'off')) end)   -- pause/resume E3
+    mq.bind('/at_close', function() e3_release_all(); running = false end)   -- broadcast close: resume E3, then exit
+    -- A PEER asking us to hold E3 is a third owner, not an override. Without this, a peer finishing its
+    -- distribution would send /at_e3 off and unpause a character that is mid-placate here.
+    mq.bind('/at_e3', function(mode)
+        if mode == 'on' then e3_hold('remote') else e3_release('remote') end
+    end)
     mq.bind('/at_xtank', function() set_tank_xtargets(false) end)   -- healer: set raid tanks on my XTargets
     -- Pin / unpin a non-tank. Takes effect on the next pass; the list is saved immediately so it is
     -- still there after a restart. /at_xtpin with no name lists what is pinned.
@@ -4875,6 +4996,68 @@ pcall(function()
         if e then e.state, e.oor = st, false end
     end)
     mq.bind('/at_ephave', function(who) if who and who ~= '' then epState[who] = true end end)
+    mq.bind('/at_pacoff', function(who, v)
+        if not who or who == '' then return end
+        if v == '1' then pacOff[who:lower()] = true else pacOff[who:lower()] = nil end
+        save_settings()
+    end)
+    mq.bind('/at_pacgem', function(who, g)
+        if not who or who == '' then return end
+        pacGem[who:lower()] = math.max(1, math.min(12, tonumber(g) or 8))
+        save_settings()
+    end)
+    mq.bind('/at_pacadd', function(id, nm, lvl, who)
+        local n = tonumber(id); if not n or pac_find(n) then return end
+        pacQueue[#pacQueue + 1] = { id = n, name = (nm or '?'):gsub('_', ' '),
+                                    level = tonumber(lvl) or 0, who = who }
+    end)
+    mq.bind('/at_pacdel', function(id)
+        local i = pac_find(tonumber(id) or 0); if i then table.remove(pacQueue, i) end
+    end)
+    mq.bind('/at_pacclear', function() pacQueue = {} end)
+    mq.bind('/at_pacmark', function(id, st)
+        local _, e = pac_find(tonumber(id) or 0)
+        if e then e.state, e.oor, e.oorSince, e.oorDist = st, false, nil, nil end
+    end)
+    -- The caster reporting that a mob it owns is too far to reach. Not a state - see pac_set_oor.
+    mq.bind('/at_pacoor', function(id, v, d)
+        local _, e = pac_find(tonumber(id) or 0)
+        if e then pac_set_oor(e, v == '1', tonumber(d) or 0) end
+    end)
+    -- Reassignment of an entry that nobody has picked up yet. Ignored once it is sent or resolved, so a
+    -- message that crosses with a pickup cannot steal a mob out from under the caster working it.
+    mq.bind('/at_pacwho', function(id, who)
+        local n = tonumber(id) or 0
+        local _, e = pac_find(n)
+        if not (e and who and who ~= '') then return end
+        if e.sent or e.state then return end
+        -- AM I THE ONE LOSING IT, AND AM I ALREADY ON IT?
+        -- The grace above makes this rare, but rare is not never, and the failure it prevents is the
+        -- expensive one: two casters stripped and casting at the same mob.
+        -- If it is in flight here, refuse the move and say so - I am mid-cast, the assignment is mine.
+        if e.who and e.who:lower() == myName:lower() and who:lower() ~= myName:lower() then
+            if (epCast and epCast.id == n) or (pwCast and pwCast.id == n) then
+                pcall(function() peer_bcast('/at_pacsent %d', n) end)
+                rezlog('[pacify] %s tried to move %s away, but I am casting at it - keeping it',
+                       who, e.name or ('#' .. n))
+                e.sent = true
+                return
+            end
+            -- Not in flight: drop it from my own queue so it is not worked twice.
+            local i = ep_find(n); if i then table.remove(epQueue, i) end
+            local j = pw_find(n); if j then table.remove(pwQueue, j) end
+        end
+        e.who, e.assignedAt = who, mq.gettime()
+    end)
+    mq.bind('/at_pacsent', function(id)
+        local _, e = pac_find(tonumber(id) or 0); if e then e.sent = true end
+    end)
+    mq.bind('/atpac', function() if not pac_announce() then log('[pacify] I have no pacify spell') end end)
+    mq.bind('/at_paccap', function(who, cap, rng, kind)
+        if not who or who == '' then return end
+        pacCap[who] = { cap = tonumber(cap) or 0, range = tonumber(rng) or 0,
+                        kind = kind or '?', updated = mq.gettime() }
+    end)
     -- The pin has to reach every toon: each one decides locally whether it is the elected caster, so a
     -- pin known only to the driver would leave the others still electing by class order.
     mq.bind('/at_epcaster', function(who)
@@ -5004,7 +5187,13 @@ pcall(function()
                 pcall(function() mr = tonumber(mq.TLO.Spell(gn).MyRange()) or 0 end)
                 pcall(function() rr = tonumber(mq.TLO.Spell(gn).Range()) or 0 end)
                 local ben = true
-                pcall(function() ben = (tostring(mq.TLO.Spell(gn).Beneficial()) == 'TRUE') end)
+                -- tlo_true, NOT a raw string compare. This TLO comes back as a Lua boolean, so tostring gives
+                -- 'true' and the old test against 'TRUE' was false for every spell in the book - which
+                -- meant nothing was ever treated as beneficial and the filter below let heals through.
+                -- Ejtou read her placate range off Desperate Renewal, a HEAL, and got 279; she then fired
+                -- at mobs past placate's real reach and logged them as 'would not land'. Shela and
+                -- Antilerd happened to have a detrimental as their longest and looked fine.
+                pcall(function() ben = tlo_true(mq.TLO.Spell(gn).Beneficial()) end)
                 if rr > 0 then
                     log('     gem %-2d %-26s %-5s Range %-5s MyRange %-5s %s', g, gn:sub(1, 26),
                         ben and 'ben' or 'DET', tostring(rr), tostring(mr),
@@ -5668,7 +5857,7 @@ end
     -- perfectly healthy but no E3 command it is sent ever happens", which is close to undiagnosable in the
     -- moment - so make undoing it trivial rather than clever.
     mq.bind('/atresume', function()
-        mq.cmd('/e3p off')
+        e3_release_all()
         for _, nm in ipairs(group_members()) do
             if nm:lower() ~= myName:lower() then pcall(function() peer_cmdf(nm, '/at_e3 off') end) end
         end
@@ -5792,11 +5981,15 @@ end
             rezExpectUntil = mq.gettime() + 15000
         end
     end)
-    mq.bind('/at_rezinc', function(from)   -- a rezzer is casting on me right now: arm the accept window
+    mq.bind('/at_rezinc', function(from, cid)   -- a rezzer is casting on me right now: arm the accept window
         rezIncAt       = mq.gettime()   -- a REZZER said so; my own readiness does not count
         rezExpectFrom  = mq.gettime()
         rezExpectUntil = mq.gettime() + 20000
-        rezlog('[rez] %s is rezzing me - watching for the confirmation box', tostring(from or '?'))
+        -- Remember WHICH corpse, so the loot afterwards goes to the right one. Older builds send no id,
+        -- in which case this is nil and the loot falls back to searching by name as before.
+        rezCorpseID    = tonumber(cid) or nil
+        rezlog('[rez] %s is rezzing me%s - watching for the confirmation box', tostring(from or '?'),
+               rezCorpseID and (' (corpse ' .. rezCorpseID .. ')') or '')
     end)
     mq.bind('/at_rezrdy!', function(tname) if tname then rezConfirm[tname:lower()] = mq.gettime() end end)   -- target confirmed ready
     -- The SENDER decides how long its skip is good for. This used to hardcode 8s, so a toon that skipped
@@ -6300,7 +6493,9 @@ end
 -- Pause ('on') or resume ('off') E3 on ourselves AND every listed peer, so E3 can't grab the cursor
 -- mid-pickup or reposition a toon during a trade. Peers handle it via /at_e3.
 local function group_e3(mode, peers)
-    mq.cmd('/e3p ' .. mode)
+    -- Named hold rather than a bare /e3p, so finishing a distribution cannot release a placate run that
+    -- is still holding this character's weapons off.
+    if mode == 'on' then e3_hold('distribute') else e3_release('distribute') end
     for _, p in ipairs(peers or {}) do peer_cmdf(p, '/at_e3 ' .. mode) end
 end
 
@@ -6345,11 +6540,14 @@ miniCures       = false   -- show the cure buttons (Radiant Cure etc) in the min
 miniArcane      = false   -- show the Arcane Reprisal row in the mini window
 miniPhantom     = false   -- show the Phantom Whispers queue in the mini window
 miniPlacate     = false   -- show the enchanter Placate queue in the mini window
+miniPacify      = false   -- show the routed Pacify queue in the mini window
 miniNightveil   = false   -- show the Nightveil emblem buttons in the mini window
 epState         = {}      -- char -> true when that toon is the enchanter working the queue
 epLast          = 0
 epSaidGem       = nil     -- last gem contents we spoke about, so it is said once not every tick
 epGemSaidAt     = 0       -- rate-limit for the 'waiting on the gem' line
+epCursorTryAt   = 0       -- rate-limit on /autoinventory attempts to clear the cursor
+epElectSaidAt   = 0       -- rate-limit for the 'not the elected caster' stand-down line
 epOorSaidAt     = 0       -- rate-limit for the 'out of range' line
 epMemAt         = nil     -- when we last issued a /memspell, so we do not stack attempts
 epPrevTarget    = 0       -- the caller's target when the run started; put back when the queue finishes
@@ -9056,7 +9254,12 @@ end
 -- LazCraft uses 'mainhand' and 'ammo' in its trophy swap; same naming.
 EP_SLOTS = { 'mainhand', 'offhand', 'ranged' }
 EP_STRIP_MAX = 180000    -- backstop: never stay stripped longer than this, whatever the queue is doing
-epGem      = 8           -- which gem holds placate; set in Settings
+epGem      = 8           -- legacy single-gem setting; superseded by pacGem per character
+-- MY gem for pacify. pacGem is per character and set in Settings; epGem is the old shared number and
+-- remains the fallback so a group that never touches Smart Cast behaves exactly as before.
+function ep_gem_num()
+    return (pacGem and pacGem[myName:lower()]) or epGem or 8
+end
 epQueue    = {}          -- { { id, name, oor, state } }  state: nil | 'done' | 'failed'
 epSaved    = nil         -- slot -> original item name ('' = was empty). nil = not stripped.
 epStripAt  = 0
@@ -9113,16 +9316,150 @@ function ep_recovery_read()
     return any and t or nil
 end
 
+-- ===== WHO IS HOLDING E3 DOWN =====
+-- E3's IsPaused is ONE BOOLEAN with no reference count - /e3p on sets it, /e3p off clears it, and the
+-- last caller wins. AT has more than one thing that needs E3 held: the placate run (mem, strip, cast,
+-- re-equip) and the consumable distributor (pickups and trades), and either can be asked to pause by a
+-- PEER as well, through /at_e3.
+-- With a single flag per subsystem they clobbered each other. The expensive direction: placate strips
+-- the enchanter's weapons and pauses, the distributor finishes an unrelated trade and sends /e3p off,
+-- and E3 starts driving a character that is standing there with no weapons mid-placate.
+-- So count holders instead. /e3p on goes out only when the FIRST one takes hold and /e3p off only when
+-- the LAST one lets go, which makes releasing someone else's hold impossible by construction.
+E3HOLD = {}
+-- IS E3 ACTUALLY PAUSED? Not what we believe - what E3 says.
+-- E3 exposes Basics.IsPaused through its reflection lookup, and MQ2Mono.Query wraps whatever it is given
+-- in ${...} and runs it through Casting.Ifs_Results - the same resolver that handles ${E3N.State.*}. So
+-- the internal value IS reachable from here, via that bridge, even though ${E3N.State.Basics.IsPaused}
+-- is not an MQ TLO on its own and cannot be read directly.
+-- Returns nil if the bridge itself did not answer - E3 not loaded, not initialised, mid-reload. nil is
+-- deliberately NOT false: "I could not tell" and "it is running" want different handling, and treating
+-- the first as the second is how you get a confident wrong answer.
+e3PausedSaidRaw = false
+function e3_is_paused()
+    local v
+    pcall(function() v = mq.TLO.MQ2Mono.Query('e3', 'E3N.State.Basics.IsPaused')() end)
+    local s = (v == nil) and '' or tostring(v):lower()
+    -- SAY WHAT THE BRIDGE ACTUALLY RETURNS, once, the first time it is asked. Everything built on this
+    -- read is only as good as the read, and there is no way to tell from the outside whether the query
+    -- resolved. One line in the log removes the guesswork permanently.
+    if not e3PausedSaidRaw then
+        e3PausedSaidRaw = true
+        rezlog('[e3] pause probe returns "%s" (want true/false; anything else means the query did not '
+            .. 'resolve and every pause check is blind)', s)
+    end
+    -- ONLY AN EXPLICIT TRUE OR FALSE IS AN ANSWER.
+    -- Ifs_Results does string REPLACEMENT: if it cannot resolve the key it hands back the text unchanged,
+    -- so a failed query returns the literal "${e3n.state.basics.ispaused}". The old test asked "is it
+    -- true?" and returned false for that - which reads as "E3 is running" and is indistinguishable from
+    -- E3 actually running. That is how "asked E3 to pause and it reports it is still RUNNING" could be
+    -- printed by a check that had in fact learned nothing.
+    -- nil means I DO NOT KNOW, and callers treat that differently from false on purpose.
+    if s == 'true' or s == '1' then return true end
+    if s == 'false' or s == '0' then return false end
+    return nil
+end
+
+local function e3_holders()
+    local n = 0
+    for _ in pairs(E3HOLD) do n = n + 1 end
+    return n
+end
+function e3_hold(owner)
+    owner = owner or 'unknown'
+    if E3HOLD[owner] then return end          -- idempotent per owner: strip may ask after the mem did
+    local was = e3_holders()
+    E3HOLD[owner] = true
+    if was == 0 then
+        mq.cmd('/e3p on')
+        -- /e3p IS QUEUED, NOT IMMEDIATE. E3's own IsPaused() starts with
+        --     EventProcessor.ProcessEventsInQueues("/e3p")
+        -- so the command sits in a queue and only lands when E3's loop next asks whether it is paused.
+        -- The call returns to us instantly either way, so without this we send "pause", then strip
+        -- weapons and open the spellbook while E3 is still driving - which is precisely the window it
+        -- was paused to avoid.
+        -- Bounded, not indefinite: it is one iteration of E3's loop, and every character here runs
+        -- ProcessLoopDelayInMS=50. 250ms is several times that and is paid ONCE, on the transition into
+        -- being held, not per owner and not on release.
+        -- VERIFY, do not assume. e3_is_paused reads E3's own flag through the mono bridge, so instead of
+        -- waiting a fixed guess we wait until it is actually true - and find out if it never becomes so.
+        -- 2.5s, not 1s. Measured: E3 took between 1.0 and 1.6s to process /e3p on a live pull, so a
+        -- one second window reported a false alarm on a pause that was simply still in flight.
+        -- This is a ceiling, not a wait - it returns the moment E3 reports paused.
+        mq.delay(2500, function() return e3_is_paused() == true end)
+        local st = e3_is_paused()
+        if st == false then
+            -- It took the command and is still running. Say it plainly rather than carrying on and
+            -- wondering later why E3 healed through a placate or stepped on a /nowcast.
+            rezlog('\\ar[e3] asked E3 to pause and it reports it is still RUNNING - retrying once\\ax')
+            mq.cmd('/e3p on')
+            mq.delay(2500, function() return e3_is_paused() == true end)
+            local after = e3_is_paused()
+            if after == false then
+                rezlog('\\ar[e3] E3 WILL NOT PAUSE - it is going to act underneath us. /atresume then retry.\\ax')
+            elseif after == nil then
+                -- Treating "could not read" as success is how this hid. It is not success.
+                rezlog('\\ar[e3] cannot read E3 pause state at all - proceeding BLIND, E3 may act '
+                    .. 'underneath us. Check MQ2Mono is loaded and e3 is running.\\ax')
+            end
+        elseif st == nil then
+            -- Bridge did not answer. Fall back to the old behaviour: wait out one E3 loop and hope.
+            mq.delay(250)
+        end
+    end
+end
+-- CALLED ON THE TICK WHILE WE HOLD IT. E3 can be unpaused by anything that sends /e3p - a stray macro,
+-- a hotkey, a peer command, somebody typing it - and the symptom is E3 healing and overriding /nowcast
+-- while AT believes it has the character. Cheap to check, and re-asserting costs nothing when it is
+-- already true.
+function e3_assert_held()
+    if e3_holders() == 0 then return end
+    if e3_is_paused() == false then
+        rezlog('\\ar[e3] E3 came back up while %d hold(s) were still on it - pausing it again\\ax',
+               e3_holders())
+        mq.cmd('/e3p on')
+        mq.delay(2500, function() return e3_is_paused() == true end)
+    end
+end
+
+function e3_release(owner)
+    owner = owner or 'unknown'
+    if not E3HOLD[owner] then return end
+    E3HOLD[owner] = nil
+    if e3_holders() == 0 then mq.cmd('/e3p off') end
+end
+-- Unconditional: for the way out and for /atresume, where the point is to leave nothing held whatever
+-- anyone thinks they own.
+function e3_release_all()
+    for k in pairs(E3HOLD) do E3HOLD[k] = nil end
+    mq.cmd('/e3p off')
+end
+
+-- STOW WHATEVER IS ON THE CURSOR. Returns true if the cursor ended up empty.
+-- /autoinventory only moves the item to a free bag slot: it does not destroy anything and does not pick
+-- a destination beyond that, so the worst case of being wrong is an item in a bag.
+function cursor_stow(tag)
+    if (mq.TLO.Cursor.ID() or 0) == 0 then return true end
+    local held = tostring(mq.TLO.Cursor.Name() or '?')
+    pcall(function() mq.cmd('/autoinventory') end)
+    mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    if (mq.TLO.Cursor.ID() or 0) == 0 then
+        rezlog('[%s] stowed %s off the cursor', tag or 'cursor', held)
+        return true
+    end
+    return false, held
+end
+
 epPaused = false
 function ep_pause()
-    if epPaused then return end       -- idempotent: strip may ask again after the mem already did
+    if epPaused then return end
     epPaused = true
-    mq.cmd('/e3p on')
+    e3_hold('placate')
 end
 function ep_resume(why)
     if not epPaused then return end
     epPaused = false
-    mq.cmd('/e3p off')
+    e3_release('placate')
     rezlog('[placate] E3 resumed (%s)', why or 'done')
 end
 
@@ -9142,11 +9479,354 @@ EP_CLASSES = { ENC = true, CLR = true, PAL = true }
 EP_CLASS_ORDER = { 'ENC', 'CLR', 'PAL' }
 -- `or ''` not `= ''`, same reason as miniFold: this sits above load_settings() today, and a plain
 -- assignment would silently discard a loaded pin if either ever moved.
+pacOff = pacOff or {}     -- [nameLower] = true when taken out of the rotation
+-- PER CHARACTER GEM. epGem is one number shared by whoever happens to be the placate caster, which was
+-- fine with a single enchanter and is wrong the moment three characters each have their own layout.
+-- Only spell casters need one - a monk's phantom line is a disc and has no gem.
+pacGem = pacGem or {}     -- [nameLower] = gem number
+pacQueue = pacQueue or {}
+function pac_find(id)
+    for i, e in ipairs(pacQueue) do if e.id == id then return i, e end end
+    return nil
+end
+pacLast = pacLast or ''
 epCaster = epCaster or ''   -- a character name pins it; empty means pick by class order
 -- Who the group has elected. Every toon computes this from the SAME inputs - the reported capability
 -- list and the class order - so they all reach the same answer without a negotiation.
 -- Ties are broken by name, for the same reason the rez chain sorts its pins: two toons of the same class
 -- must not disagree about which of them is first.
+-- ===== PACIFY ROUTING =====
+-- One queue, several casters, each with a different level ceiling. A monk's phantom line, an enchanter's
+-- placate, a cleric's and a paladin's all do the same job and all cap out somewhere different - so the
+-- interesting question is not "who can pacify" but "who should take THIS mob".
+--
+-- Spell[x].MaxLevel is spell DATA, so any character can read it - but the RANK each caster owns differs,
+-- so each reports its own. The driver never has to know what anyone carries.
+--
+-- ASSIGNMENT RULE: the LOWEST ceiling that still covers the mob. Sending a level 70 mob to the caster
+-- capped at 95 wastes the only one who can take a level 90, and that matters precisely when a pull has
+-- a mix - which is when pacifying matters at all.
+pacCap = {}   -- [char] = { cap, spell, range, kind, updated }
+
+-- What I can pacify with, whatever class I am. Returns spell name, level cap, range - or nil.
+function pac_self()
+    local sp, kind
+    if ep_can_placate() then
+        -- VALIDATE THE GEM, do not just read it. This used to fall back to the spellbook only when the
+        -- gem was EMPTY, so a gem holding the wrong spell was taken at face value - a paladin whose
+        -- placate gem held Brell's Vibrant Barricade announced that as his pacify, and MaxLevel on a
+        -- buff is 0.
+        -- A cap of 0 is not a cosmetic wrong number, it is a DEADLOCK: pac_assign only sends a mob to a
+        -- caster whose ceiling covers it, no mob is level 0 or under, so that character is never
+        -- assigned anything - which means ep_tick never runs, which means ep_ensure_gem never gets the
+        -- chance to mem the right spell and fix the very problem. It cannot recover on its own.
+        -- Announcing off the best placate in their BOOK breaks the cycle: the ceiling is honest, Smart
+        -- Cast routes to them, and ep_tick mems the spell on demand the first time it has work.
+        sp = ep_spell()
+        if not (sp and ep_spell_ok(sp)) then
+            sp = ep_best_placate and ep_best_placate() or nil
+        end
+        kind = 'placate'
+    end
+    if not sp and pw_have and pw_have() then
+        local d = pw_disc()
+        if d then sp, kind = d.name, 'phantom' end
+    end
+    if not sp then return nil end
+    local cap = 0
+    pcall(function() cap = tonumber(mq.TLO.Spell(sp).MaxLevel()) or 0 end)
+    -- A ceiling of 0 covers nothing, so announcing it just puts a caster on the panel that can never be
+    -- given a mob. Say so plainly instead - a missing caster with a reason beats a silent useless one.
+    if cap <= 0 then
+        rezlog('\\ar[pacify] "%s" reports a level ceiling of 0 - not announcing. Check the placate gem '
+            .. 'and the spell in it.\\ax', tostring(sp))
+        return nil
+    end
+    -- RANGE THROUGH THE EXISTING RESOLVERS, not a fresh MyRange read. MyRange is the member that lies for
+    -- placate on this build - it returns the base and ignores the focus - which is the whole reason
+    -- ep_range exists: it derives the focus ratio from a DETRIMENTAL spell that does report it and
+    -- applies that to the placate base.
+    -- pw_range does the equivalent for the monk disc line. Reading MyRange here would have quietly
+    -- undone both and routed on unfocused numbers.
+    local rng = 0
+    if kind == 'placate' then rng = ep_range() or 0
+    else                      rng = pw_range() or 0 end
+    if rng <= 0 then
+        pcall(function() rng = tonumber(mq.TLO.Spell(sp).MyRange()) or 0 end)
+        if rng <= 0 then pcall(function() rng = tonumber(mq.TLO.Spell(sp).Range()) or 0 end) end
+    end
+    return sp, cap, rng, kind
+end
+
+-- Who should take a mob of this level. Lowest sufficient ceiling wins; ties break by name so every toon
+-- reaches the same answer without asking anyone.
+-- Announce what I can pacify. Called ONCE at startup rather than on the heartbeat: the spell and its
+-- ceiling do not change during a session unless something is re-memmed, and pac_self is half a dozen
+-- TLO reads to answer a question whose answer is fixed.
+-- /atpac re-announces, which is the thing to run after memming a different rank.
+function pac_announce()
+    local sp, cap, rng, kind = pac_self()
+    if not sp then return false end
+    pacCap[myName] = { cap = cap, spell = sp, range = rng, kind = kind, updated = mq.gettime() }
+    pcall(function() peer_bcast('/at_paccap %s %d %d %s', myName, cap or 0, rng or 0, kind or '?') end)
+    log('[pacify] I can pacify with %s - caps at level %d, range %d', sp, cap or 0, rng or 0)
+    -- ANNOUNCE AGAIN IF THE RANGE IS STILL THE FALLBACK. ep_range caches only a real answer, so a
+    -- fallback here means the spell was not readable yet - typically because the gem is not memmed 8
+    -- seconds into a session. Broadcasting 200 once and never revisiting it would pin this character at
+    -- the unfocused number for the whole session, and the routing would quietly favour the wrong caster.
+    -- ONLY RE-CHECK IF THE SPELL ITSELF DID NOT RESOLVE. Comparing the RESULT against the fallback value
+    -- was wrong: the monk's phantom line genuinely reads 200, which is also the fallback number, so a
+    -- correctly resolved range re-announced itself every minute forever.
+    -- The question is whether we got an answer, not whether the answer happens to equal a default.
+    local resolved = (kind == 'placate') and (epRangeCache ~= nil) or (pwRangeCache ~= nil)
+    if not resolved then
+        pacAnnounceAt = mq.gettime() + 60000
+        log('[pacify] range not resolved yet (using %d) - will re-check in a minute', rng)
+    end
+    return true
+end
+
+-- Who should take a mob of this level AT this distance.
+-- Two filters, then two preferences:
+--   filter  ceiling covers the mob, and range reaches it
+--   prefer  the LOWEST sufficient ceiling - so the high-cap caster stays free for mobs only they can take
+--   prefer  then the LONGEST range, because a caster who can hit it from further out is less likely to
+--           have to move, and moving is what breaks a pacify
+-- HAND MY ASSIGNED MOBS TO MY OWN QUEUE. Smart Cast decides WHO; the existing placate and phantom
+-- queues already know HOW - the strip, the mem, the range stalls, the retries, the verification, the
+-- gear recovery. Feeding them is far better than a third implementation of all that.
+-- Each character dispatches only its own entries, so this runs everywhere and does nothing on five of
+-- six toons. `sent` marks an entry handed off, so it happens once rather than every tick.
+-- CLEAR THE QUEUE WHEN THERE IS NOTHING LEFT TO DO. A finished list that stays on screen is the same
+-- problem the placate queue had: you cannot tell "done" from "stuck", and the next pull starts with
+-- yesterday's mobs still listed.
+-- Two conditions, both meaning "no further work":
+--   * every entry resolved - pacified, immune, failed, above everyone's ceiling
+--   * an entry stuck OUT OF RANGE for more than PAC_OOR_MAX - the group has moved on and it is not
+--     coming back into reach, so holding the whole list for it helps nobody
+-- Cleared across the group, since every toon keeps its own copy.
+-- HOW LONG AN ASSIGNED ENTRY MAY GO UNRESOLVED before we assume it is never happening.
+-- This is NOT a "stayed out of range" timer, though it was written as one at 10 seconds - and that was
+-- far too short. A caster that has taken an entry then strips its weapons, mems, closes the spellbook,
+-- walks into range, casts, waits out the cast, verifies the debuff, retries twice and re-equips. Forty
+-- seconds is an ordinary run, so a 10-second bound cleared the list out from under work in progress.
+-- The caster resolves its own entries through pac_reflect, so this only catches the ones that never
+-- come back at all.
+-- TWO DIFFERENT FAILURES, TWO DIFFERENT CLOCKS. These used to be one number doing both jobs, which is
+-- why it was wrong at 10 seconds and then only approximately right at 90.
+--   PAC_OOR_MAX    the caster has REPORTED this mob out of reach and it has stayed that way. The group
+--                  has moved on and it is not coming back into range, so holding the list for it helps
+--                  nobody. This is now a real out-of-range timer: the caster reflects its own oor state
+--                  through pac_reflect_oor rather than us guessing from how long something has taken.
+--   PAC_STALL_MAX  dispatched and then nothing at all - no outcome, no oor report. That is a caster
+--                  that is not running, or a queue that has wedged. A caster doing ordinary work strips,
+--                  mems, closes the book, walks in, casts, verifies, retries and re-equips, so forty
+--                  seconds is a normal run and this bound has to stay generous.
+-- Both are backstops. In the normal case the casting queue gives up first (EP_FAR_MAX / PW_FAR_MAX at
+-- 45s) and reflects a real outcome, and neither of these ever fires.
+-- HOW LONG AN ASSIGNMENT IS LEFT ALONE BEFORE IT MAY BE MOVED.
+-- e.sent is set by the ASSIGNEE and reaches everyone else as a broadcast, so between it picking the mob
+-- up and that message landing, whoever is adding mobs still sees the entry as free and would happily
+-- reassign a mob that is already being worked. Nothing on the wire is instant; a short grace covers it.
+-- Inside this, a corpse is close enough to rez and loot without dragging, so /corpse having no
+-- measurable effect is the expected outcome rather than a failure.
+CORPSE_NEAR = 10
+PAC_MOVE_GRACE = 2500
+PAC_OOR_MAX   = 90000
+PAC_STALL_MAX = 90000
+PAC_LINGER    = 6000     -- show the finished list briefly before it goes
+pacDoneAt     = nil
+
+function pac_autoclear()
+    if not pacQueue or #pacQueue == 0 then pacDoneAt = nil; return end
+    local pending, oldOor, oldStall = 0, 0, 0
+    for _, e in ipairs(pacQueue) do
+        if not e.state then
+            -- The clock starts when it was DISPATCHED, not when it was queued: time spent waiting for a
+            -- caster to pick it up is not time that caster has failed to act.
+            if e.sent then e.waitSince = e.waitSince or mq.gettime() end
+            local gone = false
+            if e.oor and e.oorSince and (mq.gettime() - e.oorSince) > PAC_OOR_MAX then
+                oldOor, gone = oldOor + 1, true
+            elseif e.sent and not e.oor and e.waitSince
+                   and (mq.gettime() - e.waitSince) > PAC_STALL_MAX then
+                oldStall, gone = oldStall + 1, true
+            end
+            if not gone then pending = pending + 1 end
+        end
+    end
+    if pending > 0 then pacDoneAt = nil; return end
+
+    -- Everything is resolved, or the only things left are ones we have given up on.
+    pacDoneAt = pacDoneAt or mq.gettime()
+    if (mq.gettime() - pacDoneAt) > PAC_LINGER then
+        if oldOor > 0 then
+            log('[pacify] clearing - %d entry(s) stayed out of reach for %ds',
+                oldOor, PAC_OOR_MAX / 1000)
+        end
+        if oldStall > 0 then
+            log('[pacify] clearing - %d entry(s) were never heard back on within %ds',
+                oldStall, PAC_STALL_MAX / 1000)
+        end
+        if oldOor == 0 and oldStall == 0 then
+            log('[pacify] all done - clearing the list')
+        end
+        pacQueue, pacDoneAt = {}, nil
+        pcall(function() peer_bcast('/at_pacclear') end)
+    end
+end
+
+function pac_dispatch()
+    if not pacQueue or #pacQueue == 0 then return end
+    local me = myName:lower()
+    for _, e in ipairs(pacQueue) do
+        if e.who and e.who:lower() == me and not e.sent and not e.state then
+            -- LEVEL CAP, checked here rather than in the casting queues. Unlike range - which changes as
+            -- the group closes and so is worth retrying - a mob above the ceiling never becomes eligible,
+            -- so it is marked once and never queued at all.
+            local myCap = (pacCap[myName] or {}).cap or 0
+            if (e.level or 0) > myCap and myCap > 0 then
+                e.sent, e.state = true, 'too high'
+                pcall(function() peer_bcast('/at_pacmark %d %s', e.id, 'too high') end)
+                rezlog('[pacify] %s is level %d, my ceiling is %d - not attempting', e.name, e.level or 0, myCap)
+            else
+                e.sent = true
+                if ep_can_placate() then
+                    if not ep_find(e.id) then
+                        -- mine=true: ASSIGNED TO ME BY SMART CAST, as opposed to an entry broadcast to
+                        -- everybody's queue by the manual button. The election below stands a character
+                        -- down when it is not the group's chosen caster, which is right for a shared
+                        -- list and wrong for work addressed to this character specifically.
+                        epQueue[#epQueue + 1] = { id = e.id, name = e.name, oor = false, farSince = nil,
+                                                  mine = true }
+                        -- HOLD E3 NOW, not at the mem a tick later.
+                        -- /e3p is queued on E3's side and measured 1.0-1.6s to actually land - far longer
+                        -- than its 50ms loop - so asking for the pause and immediately memming and
+                        -- stripping meant E3 was still driving through the part that matters.
+                        -- Taking it here buys a whole tick of lead time at no cost: by the time ep_tick
+                        -- gets to the mem it is already held. If the work then evaporates - mob dies,
+                        -- gets reassigned - the "paused, holding nothing, nothing queued" backstop in
+                        -- ep_tick lets go on its own.
+                        ep_pause()
+                        pcall(function() peer_bcast('/at_pacsent %d', e.id) end)
+                        rezlog('[pacify] taking %s#%d (level %d) into my placate queue', e.name, e.id, e.level or 0)
+                    end
+                elseif pw_have and pw_have() then
+                    if not pw_find(e.id) then
+                        pwQueue[#pwQueue + 1] = { id = e.id, name = e.name, oor = false }
+                        pcall(function() peer_bcast('/at_pacsent %d', e.id) end)
+                        rezlog('[pacify] taking %s#%d (level %d) into my phantom queue', e.name, e.id, e.level or 0)
+                    end
+                end
+            end
+        end
+    end
+end
+
+-- HOW MANY UNRESOLVED MOBS ARE ALREADY ON THIS CASTER. Read off the shared queue, so every character
+-- computes the same number and reaches the same assignment without asking anyone.
+function pac_load(nm)
+    local n = 0
+    local low = (nm or ''):lower()
+    for _, e in ipairs(pacQueue or {}) do
+        if not e.state and e.who and e.who:lower() == low then n = n + 1 end
+    end
+    return n
+end
+
+-- REASSIGN WHAT HAS NOT BEEN PICKED UP YET.
+-- Assignments are made one mob at a time as they are added, so a choice made at mob 1 can be wrong by
+-- mob 4 - the classic case being the high-ceiling caster taking a couple of ordinary mobs and then a
+-- level 79 arriving that only they can take.
+-- ONLY UN-SENT ENTRIES MOVE. Once e.sent is set the assignee has it in its own queue and may already be
+-- stripped, memming or mid-cast for it; taking it back then is how you get two casters on one mob.
+-- Before that it is just a name on the shared list and costs nothing to change.
+-- A move must STRICTLY even things out - the receiver's load after the move must still be below the
+-- giver's. That is what stops two casters passing the same mob back and forth forever.
+function pac_rebalance()
+    local moved = 0
+    for _ = 1, 8 do          -- bounded: a pull is small and this runs on every add
+        local pick
+        for _, e in ipairs(pacQueue or {}) do
+            -- not state: already done, failed or ruled too high - settled, leave it.
+            -- not sent: nobody has picked it up, so nobody is stripped or casting for it yet.
+            -- grace: and the pickup message has had time to get here if it was coming.
+            if not e.state and not e.sent and e.who
+               and (mq.gettime() - (e.assignedAt or 0)) > PAC_MOVE_GRACE then
+                local fromLoad = pac_load(e.who)
+                for nm, c in pairs(pacCap) do
+                    if nm:lower() ~= e.who:lower() and not pacOff[nm:lower()]
+                       and (c.cap or 0) >= (e.level or 0)
+                       and ((e.dist or 0) <= 0 or (c.range or 0) >= (e.dist or 0)) then
+                        local toLoad = pac_load(nm)
+                        local fromCap = (pacCap[e.who] or {}).cap or 0
+                        -- Two reasons to move, and the second is the one that matters most.
+                        --  1. STRICTLY EVENER: the receiver ends up below the giver even after taking it.
+                        --  2. SAME BALANCE, LOWER CEILING: counts come out equal, but the work shifts to
+                        --     the caster with the smaller ceiling. Three 69s and a 79 across a 70/76/80
+                        --     group is 2/1/1 either way - the question is who holds the two, and it must
+                        --     not be the only one who can take the 79.
+                        -- Rule 2 cannot oscillate: it only ever moves toward a LOWER ceiling, so a mob
+                        -- cannot come back the way it went.
+                        local evener = (toLoad + 1 < fromLoad)
+                        local downhill = (toLoad + 1 == fromLoad) and ((c.cap or 0) < fromCap)
+                        if evener or downhill then
+                            local gain = evener and (fromLoad - toLoad) or 1
+                            if not pick or gain > pick.gain then
+                                pick = { e = e, to = nm, from = e.who, gain = gain }
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        if not pick then break end
+        pick.e.who = pick.to
+        pick.e.assignedAt = mq.gettime()   -- fresh grace on its new owner
+        moved = moved + 1
+        log('[pacify] moved %s from %s to %s to even out the queue', pick.e.name, pick.from, pick.to)
+        pcall(function() peer_bcast('/at_pacwho %d %s', pick.e.id, pick.to) end)
+    end
+    return moved
+end
+
+function pac_assign(mobLevel, dist)
+    local best, bestCap, bestRng, bestLoad = nil, nil, nil, nil
+    for nm, c in pairs(pacCap) do
+        -- NO STALENESS CHECK. A spell's level ceiling does not change, so an old report is as good as a
+        -- fresh one - and expiring it meant a quiet character dropped out of the routing and mobs got
+        -- sent to the wrong caster, or to nobody.
+        -- Being OFF is a decision; being quiet is not.
+        local capOk = (c.cap or 0) >= (mobLevel or 0) and not pacOff[nm:lower()]
+        -- No distance given means "do not filter on it" - the caller did not know, so neither do we.
+        local rngOk = (not dist) or dist <= 0 or (c.range or 0) >= dist
+        if capOk and rngOk then
+            -- SPREAD THE WORK, THEN PREFER THE LOW CEILING.
+            -- The ceiling is a CONSTRAINT - only casters who can take this mob are in here at all - but it
+            -- used to be the whole rule, and that is not a sharing rule. With a cleric at 76 and an
+            -- enchanter at 80, every mob up to 76 went to the cleric and the enchanter sat idle unless
+            -- something 77+ turned up. One caster did all the work, one recast at a time, stripping and
+            -- re-equipping for every mob.
+            -- Fewest already queued wins first, so an even pull splits evenly. Lowest sufficient ceiling
+            -- is the tiebreak, which is what keeps the high-cap caster free when loads are level - so a
+            -- level 79 that only they can take still finds them with an empty queue.
+            local load = pac_load(nm)
+            local better = false
+            if not bestCap then better = true
+            elseif load < bestLoad then better = true
+            elseif load == bestLoad then
+                if c.cap < bestCap then better = true
+                elseif c.cap == bestCap then
+                    if (c.range or 0) > (bestRng or 0) then better = true
+                    elseif (c.range or 0) == (bestRng or 0) and nm:lower() < best:lower() then better = true end
+                end
+            end
+            if better then best, bestCap, bestRng, bestLoad = nm, c.cap, c.range, load end
+        end
+    end
+    return best, bestCap, bestRng
+end
+
 function ep_elected()
     if epCaster ~= '' then return epCaster end
     local best, bestRank = nil, 99
@@ -9167,6 +9847,66 @@ function ep_elected()
     return best
 end
 
+-- Summon my own corpse, loot everything, close the window.
+-- Ordered deliberately: summon FIRST, because a corpse that is out of reach cannot be looted and /corpse
+-- is free when it is already close. Then loot, then close - leaving the loot window open blocks trades,
+-- pickups and the next rez, and nothing else would ever close it.
+function loot_my_corpse(wantID)
+    local id = tonumber(wantID) or 0
+    if id <= 0 then
+        pcall(function() id = tonumber(mq.TLO.Spawn('pccorpse ' .. myName).ID()) or 0 end)
+    end
+    if id <= 0 then return end
+
+    pcall(function() mq.cmdf('/target id %d', id) end)
+    mq.delay(1000, function() return (tonumber(mq.TLO.Target.ID()) or 0) == id end)
+    if (tonumber(mq.TLO.Target.ID()) or 0) ~= id then
+        rezlog('[corpse] could not target my corpse'); return
+    end
+    pcall(function() mq.cmd('/corpse') end)
+    mq.delay(600)
+
+    pcall(function() mq.cmd('/loot') end)
+    mq.delay(2500, function() return mq.TLO.Window('LootWnd').Open() end)
+    if not mq.TLO.Window('LootWnd').Open() then
+        rezlog('[corpse] the loot window did not open - corpse may be out of reach')
+        return
+    end
+
+    -- NOTHING TO TAKE. Corpses here do not hold gear - opening and closing the loot window is simply
+    -- what makes the body go away, and that is the entire point: a rezzed corpse left lying around is
+    -- clutter that the next rez has to look past.
+    -- This used to walk thirty slots three times looking for items that were never there.
+
+    -- ALWAYS close it, whatever happened above.
+    pcall(function() mq.cmd('/notify LootWnd LW_DoneButton leftmouseup') end)
+    mq.delay(800, function() return not mq.TLO.Window('LootWnd').Open() end)
+    if mq.TLO.Window('LootWnd').Open() then
+        pcall(function() mq.TLO.Window('LootWnd').DoClose() end)
+        mq.delay(500, function() return not mq.TLO.Window('LootWnd').Open() end)
+    end
+    -- DID IT ACTUALLY GO? The point is the body disappearing, so check rather than assume - and try once
+    -- more if it is still there, since a loot window that opened on a busy client does not always take.
+    mq.delay(1200)
+    local still = ''
+    pcall(function() still = tostring(mq.TLO.Spawn(id).Type() or '') end)
+    if still == 'Corpse' then
+        rezlog('[corpse] still there after looting - one more go')
+        pcall(function() mq.cmdf('/target id %d', id) end)
+        mq.delay(800, function() return (tonumber(mq.TLO.Target.ID()) or 0) == id end)
+        pcall(function() mq.cmd('/loot') end)
+        mq.delay(2000, function() return mq.TLO.Window('LootWnd').Open() end)
+        pcall(function() mq.cmd('/notify LootWnd LW_DoneButton leftmouseup') end)
+        mq.delay(800, function() return not mq.TLO.Window('LootWnd').Open() end)
+        pcall(function() still = tostring(mq.TLO.Spawn(id).Type() or '') end)
+    end
+    if still == 'Corpse' then
+        rezlog('\\ay[corpse] my corpse is still lying there - loot it by hand\\ax')
+    else
+        rezlog('[corpse] corpse cleared')
+    end
+end
+
 function ep_can_placate()
     local c = ''
     pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or ''):upper() end)
@@ -9180,7 +9920,7 @@ function ep_is_enchanter() return ep_can_placate() end
 -- and whatever is in it is what gets cast, so upgrading the spell needs no settings change.
 function ep_spell()
     local nm = ''
-    pcall(function() nm = tostring(mq.TLO.Me.Gem(epGem).Name() or '') end)
+    pcall(function() nm = tostring(mq.TLO.Me.Gem(ep_gem_num()).Name() or '') end)
     if nm == '' or nm == 'NULL' then return nil end
     return nm
 end
@@ -9248,14 +9988,14 @@ function ep_ensure_gem()
     -- Self-contained pause and resume: ep_strip takes its own immediately afterwards, and /e3p is
     -- idempotent, so the two cannot fight.
     ep_pause()
-    rezlog('[placate] gem %d holds %s - memming %s instead (E3 paused)', epGem,
+    rezlog('[placate] gem %d holds %s - memming %s instead (E3 paused)', ep_gem_num(),
            (have and ('"' .. have .. '"')) or 'nothing', want)
-    pcall(function() mq.cmdf('/memspell %d "%s"', epGem, want) end)
-    mq.delay(10000, function() return (mq.TLO.Me.Gem(epGem).Name() or '') == want end)
+    pcall(function() mq.cmdf('/memspell %d "%s"', ep_gem_num(), want) end)
+    mq.delay(10000, function() return (mq.TLO.Me.Gem(ep_gem_num()).Name() or '') == want end)
     local now = ''
-    pcall(function() now = tostring(mq.TLO.Me.Gem(epGem).Name() or '') end)
+    pcall(function() now = tostring(mq.TLO.Me.Gem(ep_gem_num()).Name() or '') end)
     if now ~= want then
-        rezlog('\\ar[placate] could not mem %s into gem %d (it reads "%s")\\ax', want, epGem, now)
+        rezlog('\\ar[placate] could not mem %s into gem %d (it reads "%s")\\ax', want, ep_gem_num(), now)
         ep_resume('mem failed')          -- nothing to strip, so release it here
         return false
     end
@@ -9282,7 +10022,7 @@ function ep_ensure_gem()
     end
     -- E3 stays paused from here: the strip and the casting follow immediately, and ep_restore hands it
     -- back once the gear is on.
-    rezlog('[placate] %s is memmed in gem %d', want, epGem)
+    rezlog('[placate] %s is memmed in gem %d', want, ep_gem_num())
     return true
 end
 
@@ -9298,61 +10038,55 @@ EP_FAR_MAX = 45000
 epRangeCache = nil
 function ep_range()
     if epRangeCache then return epRangeCache end
-    local sp = ep_spell(); if not sp then return EP_RANGE_FALLBACK end
-    -- DERIVE THE FOCUS FROM A SPELL THAT REPORTS IT. MyRange is documented to include focus effects and
-    -- does so for other spells on this build - Mind Shatter reads 279 against a smaller base - but for
-    -- Placate it comes back at the base value. So the focus IS readable, just not through this spell.
-    -- Walk the memmed gems, find any spell where MyRange exceeds Range, and take that ratio: the focus is
-    -- a property of the CHARACTER, not of the individual spell, so it applies to placate too.
-    -- Self-calibrating and needs no configuration - it re-reads whenever the cache is cleared, so
-    -- swapping a focus item corrects itself.
-    local base = 0
-    for _, m in ipairs({ 'MyRange', 'Range', 'Location' }) do
-        local v = 0
-        pcall(function() v = tonumber(mq.TLO.Spell(sp)[m]()) or 0 end)
-        if v > base then base = v end
-    end
-
-    -- DETRIMENTAL SPELLS ONLY. Extended range is a different focus for beneficial and detrimental
-    -- spells, so a ratio taken from a heal or a buff would be the wrong number for placate - which is
-    -- detrimental. Sampling the wrong kind would give a confident answer that is simply not ours.
-    -- Highest ratio among them wins: erring long means occasionally casting at something a little out
-    -- of reach, erring short means skipping mobs we could have placated.
-    local ratio, from = 1.0, nil
+    -- TAKE THE RANGE STRAIGHT OFF A DETRIMENTAL SPELL. They all share the same 200 base and they DO
+    -- report the focus, so whatever one of them says is simply the answer - no ratio, no arithmetic on
+    -- top of a base that may or may not already include it.
+    -- The maths version got this wrong twice: once by feeding Location into the base, and once by
+    -- multiplying a MyRange that had already had the focus applied. Both produced a confident number
+    -- past 400. Reading a spell that answers correctly avoids the whole class of error.
+    -- Placate itself is excluded: it is the one that does NOT report its focus, which is why this exists.
+    local sp = ep_spell()
+    local best, from = 0, nil
     for g = 1, 12 do
         local gn = ''
         pcall(function() gn = tostring(mq.TLO.Me.Gem(g).Name() or '') end)
-        if gn ~= '' and gn ~= 'NULL' then
+        if gn ~= '' and gn ~= 'NULL' and gn ~= sp then
             local ben = true
-            pcall(function() ben = (tostring(mq.TLO.Spell(gn).Beneficial()) == 'TRUE') end)
+            -- tlo_true, NOT a raw string compare. This TLO comes back as a Lua boolean, so tostring gives
+                -- 'true' and the old test against 'TRUE' was false for every spell in the book - which
+                -- meant nothing was ever treated as beneficial and the filter below let heals through.
+                -- Ejtou read her placate range off Desperate Renewal, a HEAL, and got 279; she then fired
+                -- at mobs past placate's real reach and logged them as 'would not land'. Shela and
+                -- Antilerd happened to have a detrimental as their longest and looked fine.
+                pcall(function() ben = tlo_true(mq.TLO.Spell(gn).Beneficial()) end)
             if not ben then
-                local mr, rr = 0, 0
+                local mr = 0
                 pcall(function() mr = tonumber(mq.TLO.Spell(gn).MyRange()) or 0 end)
-                pcall(function() rr = tonumber(mq.TLO.Spell(gn).Range()) or 0 end)
-                if rr > 0 and mr > rr then
-                    local this = mr / rr
-                    if this > ratio then ratio, from = this, gn end
-                end
+                if mr > best then best, from = mr, gn end
             end
         end
     end
-
-    local r = base
-    if from then
-        r = math.floor(base * ratio)
-        rezlog('[placate] range focus %.2fx read from %s - %d base becomes %d', ratio, from, base, r)
+    if best > 0 then
+        epRangeCache = best
+        rezlog('[placate] cast range %d, read from %s', best, from)
+        return best
+    end
+    -- No detrimental memmed to ask. Fall back to placate's own reading, unfocused though it is - short
+    -- is the safe direction, since it only makes the queue wait rather than fire at something unreachable.
+    local r = 0
+    if sp then
+        pcall(function() r = tonumber(mq.TLO.Spell(sp).MyRange()) or 0 end)
+        if r <= 0 then pcall(function() r = tonumber(mq.TLO.Spell(sp).Range()) or 0 end) end
     end
     if r > 0 then
-        epRangeCache = r
-        rezlog('[placate] cast range resolved to %d from %s', r, sp)
+        rezlog('[placate] no detrimental memmed to read a focused range from - using %d unfocused', r)
         return r
     end
     return EP_RANGE_FALLBACK
 end
-
 function ep_gem_ready()
     local t = -1
-    pcall(function() t = tonumber(mq.TLO.Me.GemTimer(epGem).TotalSeconds()) or -1 end)
+    pcall(function() t = tonumber(mq.TLO.Me.GemTimer(ep_gem_num()).TotalSeconds()) or -1 end)
     return t == 0
 end
 
@@ -9382,11 +10116,51 @@ function ep_find(id)
     return nil
 end
 
+-- Tell Smart Cast how it went, so the shared queue shows the outcome rather than sitting on 'assigned'.
+function pac_reflect(id, state)
+    local _, e = pac_find(id)
+    if e and not e.state then
+        e.state = state
+        e.oor, e.oorSince, e.oorDist = false, nil, nil
+        pcall(function() peer_bcast('/at_pacmark %d %s', id, state) end)
+    end
+end
+
+-- OUT OF RANGE IS A STATE, NOT A SILENCE.
+-- Both casting queues already know when a mob is too far - they set their own `oor` flag and skip past
+-- it - but that never left the caster. On the shared list the entry looked identical to one that had
+-- been handed over and simply not acted on yet, so the only thing distinguishing "waiting for the group
+-- to close" from "that caster is not running" was elapsed time. That is what PAC_OOR_MAX was inferring,
+-- and inference is why it was set to the wrong thing twice.
+-- Now the caster says so. `oor` is DELIBERATELY NOT a state: state means resolved and stops the entry
+-- being worked, whereas out of range is temporary by definition - the group walks forward and it clears
+-- itself. It is a flag alongside the state, not one of its values.
+function pac_set_oor(e, oor, dist)
+    if not e or e.state then return end
+    if oor then
+        -- The clock starts on the FIRST report and is not restarted by later ones, so a mob that has
+        -- been unreachable for a minute does not look fresh because the caster mentioned it again.
+        e.oorSince = e.oorSince or mq.gettime()
+        e.oor, e.oorDist = true, dist
+    else
+        e.oor, e.oorSince, e.oorDist = false, nil, nil
+    end
+end
+
+-- Called by the casting queues on a TRANSITION only - in or out - so this is not chatter on the wire.
+function pac_reflect_oor(id, oor, dist)
+    local _, e = pac_find(id)
+    if not e or e.state then return end
+    pac_set_oor(e, oor, dist)
+    pcall(function() peer_bcast('/at_pacoor %d %d %d', id, oor and 1 or 0, math.floor(dist or 0)) end)
+end
+
 function ep_mark(id, state, why)
     local _, e = ep_find(id)
     if not e or e.state then return end
     e.state, e.oor = state, false
     rezlog('[placate] %s#%d - %s', e.name or '?', id or 0, why)
+    pac_reflect(id, state)
     ep_queue_log('after mark')
     pcall(function() peer_bcast('/at_epmark %d %s', id, state) end)
 end
@@ -9460,6 +10234,8 @@ end
 EP_STRIP_PASSES = 3
 epStripPass     = 0
 epNotReadyAt    = 0
+
+epCursorSaidAt = 0
 
 function ep_strip()
     if epSaved then
@@ -9844,11 +10620,38 @@ end
 
 function ep_tick()
     if not ep_is_enchanter() then return end
-    -- ELECTED ONLY. Capability is not permission: with an enchanter, a cleric and a paladin in one group
-    -- all three pass the class check, and all three would strip and cast at the same mob.
-    local who = ep_elected()
-    if who and who:lower() ~= myName:lower() then return end
-
+    -- ANYTHING ON THE CURSOR STOPS THE WHOLE TICK. The per-cast checks below catch it at the moment of
+    -- casting, but by then the run may already have stripped gear or targeted a mob - and an item held
+    -- while any of that happens is how it gets put somewhere nobody expects.
+    -- Checked first, before anything is touched.
+    --
+    -- IT USED TO JUST STAND DOWN, on the reasoning that whatever is on the cursor got there for a reason
+    -- and is not ours to move. In practice what is on it is a heal orb the group's own healing put there:
+    -- Ejtou held Orb of the Sanguine and refused to placate for as long as it sat on her cursor, because
+    -- unlike Shela and Ehaba she has no OrbInv=/autoinventory event to stow it. Standing down forever
+    -- over a potion that belongs in a bag is worse than putting it in the bag.
+    -- So: TRY TO STOW IT FIRST. /autoinventory only ever moves the item to a free bag slot - it does not
+    -- destroy anything and it does not choose where things go beyond that - so the cost of being wrong
+    -- is an item in a bag rather than on the cursor.
+    -- If it will NOT stow - bags full, or something the client refuses to put away - fall back to exactly
+    -- the old behaviour and stand down, because then it really is stuck and worth stopping for.
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        local held = tostring(mq.TLO.Cursor.Name() or '?')
+        -- Rate limited so a genuinely stuck cursor does not mean an /autoinventory every pulse.
+        if (mq.gettime() - (epCursorTryAt or 0)) > 3000 then
+            epCursorTryAt = mq.gettime()
+            pcall(function() mq.cmd('/autoinventory') end)
+            mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+        end
+        if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+            if (mq.gettime() - (epCursorSaidAt or 0)) > 5000 then
+                epCursorSaidAt = mq.gettime()
+                rezlog('\\ay[placate] holding off - %s will not stow off the cursor (bags full?)\\ax', held)
+            end
+            return
+        end
+        rezlog('[placate] stowed %s off the cursor', held)
+    end
     -- BACKSTOP FIRST, before anything else can return early. Being stripped is a state with a real cost -
     -- an enchanter with no weapons is an enchanter not meleeing and not proccing anything useful - and a
     -- queue that stalls on an unreachable mob would otherwise leave them that way indefinitely.
@@ -9865,6 +10668,68 @@ function ep_tick()
         if pending == 0 then ep_resume('nothing left to do') end
     end
 
+    -- CLEARING IS THE TICK'S JOB, not the panel's - the same fault the phantom queue had.
+    -- This lived only inside draw_placate, so it ran only on a character with the window open. Every
+    -- headless worker accumulated resolved entries forever: Ejtou's queue grew 1, 2, 3, 4 with every
+    -- entry already done or failed, and the stand-down line kept reporting a queue that should have
+    -- emptied minutes earlier.
+    if #epQueue > 0 then
+        local pend = 0
+        for _, q in ipairs(epQueue) do if not q.state then pend = pend + 1 end end
+        if pend == 0 then
+            epDoneAt = epDoneAt or mq.gettime()
+            local hold = (#epQueue == 1) and 10000 or EP_LINGER
+            if (mq.gettime() - epDoneAt) > hold then
+                epQueue, epDoneAt = {}, nil
+                pcall(function() peer_bcast('/at_epclear') end)
+                ep_queue_log('linger expired')
+            end
+        else
+            epDoneAt = nil
+        end
+    end
+
+    -- ELECTED ONLY - BUT NOT FOR WORK ADDRESSED TO ME.
+    -- Capability is not permission: with an enchanter, a cleric and a paladin in one group all three pass
+    -- the class check, and on the SHARED list all three would strip and cast at the same mob. That is
+    -- what the election is for, and for the manual button it is still correct.
+    -- Smart Cast changed the premise. It routes each mob to exactly one caster by level ceiling - lowest
+    -- that still covers it - so the collision the election prevents cannot happen for assigned work. With
+    -- the election in front of it, the two systems disagreed and the election won: Ejtou (cap 76) was
+    -- correctly given level 69 mobs, was not the elected caster, and returned here SILENTLY. The mobs sat
+    -- in her queue while Shela, the only one allowed to cast, had never been given them.
+    -- So: if anything pending was assigned to me, I am the right caster for it by definition.
+    -- This now sits BELOW the backstops rather than above them. A stand-down must not skip the code that
+    -- puts someone's weapons back on.
+    do
+        local who = ep_elected()
+        if who and who:lower() ~= myName:lower() then
+            local mine = false
+            for _, q in ipairs(epQueue) do if not q.state and q.mine then mine = true; break end end
+            if not mine then
+                -- STAND DOWN CLEANLY, do not just leave.
+                -- This return is ABOVE the queue scan, and the queue scan is where the "nothing left to
+                -- do -> put the weapons back" branch lives. So a caster that finished its own mobs and
+                -- then found it was not the elected one walked away still stripped and still holding E3.
+                -- Ejtou did exactly that: stripped at 04:17:31, stood down from 04:17:38, and was only
+                -- rescued at 04:20:32 by the EP_STRIP_MAX backstop - three minutes with no weapons and
+                -- E3 paused, which is three minutes of no heals and no manastone.
+                -- Nothing of mine is pending, so there is nothing to be stripped or paused FOR.
+                if epSaved then ep_restore('nothing of mine left to placate')
+                elseif epPaused then ep_resume('nothing of mine left to placate') end
+                -- Said out loud, rate limited. The silent version of this line is the reason the above
+                -- took a log read to find: a queue with entries and no activity looked identical to a
+                -- queue that had stalled.
+                if #epQueue > 0 and (mq.gettime() - (epElectSaidAt or 0)) > 15000 then
+                    epElectSaidAt = mq.gettime()
+                    rezlog('[placate] %s is the elected caster - standing down (%d queued here, none assigned to me)',
+                           who, #epQueue)
+                end
+                return
+            end
+        end
+    end
+
     if epCast then
         -- PLACATE HAS A CAST TIME, so nothing can be concluded while it is still going out. This used to
         -- read the gem timer immediately and call the job done the moment it moved, which reported a
@@ -9873,6 +10738,25 @@ function ep_tick()
         pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
         if casting then
             epCast.sawCast = true
+            -- WATCH THE CURSOR THROUGH THE CAST, not only before it.
+            -- Everything else checks at a moment: tick start, before the strip, before a retry. The cast
+            -- itself is the longest window in the whole run and was the one nobody was watching - the
+            -- tick returned here immediately on every pulse while a spell was going out. A heal orb,
+            -- a summoned item, a trade landing in that window put an item on the cursor with a cast
+            -- already in flight, which is how it ends up somewhere nobody expects.
+            -- STOP THE CAST FIRST, then stow. Order matters: stowing while the spell is still going out
+            -- leaves the same race open a moment longer, and the cast is the thing we can cancel.
+            -- The retry costs nothing here - see freeRetry below - because being interrupted is not the
+            -- same as being resisted, and it was not this mob's fault.
+            if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                local held = tostring(mq.TLO.Cursor.Name() or '?')
+                pcall(function() mq.cmd('/stopcast') end)
+                mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+                local ok = cursor_stow('placate')
+                rezlog('\\ay[placate] %s appeared on the cursor mid-cast at %s - stopped the cast%s\\ax',
+                       held, epCast.name or '?', ok and ' and stowed it' or ' (it will NOT stow)')
+                epCast.freeRetry = true
+            end
             return
         end
 
@@ -9937,8 +10821,22 @@ function ep_tick()
             return
         end
         if epCast.tries < EP_RETRY then
-            epCast.tries = epCast.tries + 1
+            -- An interrupted cast does not spend a retry. EP_RETRY exists to stop us re-casting forever
+            -- at a mob that keeps resisting; a cast we cancelled ourselves because an item appeared on
+            -- the cursor tells us nothing about the mob and should not count against it.
+            if epCast.freeRetry then epCast.freeRetry = false
+            else epCast.tries = epCast.tries + 1 end
             epCast.at, epCast.sawCast, epCast.checkTries = mq.gettime(), false, 0
+            -- NOTHING ON THE CURSOR, on a retry as much as on a first cast. Casting while holding an item
+            -- is how it ends up somewhere unexpected, and a retry is MORE exposed than the first cast:
+            -- seconds have passed, and anything that touches the cursor - a stow that did not take, a
+            -- trade, a manual pickup - has had time to happen since the strip checked.
+            cursor_stow('placate')
+            if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+                rezlog('\\ay[placate] not retrying %s#%d - %s will not stow off the cursor\\ax',
+                       epCast.name, epCast.id or 0, tostring(mq.TLO.Cursor.Name() or '?'))
+                return
+            end
             rezlog('[placate] did not land on %s#%d - retry %d of %d', epCast.name, epCast.id or 0, epCast.tries, EP_RETRY)
             if (tonumber(mq.TLO.Target.ID()) or 0) ~= epCast.id then
                 pcall(function() mq.cmdf('/target id %d', epCast.id) end)
@@ -9958,6 +10856,10 @@ function ep_tick()
     -- everything behind it - a Stillmoon novice sat at 210m for a minute while three reachable mobs
     -- waited their turn, and the enchanter stayed stripped throughout.
     -- Far entries are kept in the queue and retried; they just do not hold up the ones we can reach.
+    -- EVERY ENTRY IS MEASURED, not just up to the first reachable one. This used to break out of the
+    -- loop the moment it had something to cast at, which meant anything behind that mob kept whatever
+    -- oor flag it was last given - so the panel could show a mob as out of range long after the group
+    -- had walked up to it, and the flag we now report to Smart Cast would have been stale on arrival.
     local next_e, reach = nil, ep_range()
     local farOnes = 0
     for _, q in ipairs(epQueue) do
@@ -9965,17 +10867,26 @@ function ep_tick()
             local d = 9999
             pcall(function() d = math.floor(tonumber(mq.TLO.Spawn(q.id).Distance()) or 9999) end)
             if d <= reach then
+                if q.oor then
+                    q.farSince = nil
+                    pac_reflect_oor(q.id, false, d)
+                    rezlog('[placate] %s is back in reach (%dm) - picking it up again', q.name, d)
+                end
                 q.oor = false
-                next_e = q
-                break
-            end
-            q.oor = true
-            farOnes = farOnes + 1
-            -- GIVE UP ON ONE THAT NEVER CLOSES. Without this the queue can never finish, so the gear
-            -- never goes back on and only the 3-minute backstop saves it.
-            q.farSince = q.farSince or mq.gettime()
-            if (mq.gettime() - q.farSince) > EP_FAR_MAX then
-                ep_mark(q.id, 'failed', string.format('stayed out of range (%dm) for %ds', d, EP_FAR_MAX / 1000))
+                next_e = next_e or q
+            else
+                if not q.oor then
+                    pac_reflect_oor(q.id, true, d)
+                    rezlog('[placate] %s is %dm away (reach %d) - skipping it for now', q.name, d, reach)
+                end
+                q.oor = true
+                farOnes = farOnes + 1
+                -- GIVE UP ON ONE THAT NEVER CLOSES. Without this the queue can never finish, so the gear
+                -- never goes back on and only the 3-minute backstop saves it.
+                q.farSince = q.farSince or mq.gettime()
+                if (mq.gettime() - q.farSince) > EP_FAR_MAX then
+                    ep_mark(q.id, 'failed', string.format('stayed out of range (%dm) for %ds', d, EP_FAR_MAX / 1000))
+                end
             end
         end
     end
@@ -10015,7 +10926,9 @@ function ep_tick()
     end
     if epSaidGem ~= sp then
         epSaidGem = sp
-        rezlog('[placate] using "%s" from gem %d (matched on %s)', sp, epGem, tostring(spWhy))
+        -- ep_gem_num(), not epGem. epGem is the legacy shared default (8); the real gem can be per
+        -- character via pacGem. Ejtou memmed into gem 11 and this line said 8 in the same breath.
+        rezlog('[placate] using "%s" from gem %d (matched on %s)', sp, ep_gem_num(), tostring(spWhy))
     end
 
     if (mq.gettime() - (epLast or 0)) < EP_RECAST then return end
@@ -10025,7 +10938,7 @@ function ep_tick()
     -- Rate-limited to once every 5s so a long recast does not fill the log.
     if not ep_gem_ready() then
         local t = -1
-        pcall(function() t = tonumber(mq.TLO.Me.GemTimer(epGem).TotalSeconds()) or -1 end)
+        pcall(function() t = tonumber(mq.TLO.Me.GemTimer(ep_gem_num()).TotalSeconds()) or -1 end)
         if (mq.gettime() - (epGemSaidAt or 0)) > 5000 then
             epGemSaidAt = mq.gettime()
             rezlog('[placate] waiting on the gem - %ss left, %d still queued', tostring(t), (function()
@@ -10052,6 +10965,9 @@ function ep_tick()
     -- defeats the whole point - the proc breaks the placate - and casting with something on the cursor
     -- is how items end up somewhere unexpected.
     -- Checked here rather than inside ep_strip so it also covers a queue resumed after a stall.
+    -- Hoisted out of ep_tick so the RETRY path can use it too - see below. It was a local here and the
+    -- retry went straight to /nowcast without it, so an item picked up mid-run was only caught before
+    -- the first cast of a mob and not before the two retries that follow.
     local function ep_ready_to_cast()
         for _, slot in ipairs(EP_SLOTS) do
             local worn = ''
@@ -10169,6 +11085,13 @@ function pw_range()
 end
 PW_VERIFY_MS = 2000      -- how long to watch for the debuff before calling a cast lost
 PW_RETRY_MAX = 3
+-- GIVE UP ON ONE THAT NEVER CLOSES, the same way the placate queue does (EP_FAR_MAX). Without it an
+-- entry that goes out of reach once has no way out of the queue: nothing marks it, so it stays pending
+-- forever and the list can never finish. Same 45s, and deliberately shorter than PAC_OOR_MAX (90s) so
+-- the outcome reflects back into Smart Cast before the shared list gives up and clears itself.
+PW_FAR_MAX   = 45000
+pwOorSaidAt  = 0         -- rate limit on the "everything is out of reach" line
+pwCursorSaidAt = 0       -- rate limit on the stuck-cursor line
 -- ENTRIES ARE MARKED, NOT REMOVED. A queue that empties as it works gives you nothing to look at: by the
 -- time you glance over, the evidence of what happened is gone. Each mob stays put and changes colour -
 -- grey waiting, red out of range, green landed, amber gave up - so the whole sweep is visible at once,
@@ -10219,6 +11142,7 @@ function pw_mark(id, state, why)
     e.state, e.oor = state, false
     rezlog('[pw] %s - %s', e.name or ('id ' .. id), why)
     pcall(function() peer_bcast('/at_pwmark %d %s', id, state) end)
+    pac_reflect(id, state)
 end
 
 -- Runs on EVERY toon; returns immediately on anyone without the disc. Main loop only - it targets and
@@ -10227,8 +11151,38 @@ function pw_tick()
     local disc = pw_disc()
     if not disc then return end
 
+    -- SAME CURSOR RULE AS PLACATE. The phantom line never had one: it fires a disc rather than a spell,
+    -- so it does not strip gear and looked lower risk - but a disc still goes out while an item is held,
+    -- and it targets and re-targets exactly the same way. An item on the cursor through any of that is
+    -- how it gets put somewhere nobody expects.
+    -- Stow it if it will go; only stand down if it will not.
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        local ok, held = cursor_stow('pw')
+        if not ok then
+            if (mq.gettime() - (pwCursorSaidAt or 0)) > 5000 then
+                pwCursorSaidAt = mq.gettime()
+                rezlog('\\ay[pw] holding off - %s will not stow off the cursor\\ax', tostring(held or '?'))
+            end
+            return
+        end
+    end
+
     if pwCast then
         local age = mq.gettime() - pwCast.at
+        -- MID-DISC, same as placate: cancel first, then stow. A disc has a cast time on this line and
+        -- that window was unwatched.
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if casting and (mq.TLO.Cursor.ID() or 0) ~= 0 then
+            local held = tostring(mq.TLO.Cursor.Name() or '?')
+            pcall(function() mq.cmd('/stopcast') end)
+            mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+            local ok = cursor_stow('pw')
+            rezlog('\\ay[pw] %s appeared on the cursor mid-cast at %s - stopped it%s\\ax',
+                   held, pwCast.name or '?', ok and ' and stowed it' or ' (it will NOT stow)')
+            pwCast.freeRetry = true
+            return
+        end
         if pw_on_mob() then
             local _, e = pw_find(pwCast.id)
             rezlog('[pw] landed on %s%s', (e and e.name) or ('id ' .. pwCast.id),
@@ -10242,7 +11196,9 @@ function pw_tick()
         end
         if age < PW_VERIFY_MS then return end
         if pwCast.tries < PW_RETRY_MAX then
-            pwCast.tries = pwCast.tries + 1
+            -- An interruption we caused does not count against the mob - same reasoning as placate.
+            if pwCast.freeRetry then pwCast.freeRetry = false
+            else pwCast.tries = pwCast.tries + 1 end
             pwCast.at = mq.gettime()
             rezlog('[pw] no sign of it on %s - retry %d of %d', pwCast.name or '?', pwCast.tries, PW_RETRY_MAX)
             pcall(function() mq.cmdf('/disc %s', disc.name) end)
@@ -10257,32 +11213,83 @@ function pw_tick()
         return
     end
 
-    if #pwQueue == 0 then return end
+    if #pwQueue == 0 then pwDoneAt = nil; return end
+
+    -- THE SWEEP RUNS BEFORE THE RECAST AND READY GATES, not after. Ageing a far mob out, noticing one
+    -- has died, and tidying a finished list are all housekeeping - none of them need the disc to be up,
+    -- and putting them behind the gates meant a queue could sit untouched for a whole recast cycle.
+    --
+    -- PICK THE FIRST REACHABLE ONE, not simply the first pending one. This is the same bug the placate
+    -- queue had and fixed (see ep_tick): stalling on a far mob blocked everything behind it. Worse here,
+    -- because nothing else in the phantom path ever cleared the queue - one mob out of reach once and
+    -- this character stopped pacifying for the rest of the session.
+    -- Far entries stay in the queue and get retried; they just do not hold up the ones we can reach.
+    local next_e, nextDist, reach = nil, 0, pw_range()
+    local farOnes = 0
+    for _, q in ipairs(pwQueue) do
+        if not q.state then
+            if not pw_spawn_ok(q.id) then
+                pw_mark(q.id, 'failed', 'dead or gone')
+            else
+                local d = 9999
+                pcall(function() d = math.floor(tonumber(mq.TLO.Spawn(q.id).Distance()) or 9999) end)
+                if d <= reach then
+                    if q.oor then
+                        q.oor, q.farSince = false, nil
+                        pcall(function() peer_bcast('/at_pwoor %d 0', q.id) end)
+                        pac_reflect_oor(q.id, false, d)
+                        rezlog('[pw] %s is back in reach (%dm) - picking it up again', q.name, d)
+                    end
+                    if not next_e then next_e, nextDist = q, d end
+                else
+                    if not q.oor then
+                        q.oor = true
+                        pcall(function() peer_bcast('/at_pwoor %d 1', q.id) end)
+                        pac_reflect_oor(q.id, true, d)
+                        rezlog('[pw] %s is %dm away (reach %d) - skipping it for now', q.name, d, reach)
+                    end
+                    farOnes = farOnes + 1
+                    q.farSince = q.farSince or mq.gettime()
+                    if (mq.gettime() - q.farSince) > PW_FAR_MAX then
+                        pw_mark(q.id, 'failed', string.format('stayed out of range (%dm) for %ds',
+                                d, PW_FAR_MAX / 1000))
+                    end
+                end
+            end
+        end
+    end
+
+    -- CLEARING IS THE TICK'S JOB, not the panel's. It used to live inside draw_phantom, which only runs
+    -- when the mini section is open - and miniPhantom is off by default. So on a normal session the list
+    -- was never tidied at all, and the next pull started behind whatever was left over.
+    local pending = 0
+    for _, q in ipairs(pwQueue) do if not q.state then pending = pending + 1 end end
+    if pending == 0 then
+        pwDoneAt = pwDoneAt or mq.gettime()
+        local hold = (#pwQueue == 1) and PW_LINGER_ONE or PW_LINGER
+        if (mq.gettime() - pwDoneAt) > hold then
+            pwQueue, pwDoneAt = {}, nil
+            pcall(function() peer_bcast('/at_pwclear') end)
+            rezlog('[pw] all done - clearing the list')
+        end
+        return
+    end
+    pwDoneAt = nil
+
+    if not next_e then
+        if farOnes > 0 and (mq.gettime() - (pwOorSaidAt or 0)) > 5000 then
+            pwOorSaidAt = mq.gettime()
+            rezlog('[pw] %d queued mob(s) out of reach (%d) - waiting', farOnes, reach)
+        end
+        return
+    end
+
     if (mq.gettime() - pwLast) < disc.recast then return end
     local rdy = false
     pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(disc.name)()) end)
     if not rdy then return end
 
-    local e
-    for _, q in ipairs(pwQueue) do if not q.state then e = q; break end end
-    if not e then return end          -- everything resolved; the UI handles the linger and clear
-    if not pw_spawn_ok(e.id) then pw_mark(e.id, 'failed', 'dead or gone'); return end
-
-    local dist = 9999
-    pcall(function() dist = math.floor(tonumber(mq.TLO.Spawn(e.id).Distance()) or 9999) end)
-    local reach = pw_range()
-    if dist > reach then
-        if not e.oor then
-            e.oor = true
-            pcall(function() peer_bcast('/at_pwoor %d 1', e.id) end)
-            rezlog('[pw] %s is %dm away (reach %d) - holding until we are closer', e.name, dist, reach)
-        end
-        return                      -- STALL, deliberately. Do not reorder someone's list behind their back.
-    end
-    if e.oor then
-        e.oor = false
-        pcall(function() peer_bcast('/at_pwoor %d 0', e.id) end)
-    end
+    local e, dist = next_e, nextDist
 
     local prev = 0
     pcall(function() prev = tonumber(mq.TLO.Target.ID()) or 0 end)
@@ -10368,6 +11375,127 @@ function draw_nightveil()
                     pcall(function() ImGui.SetTooltip(nm .. '\n' .. why) end)
                 end
             end
+        end
+    end
+end
+
+-- The pacify panel: who can do it, what each caps at, and the queue with each mob routed to a caster.
+function draw_pacify()
+    -- WHO IS AVAILABLE, and what they top out at. Shown because the routing is only as good as this
+    -- table, and a caster missing from it is the first thing you would want to notice.
+    local names = {}
+    for nm in pairs(pacCap) do names[#names + 1] = nm end
+    table.sort(names, function(a, b) return (pacCap[a].cap or 0) < (pacCap[b].cap or 0) end)
+    if #names == 0 then ImGui.TextDisabled('nobody has reported a pacify spell yet'); return end
+
+    ImGui.TextDisabled('casters:')
+    for _, nm in ipairs(names) do
+        local c = pacCap[nm]
+        ImGui.SameLine()
+        -- CLICKABLE, like the rez chain: green in, red out. A paladin who technically has a placate but
+        -- should never be the one casting it is a normal thing to want, and the alternative is
+        -- remembering not to queue mobs in their band.
+        local off = pacOff[nm:lower()] and true or false
+        if off then ImGui.PushStyleColor(ImGuiCol.Text, 0.90, 0.35, 0.35, 1.0)
+        else        ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0) end
+        if ImGui.SmallButton(string.format('%s %d##pacoff_%s', nm:sub(1, 6), c.cap or 0, nm)) then
+            pacOff[nm:lower()] = (not off) or nil
+            save_settings()
+            pcall(function() peer_bcast('/at_pacoff %s %d', nm, off and 0 or 1) end)
+        end
+        ImGui.PopStyleColor(1)
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip(string.format('%s\n%s\ncaps at level %d, range %d\n\n%s',
+                nm, c.spell or c.kind or '?', c.cap or 0, c.range or 0,
+                off and 'OUT of the rotation - click to put back in'
+                    or 'in the rotation - click to take out')) end)
+        end
+        -- The gem lives in SETTINGS, not here. It is set once per character and then never touched, so
+        -- it does not belong on a panel you look at during a pull - unlike the in/out click above, which
+        -- is a decision you make in the moment.
+    end
+
+    if ImGui.Button('Pacify target##pacadd', 150, 0) then
+        local id, nm, ty, hp, lvl = 0, '', '', 0, 0
+        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
+        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
+        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
+        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
+        pcall(function() lvl = tonumber(mq.TLO.Target.Level()) or 0 end)
+        local dist = 0
+        pcall(function() dist = math.floor(tonumber(mq.TLO.Target.Distance()) or 0) end)
+        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
+            log('\\ay[pacify] target an NPC first\\ax')
+        elseif pac_find(id) then
+            log('[pacify] %s is already queued', nm)
+        else
+            -- ROUTED AT CLICK TIME, from the level the mob actually is. Deciding later would mean
+            -- deciding again on every tick, and the answer cannot change - a mob's level is fixed.
+            -- Distance is a snapshot: the mob may close before its turn comes, so it is used to PREFER a
+            -- caster who can already reach it rather than to rule anyone out permanently.
+            local who, cap, rng = pac_assign(lvl, dist)
+            if not who then who, cap, rng = pac_assign(lvl) end   -- nobody in range: fall back on level
+            pacQueue[#pacQueue + 1] = { id = id, name = nm, level = lvl, dist = dist, who = who,
+                                        assignedAt = mq.gettime() }
+            if who then
+                log('[pacify] %s (level %d, %dm) -> %s (caps %d, reach %d)', nm, lvl, dist, who, cap or 0, rng or 0)
+                pcall(function() peer_bcast('/at_pacadd %d %s %d %s', id, nm:gsub(' ', '_'), lvl, who) end)
+                -- Every add can change who should have what, so settle the list before anyone picks up.
+                pac_rebalance()
+            else
+                log('\\ay[pacify] %s is level %d - nobody here can pacify that high\\ax', nm, lvl)
+            end
+        end
+    end
+    ImGui.SameLine()
+    if ImGui.SmallButton('Clear##pacclear') then
+        pacQueue = {}
+        pcall(function() peer_bcast('/at_pacclear') end)
+    end
+
+    for i, e in ipairs(pacQueue) do
+        ImGui.Text(string.format('%d.', i)); ImGui.SameLine()
+        if not e.who then
+            ImGui.TextColored(0.85, 0.35, 0.35, 1.0,
+                string.format('%s  lvl %d  - too high for anyone', e.name, e.level or 0))
+        elseif e.state == 'done' then
+            ImGui.TextColored(0.36, 0.85, 0.46, 1.0, string.format('%s  (%s)', e.name, e.who))
+        elseif e.state == 'too high' then
+            ImGui.TextColored(0.85, 0.35, 0.35, 1.0,
+                string.format('%s  lvl %d  above %s\'s ceiling', e.name, e.level or 0, e.who))
+        elseif e.state then
+            ImGui.TextColored(0.90, 0.72, 0.35, 1.0, string.format('%s  (%s: %s)', e.name, e.who, e.state))
+        elseif e.oor then
+            -- REPORTED out of range by the caster that owns it, not inferred here. Skipped for now and
+            -- picked up again the moment it is in reach - so this is a normal, self-correcting state and
+            -- not a fault. Amber rather than red for that reason: red is for something that has stopped.
+            local secs = e.oorSince and math.floor((mq.gettime() - e.oorSince) / 1000) or 0
+            ImGui.TextColored(0.90, 0.60, 0.30, 1.0,
+                string.format('%s  %s - out of range%s', e.name, e.who,
+                    (e.oorDist and e.oorDist > 0) and string.format(' (%dm)', e.oorDist) or ''))
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                pcall(function() ImGui.SetTooltip(string.format(
+                    '%s\n%s has it queued but cannot reach it%s.\nSkipped for now - it goes back in the'
+                    .. ' rotation as soon as it is in range.\nout of reach for %ds; given up on at %ds.',
+                    e.name, e.who,
+                    (e.oorDist and e.oorDist > 0) and string.format(' - %dm at the last check', e.oorDist) or '',
+                    secs, PAC_OOR_MAX / 1000)) end)
+            end
+        elseif e.sent then
+            -- Handed to that character's own queue, which owns it from here. Worth distinguishing from
+            -- 'assigned but not yet picked up' - one is working, the other might be a caster that is
+            -- not running.
+            ImGui.TextColored(0.62, 0.82, 0.95, 1.0,
+                string.format('%s  lvl %d  %s is on it', e.name, e.level or 0, e.who))
+        else
+            ImGui.TextColored(0.80, 0.80, 0.80, 1.0,
+                string.format('%s  lvl %d  -> %s', e.name, e.level or 0, e.who))
+        end
+        ImGui.SameLine()
+        if ImGui.SmallButton('x##pacdel' .. i) then
+            pcall(function() peer_bcast('/at_pacdel %d', e.id) end)
+            table.remove(pacQueue, i)
+            break
         end
     end
 end
@@ -10491,20 +11619,12 @@ function draw_placate()
             break
         end
     end
-    if pending == 0 and #epQueue > 0 then
-        epDoneAt = epDoneAt or mq.gettime()
+    -- REPORTS the countdown; ep_tick owns epDoneAt and does the clearing, so it happens on headless
+    -- workers too. A panel that only tidies while you are looking at it is the same as no panel.
+    if pending == 0 and #epQueue > 0 and epDoneAt then
         local hold = (#epQueue == 1) and 10000 or EP_LINGER
         local left = math.max(0, hold - (mq.gettime() - epDoneAt))
         ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
-        if left <= 0 then
-            epQueue, epDoneAt = {}, nil
-            pcall(function() peer_bcast('/at_epclear') end)
-            -- Worth logging precisely because nobody pressed anything: a queue that empties on a timer
-            -- is the most likely thing to look like it "jumped".
-            ep_queue_log('linger expired')
-        end
-    else
-        epDoneAt = nil
     end
     ImGui.Spacing()
 end
@@ -10577,18 +11697,14 @@ function draw_phantom()
             break
         end
     end
-    -- All resolved: hold the finished list up briefly so the sweep is actually visible, then tidy.
-    if pending == 0 and #pwQueue > 0 then
-        pwDoneAt = pwDoneAt or mq.gettime()
+    -- REPORTS the countdown, does not run it. pw_tick owns pwDoneAt and does the clearing, because the
+    -- queue has to tidy itself whether or not anyone has this section open. A panel that only works
+    -- while you are looking at it is the same as no panel: miniPhantom is off by default, so on an
+    -- ordinary session this ran zero times and the list never cleared.
+    if pending == 0 and #pwQueue > 0 and pwDoneAt then
         local hold = (#pwQueue == 1) and PW_LINGER_ONE or PW_LINGER
         local left = math.max(0, hold - (mq.gettime() - pwDoneAt))
         ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
-        if left <= 0 then
-            pwQueue, pwDoneAt = {}, nil
-            pcall(function() peer_bcast('/at_pwclear') end)
-        end
-    else
-        pwDoneAt = nil
     end
     ImGui.Spacing()
 end
@@ -10715,6 +11831,8 @@ MINI_SECTIONS = {
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
     { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
       get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
+    { key = 'pacify',  label = 'Smart Cast',              draw = draw_pacify,
+      get = function() return miniPacify end, set = function(v) miniPacify = v end },
     { key = 'placate', label = 'Placate',                draw = draw_placate,
       get = function() return miniPlacate end, set = function(v) miniPlacate = v end },
 }
@@ -11247,6 +12365,39 @@ local function render()
                     'AdventureTime ' .. VERSION .. '   (build ' .. BUILD_TAG .. ')')
                 ImGui.Separator()
                 ImGui.Spacing()
+                -- SMART CAST GEMS. Set once per character and then forgotten, which is what Settings is
+                -- for - the in/out clicks stay on the panel because those are decisions you make during
+                -- a pull, and these are not.
+                -- Listed from the capability reports, so only characters that actually have a pacify
+                -- SPELL appear. A monk's phantom line is a disc and needs no gem.
+                do
+                    local casters = {}
+                    for nm, c in pairs(pacCap) do
+                        if c.kind == 'placate' then casters[#casters + 1] = nm end
+                    end
+                    if #casters > 0 then
+                        table.sort(casters)
+                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Smart Cast gems')
+                        ImGui.TextDisabled('which gem holds each caster\'s pacify spell')
+                        for _, nm in ipairs(casters) do
+                            ImGui.SetNextItemWidth(70)
+                            local cur = pacGem[nm:lower()] or 8
+                            local g = ImGui.InputInt(nm .. '##pacgemset_' .. nm, cur, 0)
+                            g = math.max(1, math.min(12, math.floor(tonumber(g) or 8)))
+                            if g ~= cur then
+                                pacGem[nm:lower()] = g
+                                dirty = true
+                                pcall(function() peer_bcast('/at_pacgem %s %d', nm, g) end)
+                            end
+                            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                                local c = pacCap[nm]
+                                pcall(function() ImGui.SetTooltip(string.format('%s\n%s\ncaps at level %d',
+                                    nm, (c and c.spell) or '?', (c and c.cap) or 0)) end)
+                            end
+                        end
+                        ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                    end
+                end
                 ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Sections')
                 ImGui.TextDisabled('Turn off anything you do not use - hidden sections stop rendering.')
                 ImGui.Spacing()
@@ -11529,6 +12680,7 @@ if SHOW_UI then
     -- Said at startup because the moment you need it is the moment the window is gone, and a command
     -- you have never seen is no help then.
     log('   \\ay/atui\\ax reopens the mini window, \\ay/atuie\\ax the expanded one.')
+    log('   \\ay/atpac\\ax re-announces my pacify ceiling (run it after memming a new rank).')
     log('   \\ay/atwipe\\ax holds all rezzes until the group zones (\\ay/atwipe off\\ax to release).')
 -- RECOVER STRIPPED GEAR AT STARTUP. A file here means a placate run did not put the weapons back -
 -- almost always because the client died mid-run. Nothing else will ever notice: the character just
@@ -11627,6 +12779,10 @@ local function check_peer_network()
 end
 
 load_settings()   -- restore persisted toggles (auto-rez) before we start talking to anyone
+-- Announce what this character can pacify, once. Not on the heartbeat: the spell and its ceiling do not
+-- change during a session unless something is re-memmed, and /atpac covers that.
+-- Deferred slightly - the spellbook and gems are not reliably readable the instant a script starts.
+pacAnnounceAt = mq.gettime() + 8000
 load_combos()
 mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale settings file
 -- The peer check was written and then never wired in, so the one diagnostic aimed at split/broken
@@ -11856,6 +13012,40 @@ while running do
             pcall(function() trib_donate(w.item, w.qty) end)
             altCurRefresh = mq.gettime() + 2000   -- ours is already done; just let the counts settle
         end
+        -- The one-shot pacify announce, once the client has settled.
+        if pacAnnounceAt and mq.gettime() > pacAnnounceAt then
+            pacAnnounceAt = nil
+            pcall(pac_announce)
+        end
+        -- Poll for my corpse after a rez, until it shows up or the window closes. Cheap: one spawn read
+        -- per tick, and only during the minute after standing up.
+        if corpseLootUntil then
+            if mq.gettime() > corpseLootUntil then
+                corpseLootUntil = nil
+                rezlog('[corpse] no corpse found within a minute of the rez - nothing to loot')
+            else
+                -- The exact corpse the rezzer named, if we were told. Falling back to a name search only
+                -- when we were not - which is an older rezzer, or a rez nobody announced.
+                local cid = 0
+                if rezCorpseID then
+                    local ty = ''
+                    pcall(function() ty = tostring(mq.TLO.Spawn(rezCorpseID).Type() or '') end)
+                    if ty == 'Corpse' then cid = rezCorpseID end
+                else
+                    pcall(function() cid = tonumber(mq.TLO.Spawn('pccorpse ' .. myName).ID()) or 0 end)
+                end
+                -- Not while zoning: the spawn list is unreliable mid-transition and a read there is how
+                -- we would decide there is no corpse when there is.
+                local zoning = false
+                pcall(function() zoning = tlo_true(mq.TLO.Me.Zoning()) end)
+                if cid > 0 and not zoning then
+                    corpseLootUntil = nil
+                    local lootID = cid
+                    pcall(function() loot_my_corpse(lootID) end)
+                    rezCorpseID = nil
+                end
+            end
+        end
         if altReclaimWant then
             -- No quantity: Reclaim is all-or-nothing by design, so there is nothing to compute here.
             local w = altReclaimWant; altReclaimWant = nil
@@ -11927,6 +13117,16 @@ while running do
             local n = epTestWant; epTestWant = nil
             pcall(function() ep_soak_test(n) end)
         end
+        -- Hand out any Smart Cast entries assigned to me BEFORE the queues run, so a mob queued this
+        -- tick is worked this tick rather than next.
+        -- REBALANCE ON THE TICK, not only when a mob is added. PAC_MOVE_GRACE means a freshly assigned
+        -- entry is not eligible to move yet, so a burst of adds inside that window would settle nothing
+        -- and - since the only other caller was the add itself - nothing would ever settle it later.
+        -- Cheap: it exits immediately unless there is an un-sent entry past its grace worth moving.
+        -- Check E3 is still where we put it BEFORE the placate and phantom ticks run, since those are
+        -- the two that act on the assumption that it is held.
+        atphase('e3hold'); pcall(e3_assert_held)
+        atphase('pacify'); pcall(pac_dispatch); pcall(pac_rebalance); pcall(pac_autoclear)
         atphase('placate'); pcall(ep_tick)
         if not epSaidHave and ep_is_enchanter() then
             epSaidHave = true
@@ -12559,6 +13759,17 @@ pcall(function() mq.unbind('/atpull') end)
 pcall(function() mq.unbind('/atplacatetest') end)
 pcall(function() mq.unbind('/atplacategem') end)
 pcall(function() mq.unbind('/at_ephave') end)
+pcall(function() mq.unbind('/at_paccap') end)
+pcall(function() mq.unbind('/atpac') end)
+pcall(function() mq.unbind('/at_pacmark') end)
+pcall(function() mq.unbind('/at_pacoor') end)
+pcall(function() mq.unbind('/at_pacwho') end)
+pcall(function() mq.unbind('/at_pacsent') end)
+pcall(function() mq.unbind('/at_pacclear') end)
+pcall(function() mq.unbind('/at_pacdel') end)
+pcall(function() mq.unbind('/at_pacadd') end)
+pcall(function() mq.unbind('/at_pacgem') end)
+pcall(function() mq.unbind('/at_pacoff') end)
 pcall(function() mq.unbind('/at_epcaster') end)
 pcall(function() mq.unbind('/at_epgem') end)
 pcall(function() mq.unbind('/at_epmark') end)
@@ -12608,5 +13819,5 @@ pcall(function() mq.unbind('/at_pwmark') end)
 pcall(function() mq.unbind('/at_pwclear') end)
 pcall(function() mq.unbind('/at_pwdel') end)
 pcall(function() mq.unbind('/at_pwadd') end)
-pcall(function() mq.cmd('/e3p off') end)   -- always hand our toon back to E3 on the way out
+pcall(function() e3_release_all() end)   -- always hand our toon back to E3 on the way out
 if SHOW_UI then mq.imgui.destroy(scriptName) end
