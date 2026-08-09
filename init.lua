@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.06'
-local BUILD_TAG = '1.06'  -- bump on every change; prints on startup
+VERSION = '1.07'
+local BUILD_TAG = '1.07'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -11856,85 +11856,6 @@ function draw_pacify()
 end
 
 
-function draw_phantom()
-    local holder = nil
-    for _, nm in ipairs(group_members()) do
-        if pwState[nm] then holder = nm; break end
-    end
-
-    -- Named for the disc that will ACTUALLY be cast, which differs by monk. A button reading "Phantom
-    -- Whispers" on a toon that owns Phantom Echo would be quietly lying about what it does.
-    -- pwState[holder] carries the disc NAME from a current build, but a peer on an older one reports a
-    -- bare true - and concatenating a boolean into the label throws. Take it only when it is a string.
-    local lbl = pw_label()
-    if holder and type(pwState[holder]) == 'string' then lbl = pwState[holder] end
-    if ImGui.Button(lbl .. '##pwadd', 160, 0) then
-        local id, nm, ty, hp = 0, '', '', 0
-        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
-        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
-        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
-        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
-        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
-            log('\\ay[pw] target an NPC first\\ax')
-        elseif pw_find(id) then
-            log('[pw] %s is already queued', nm)
-        else
-            pwQueue[#pwQueue + 1] = { id = id, name = nm, oor = false }
-            log('[pw] queued %s (%d in the list)', nm, #pwQueue)
-            pcall(function() peer_bcast('/at_pwadd %d %s', id, nm:gsub(' ', '_')) end)
-        end
-    end
-    -- Always present, not just when the list has something in it: a control that appears and disappears
-    -- is one you have to hunt for, and it moves everything below it when it does.
-    ImGui.SameLine()
-    if ImGui.SmallButton('Clear list##pwclear') then
-        pwQueue, pwDoneAt = {}, nil
-        pcall(function() peer_bcast('/at_pwclear') end)
-        log('[pw] queue cleared')
-    end
-    if #pwQueue == 0 then return end
-    local pending = 0
-    for i, e in ipairs(pwQueue) do
-        if not e.state then pending = pending + 1 end
-        ImGui.Text(string.format('%d.', i)); ImGui.SameLine()
-        local label, tip
-        if e.state == 'done' then
-            ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (on)')
-            tip = e.name .. '\n' .. pw_label() .. ' is on it'
-        elseif e.state == 'immune' then
-            ImGui.TextColored(0.85, 0.30, 0.30, 1.0, e.name .. '  (immune)')
-            tip = e.name .. '\nthe game says it looks unaffected - it cannot be affected by this'
-        elseif e.state == 'failed' then
-            ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
-            tip = e.name .. '\ngave up on this one - dead, gone, or it would not land'
-        elseif e.oor then
-            ImGui.TextColored(0.90, 0.35, 0.35, 1.0, e.name .. '  (oor)')
-            tip = e.name .. '\nout of range - ' .. (holder or 'the holder') .. ' is holding until it is closer'
-        else
-            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, e.name)
-            tip = e.name .. '\nwaiting its turn'
-        end
-        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-            pcall(function() ImGui.SetTooltip(tip) end)
-        end
-        ImGui.SameLine()
-        if ImGui.SmallButton('x##pwdel' .. i) then
-            pcall(function() peer_bcast('/at_pwdel %d', e.id) end)
-            table.remove(pwQueue, i)
-            break
-        end
-    end
-    -- REPORTS the countdown, does not run it. pw_tick owns pwDoneAt and does the clearing, because the
-    -- queue has to tidy itself whether or not anyone has this section open. A panel that only works
-    -- while you are looking at it is the same as no panel: miniPhantom is off by default, so on an
-    -- ordinary session this ran zero times and the list never cleared.
-    if pending == 0 and #pwQueue > 0 and pwDoneAt then
-        local hold = (#pwQueue == 1) and PW_LINGER_ONE or PW_LINGER
-        local left = math.max(0, hold - (mq.gettime() - pwDoneAt))
-        ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
-    end
-    ImGui.Spacing()
-end
 
 function draw_arcane_buttons()
     local btns = {}
@@ -12085,8 +12006,6 @@ MINI_SECTIONS = {
       set = function(v) miniCures = v; miniMagic = v; miniArcane = v; miniPots = v end },
     { key = 'coth',   label = 'CoTH Group button',     draw = draw_coth_mini,
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
-    { key = 'phantom', label = 'Phantom (placate)',     draw = draw_phantom,
-      get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
     { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
       get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
     { key = 'pacify',  label = 'Pacify',                  draw = draw_pacify,
@@ -12107,7 +12026,10 @@ function mini_order_normalise()
     -- 'placate' folded into 'pacify': the manual single-target queue is gone, Smart Cast is the
     -- only placate view, so an old layout keeps its position rather than losing the entry.
     local MERGED = { cures = 'protect', magic = 'protect', arcane = 'protect', pots = 'protect',
-                     mgb = 'groupheals', combos = 'groupheals', placate = 'pacify' }
+                     mgb = 'groupheals', combos = 'groupheals', placate = 'pacify',
+                     -- The monk phantom panel was the same thing as the manual placate panel:
+                     -- an add-target button and a clear, for a queue Pacify already fills.
+                     phantom = 'pacify' }
     local out, seen = {}, {}
     for _, k0 in ipairs(miniOrder) do
         local k = MERGED[k0] or k0
@@ -12785,29 +12707,10 @@ local function render()
                                 miniCombos = ImGui.Checkbox('combos##at_gh_combo', miniCombos)
                                 if miniCombos ~= wasK then dirty = true end
                             end
-                            if k == 'pacify' and miniPacify then
-                                ImGui.SameLine()
-                                ImGui.SetNextItemWidth(70)
-                                local g = ImGui.InputInt('gem##at_epgem', epGem or 8, 0)
-                                g = math.max(1, math.min(12, math.floor(tonumber(g) or 8)))
-                                if g ~= epGem then
-                                    epGem = g; dirty = true
-                                    pcall(function() peer_bcast('/at_epgem %d', g) end)
-                                end
-                                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                                    local sp = ep_spell()
-                                    local who = nil
-                                    for _, nm in ipairs(group_members()) do
-                                        if epState[nm] then who = nm; break end
-                                    end
-                                    pcall(function() ImGui.SetTooltip(
-                                        'which gem holds placate' ..
-                                        (who and ('\ncaster: ' .. who) or '\nnobody who can placate has reported in yet') ..
-                                        (sp and ('\nin that gem here: ' .. sp ..
-                                                 (ep_spell_ok(sp) and '  (looks right)' or '  (NOT a placate)'))
-                                             or '')) end)
-                                end
-                            end
+                            -- The placate gem field used to sit here. It is a DUPLICATE: the same
+                            -- setting has its own 'Pacify gems' block higher up in Settings, which
+                            -- is where it belongs. Two controls for one value is a way to be unsure
+                            -- which one you last changed.
                             if k == 'burns' and miniBurns then
                                 ImGui.SameLine()
                                 -- Three named views instead of a "full detail" tick, because there are
