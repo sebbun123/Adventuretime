@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.07'
-local BUILD_TAG = '1.07'  -- bump on every change; prints on startup
+VERSION = '1.08'
+local BUILD_TAG = '1.08'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -184,24 +184,11 @@ end
 -- MQ bindings are inconsistent about booleans: true, 1 and "TRUE" all turn up depending on the build
 -- and the TLO. Comparing to `true` alone silently reads as false - that is what hid the rez window for
 -- several builds, and there were fourteen more of the same comparison scattered about.
--- IS THIS SPELL OFF COOLDOWN, ignoring the flicker?
--- Me.SpellReady answers "can I cast this INSTANT", not "is it off cooldown". It drops to false during
--- any global cooldown and while another cast is going out, so on a bard - who is essentially always
--- mid-song - it blinks constantly. Two things were reading it raw: the DI save ladder, where Ejtou's
--- log flipped it 31 times each way in three minutes and the tank's death save read unavailable about
--- half of them; and the Echoes buttons, which greyed out every time the bard sang.
--- A real cooldown holds false for minutes. A GCD blink is gone inside a second. So believe a false only
--- once it has held - and reset the moment it goes true, so the next real cooldown starts its own clock.
-SPELL_RDY_FALSE_AT = {}
-SPELL_RDY_DEBOUNCE = 2500
-function spell_ready_stable(nm)
-    if not nm or nm == '' then return false end
-    local raw = true
-    pcall(function() raw = tlo_true(mq.TLO.Me.SpellReady(nm)()) end)
-    if raw then SPELL_RDY_FALSE_AT[nm] = nil; return true end
-    SPELL_RDY_FALSE_AT[nm] = SPELL_RDY_FALSE_AT[nm] or mq.gettime()
-    return (mq.gettime() - SPELL_RDY_FALSE_AT[nm]) < SPELL_RDY_DEBOUNCE
-end
+-- A gem within this many seconds of ready counts as ready. Separates a cast in flight or a global
+-- cooldown (a second or two) from an actual recast. Used by the magic clicks and the DI ladder.
+-- Replaced a SpellReady debounce: SpellReady answers "can I cast this INSTANT", which on a bard is
+-- false nearly all the time, and no amount of debouncing fixes a signal that is false continuously.
+GEM_READY_SLACK = 5
 
 function tlo_true(v)
     if v == true or v == 1 then return true end
@@ -296,266 +283,103 @@ end
 -- driver: potState[char][key] = { carries, up, secs, dsecs, updated }. Worker: last-pushed key per pot.
 potState = {}
 
--- NIGHTVEIL EMBLEM. Same shape as the CoTH emblem: an aug that only fires from a CHARM, and a character
--- can be carrying up to four of them - so the ONLY one that counts is the charmed one. Looking it up by
--- name with FindItem would find a spare in a bag and call the character ready.
--- State is pushed per character like the potions, because each toon knows its own charm and its own
--- cooldown and the driver's copy is only as fresh as the last push.
-NIGHTVEIL_ITEM = 'Nightveil Emblem'
+-- ===== NIGHTVEIL EMBLEMS =====
+-- REBUILT AROUND THE SPLIT ITEMS. These used to be augs socketed in a charm, and an aug reports
+-- TimerReady = 0 through a live two hour cooldown - every TLO lied about it. That forced a whole
+-- apparatus: a self-tracked countdown persisted to a file, a deliberate second click on a bagged copy
+-- to provoke a refusal the client would answer with a real number, eight click methods tried in order,
+-- and a chat event to correct the guess. All of it existed to work around one unreadable number.
+-- The server split them into carryable items, one per role. A bag item answers TimerReady honestly, so
+-- the entire apparatus is gone: read the timer, click the item.
+-- WHO HAS WHICH IS DETECTED, NOT ASSUMED. Membership is "this character has this item in its bags",
+-- not "this character is a cleric" - so a melee carrying the caster one is listed where it actually is.
+NV_SPLIT = {
+    { role = 'Defense',    item = 'Veiled Bastion' },
+    { role = 'Healer',     item = 'Veiled Seal' },
+    { role = 'Melee DPS',  item = 'Veiled Blade' },
+    { role = 'Caster DPS', item = 'Veiled Eclipse' },
+}
 NIGHTVEIL_OPTS = '/CastType|Item/NoInterrupt'
-nvMethod       = nil    -- which click method worked here; found once, then reused
--- The effect the emblem applies. Used as a second proof that a click landed, since a timer read through
--- the wrong copy of the item is exactly what made every method look like a failure.
-NIGHTVEIL_BUFF = 'Intensity of the Resolute'
-nvState = {}      -- [char] = { ok, secs, updated }   ok=1 socketed in a charm, secs 0=ready
+NIGHTVEIL_BUFF = 'Intensity of the Resolute'   -- what a landed click applies; used only for display
+-- ONE CHARACTER CAN CARRY ALL FOUR. This held a single item per character, which quietly assumed the
+-- item matched the class - and the whole point of splitting them is that it need not. Somebody holding
+-- all four appears in all four rows and can be sent whichever one the situation wants.
+-- [char] = { items = { [index into NV_SPLIT] = secondsLeft }, updated }
+nvState = {}
 nvLast  = ''      -- change key for the push
+nvPushAt = 0      -- last push, so a slow keepalive can re-send a dropped entry
+nvErrLast = nil   -- last reported push error, so a repeating one is logged once
 
--- THE READ, SETTLED 2026-08-05. A Nightveil Emblem SOCKETED INTO A CHARM has no readable timer - every
--- member on the aug and on its carrier answers 0/ready straight through a live two-hour cooldown. A
--- LOOSE copy sitting in a bag reads correctly and returns REMAINING SECONDS. All copies share recast
--- pool 71, so the loose one's countdown IS the socketed one's countdown.
--- This inverts an earlier conclusion in this file. A previous pass decided reading by name was safe
--- because FindItem "was not picking up a spare" - it was, and that is precisely why it worked. The
--- spare is the only honest reader on the character.
--- CONSEQUENCE: the read only exists where a spare is carried. A character holding exactly one emblem,
--- socketed, has no way to see its own cooldown; FindItem resolves to the socketed copy and lies.
--- nv_secs() returns -1 in that case rather than reporting a confident 0.
--- TimerReady CAN RETURN A STRING. On this build it answers "Not ready" rather than a number, and
--- tonumber("Not ready") is nil - which our `or 0` then turned into 0, meaning READY. Every read said the
--- emblem was available, forever, and no click could ever be seen to have worked.
--- This reads it as text first and only then tries to make a number of it.
--- Returns: 0 ready, >0 seconds left, -1 unknown.
+function nv_hms(s)
+    s = tonumber(s) or 0
+    if s <= 0 then return 'ready' end
+    if s < 60 then return string.format('%ds', s) end
+    if s < 3600 then return string.format('%dm', math.floor(s / 60)) end
+    return string.format('%dh%02dm', math.floor(s / 3600), math.floor((s % 3600) / 60))
+end
+
+-- TimerReady DOES NOT ALWAYS RETURN A NUMBER. It can come back as text - "Not ready" - and tonumber()
+-- on that is nil, which `or 0` then turns into "ready". A plausible wrong answer, which is the worst
+-- kind: it reads as a working check right up until it matters.
 function timer_secs(v)
+    if v == nil then return 0 end
+    if type(v) == 'number' then return math.max(0, math.floor(v)) end
+    local s = tostring(v)
+    local n = tonumber(s)
+    if n then return math.max(0, math.floor(n)) end
+    if s:lower():find('not ready', 1, true) then return 60 end
+    return 0
+end
+
+-- WHICH of the four do I hold? Indexes into NV_SPLIT. Cached once found, because carrying one is a
+-- per-character fact - but a MISS is never cached, since this is asked at startup before inventory is
+-- reliably readable and one early empty answer would mean "carries none" for the whole session.
+nvHave, nvHaveAt = nil, 0
+function nv_have()
+    if nvHave and #nvHave > 0 then return nvHave end
+    if nvHave and (mq.gettime() - (nvHaveAt or 0)) < 15000 then return nvHave end
+    local out = {}
+    for i, e in ipairs(NV_SPLIT) do
+        local n = 0
+        pcall(function() n = tonumber(mq.TLO.FindItemCount('=' .. e.item)()) or 0 end)
+        if n == 0 then
+            local id = 0
+            pcall(function() id = tonumber(mq.TLO.FindItem('=' .. e.item).ID()) or 0 end)
+            if id > 0 then n = 1 end
+        end
+        if n > 0 then out[#out + 1] = i end
+    end
+    if #out > 0 and (not nvHave or #nvHave == 0) then
+        local names = {}
+        for _, i in ipairs(out) do names[#names + 1] = NV_SPLIT[i].role end
+        log('[nv] carrying %d: %s', #out, table.concat(names, ', '))
+    end
+    nvHave, nvHaveAt = out, mq.gettime()
+    return out
+end
+
+-- Seconds until the item at NV_SPLIT[i] is ready. 0 ready, -1 not carried.
+function nv_secs_at(i)
+    local e = NV_SPLIT[i]
+    if not e then return -1 end
+    local v = nil
+    pcall(function() v = mq.TLO.FindItem('=' .. e.item).TimerReady() end)
     if v == nil then return -1 end
-    local t = tostring(v)
-    local n = tonumber(t)
-    if n then return (n > 0) and n or 0 end          -- a plain number: 0 is ready
-    local low = t:lower()
-    if low:find('not ready', 1, true) then return 1 end   -- on cooldown, duration unknown
-    if low:find('ready', 1, true) then return 0 end
-    -- Something like "1h 58m" or "58:12" - pull the digits out and treat any of them as "not ready".
-    if t:match('%d') then return 1 end
-    return -1
+    return timer_secs(v)
 end
 
--- A ~105 MINUTE COOLDOWN READS BADLY IN SECONDS. "6275s left" is a number nobody can act on; 1:44:35 is
--- read at a glance. Minutes are zero-padded so the width does not jump as it counts down.
--- Drops the hours field entirely under an hour rather than showing 0:44:35.
-function nv_hms(secs)
-    local n = math.floor(tonumber(secs) or 0)
-    if n < 0 then n = 0 end
-    local h = math.floor(n / 3600)
-    local m = math.floor((n % 3600) / 60)
-    local sec = n % 60
-    if h > 0 then return string.format('%d:%02d:%02d', h, m, sec) end
-    return string.format('%d:%02d', m, sec)
-end
-
-function nv_carrier()
-    local slot = find_aug(NIGHTVEIL_ITEM)
-    if slot ~= 'charm' then return nil end
-    local nm = ''
-    pcall(function() nm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    return (nm ~= '') and nm or nil
-end
-
--- The SPELL the aug grants. Not the item name, and not the aug name - "Veiled Bastion" for the Nightveil
--- Emblem. This is the only handle that knows about the cooldown.
-function nv_spell()
-    local sp = ''
-    pcall(function() sp = tostring(mq.TLO.Me.Inventory('charm').Item(1).Spell.Name() or '') end)
-    return (sp ~= '' and sp ~= 'NULL') and sp or nil
-end
-
--- DO WE CARRY A LOOSE COPY? Bags only, and deliberately NOT FindItemCount - that counts equipped gear
--- and the augs inside it, so the socketed emblem would inflate it to 1 and we would trust a read that
--- does not exist. Walks the same way my_count() does, which is proven on this build.
-function nv_loose()
-    local total = 0
-    pcall(function()
-        for pk = 1, 12 do
-            local slot = mq.TLO.Me.Inventory('pack' .. pk)
-            if (slot.ID() or 0) > 0 then
-                local cap = slot.Container() or 0
-                if cap > 0 then                                        -- a bag: count its contents
-                    for i = 1, cap do
-                        local it = slot.Item(i)
-                        if (it.ID() or 0) > 0 and (it.Name() or '') == NIGHTVEIL_ITEM then
-                            total = total + 1
-                        end
-                    end
-                elseif (slot.Name() or '') == NIGHTVEIL_ITEM then      -- loose in an inventory slot
-                    total = total + 1
-                end
-            end
-        end
-    end)
-    return total
-end
-
--- WHO DO WE BELIEVE? A positive number is never a false positive - nothing on this build invents a
--- countdown out of nowhere, so any reading above zero is real and is trusted immediately, spare or no
--- spare. The only ambiguous reading is ZERO, which is either "genuinely ready" or the socketed copy
--- lying the way it did all through the 2026-08-04 session.
--- So the character proves its own read: the first time this emblem ever reports a nonzero here, we know
--- the read works on this character and a later zero can be believed. Carrying a loose copy grants that
--- trust up front, since a bagged emblem is known to read correctly.
--- This replaces requiring a spare outright - the druid reads its cooldown across zones with no spare
--- involved, so a hard spare requirement would have suppressed a read that works.
--- The latch resets on reload and re-arms the first time a cooldown is seen. Until then the behaviour is
--- the permissive one: allow the click and let the client refuse it.
-
--- WHERE IS THE LOOSE COPY? Returns pack index and slot index, or nil. Needed because the refresh has to
--- name the bagged copy by position - clicking "the emblem" by name would find the socketed one, which
--- is equipped and would really fire.
-function nv_loose_slot()
-    local pk, si = nil, nil
-    pcall(function()
-        for p = 1, 12 do
-            local slot = mq.TLO.Me.Inventory('pack' .. p)
-            if (slot.ID() or 0) > 0 then
-                local cap = slot.Container() or 0
-                if cap > 0 then
-                    for i = 1, cap do
-                        local it = slot.Item(i)
-                        if (it.ID() or 0) > 0 and (it.Name() or '') == NIGHTVEIL_ITEM then
-                            pk, si = p, i
-                            return
-                        end
-                    end
-                end
-            end
-        end
-    end)
-    return pk, si
-end
-
--- NIGHTVEIL STATE. Globals, not locals - the main chunk sits at Lua's 200-local ceiling.
--- These were lost in a comment cleanup on 2026-08-05: the edit deleted from one marker to the next and
--- took the declarations sitting between them, leaving nv_secs comparing nil to a number on every pulse.
--- The worker died on load, the driver's own pulse threw at the same line, and the whole thing came down.
-nvSecsVal         = -1     -- seconds left as of nvSecsAt; -1 means nothing on record
-nvSecsAt          = 0      -- mq.gettime() when nvSecsVal was set
-nvNextRefresh     = 0      -- retained for the nv_refresh stub; nothing schedules a poke any more
-NV_METHOD_WAIT_MS = 4000   -- how long a click gets to resolve before the result is read
-
--- DEAD ON PURPOSE. This used to right-click the loose copy to freshen the timer read. That is not a
--- read - on a ready pool it FIRES THE SOCKETED EMBLEM. Every path that called it was a way to set off a
--- two hour clicky by accident: a ten minute background timer, a startup seed, the readiness gate, and
--- the /atnv probe. Several were "safe" only because of a guard one edit away from being relaxed.
--- ALL SIX CHARACTERS ARE TREATED THE SAME NOW: nothing is ever clicked to find out. The cooldown is
--- inferred from the recorded button press and nothing else.
--- Kept as a stub rather than deleted so any call left anywhere is harmless instead of a syntax error.
-function nv_refresh(force)
-    return false
-end
-
--- EVERY CHARACTER IS TREATED THE SAME: THE COOLDOWN IS INFERRED, NEVER MEASURED.
--- There is no read worth having. The socketed emblem and its charm answer 0 straight through a live
--- cooldown, and the one thing that made a loose copy report honestly - right-clicking it - is not a
--- query at all, it FIRES the socketed emblem. So a spare in the bags buys nothing now, and the driver
--- gets no special treatment just because it happens to be the toon in front of you.
--- A live 0 is never taken at face value while a recorded countdown is still running; our own count wins
--- until it expires. A nonzero reading, if the client volunteers one unprompted, is believed.
--- The duration is an assumption, not a measurement. Persisted to disk, so a /lua reload does not hand
--- back a green button on a live cooldown.
--- TWO HOURS. A sample once read 6275 shortly after a click, suggesting ~6300 - but that reading came
--- through the same broken path as everything else here, and overshooting is the safe direction: a button
--- that greys slightly too long costs minutes, one that greys too little offers a click that gets refused
--- and wastes the whole cycle. Anything older than this is treated as ready.
-NV_RECAST_SECS = 7200
-
-function nv_track_path()
-    local who = ''
-    pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
-    local dir = ''
-    pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    return (dir ~= '' and (dir .. '\\') or '') .. 'adventuretime_nightveil_' .. who .. '.txt'
-end
-
--- Stored as an absolute expiry in os.time() seconds. mq.gettime() is uptime, which resets on reload and
--- would make every stored value meaningless the moment it mattered.
-function nv_track_write(secs)
-    local fh = io.open(nv_track_path(), 'w')
-    if not fh then return end
-    fh:write(tostring(os.time() + (secs or 0)))
-    fh:close()
-end
-
-function nv_track_read()
-    local fh = io.open(nv_track_path(), 'r')
-    if not fh then return 0 end
-    local t = tonumber(fh:read('*a') or '') or 0
-    fh:close()
-    local left = t - os.time()
-    return (left > 0) and left or 0
-end
-
--- Called when the button has been pressed. This is the ONLY thing that ever starts a countdown - there
--- is no measurement anywhere to correct it, so the recorded press is the whole source of truth.
--- How long after our own click a recast refusal can still be assumed to be about the emblem. Generous
--- enough for a slow client, short enough that an unrelated refusal a moment later is not ours.
-NV_ATTEMPT_WINDOW = 5000
-nvAttemptAt = nil
-
-function nv_mark_clicked()
-    nvSecsVal, nvSecsAt = NV_RECAST_SECS, mq.gettime()
-    nv_track_write(NV_RECAST_SECS)
-end
-
--- TRACKING FIRST, READING SECOND. The whole read path is only trustworthy in one narrow case: when the
--- pool is already down, the refused click on the loose copy surfaces a real number. Everywhere else the
--- reads are worthless - the socketed copy always claims ready, and asking the loose one costs a charge.
--- So the source of truth is now OUR OWN RECORD of when the button last fired, persisted to disk.
--- Returns seconds left, or -1 for GENUINELY UNKNOWN - which is a real answer here, not a failure. A
--- character that has never clicked through AT, or last clicked more than two hours ago, has no way to
--- know its state and should say so rather than pick a side.
+-- The soonest-ready of everything I hold, for anything that just wants one number.
 function nv_secs()
-    local now = mq.gettime()
-    if nvSecsVal > 0 then
-        local left = nvSecsVal - math.floor((now - nvSecsAt) / 1000)
-        if left > 0 then
-            -- A FREE LOOK, NEVER A CLICK. If the client happens to be showing a real number we take it;
-            -- we just never provoke one. On most characters this reads 0 forever and the count stands.
-            local v = nil
-            pcall(function() v = mq.TLO.FindItem('=' .. NIGHTVEIL_ITEM).TimerReady() end)
-            local real = timer_secs(v)
-            if real > 0 then
-                nvSecsVal, nvSecsAt = real, now
-                return real
-            end
-            return left
-        end
-        nvSecsVal = -1                                     -- run out
-        pcall(function() os.remove(nv_track_path()) end)
-        return -1                                          -- back to unknown, not to a claimed "ready"
+    local best = -1
+    for _, i in ipairs(nv_have()) do
+        local s = nv_secs_at(i)
+        if s >= 0 and (best < 0 or s < best) then best = s end
     end
-    -- NOTHING IN MEMORY - fresh load, or we have never seen it fire. The file is the only history there
-    -- is. Older than a full cycle and it tells us nothing, which is unknown rather than ready.
-    local disk = nv_track_read()
-    if disk > 0 then
-        nvSecsVal, nvSecsAt = disk, now
-        return disk
-    end
-    return -1
+    return best
 end
+function nv_ready() return nv_secs() == 0 end
 
--- Nothing here can prove readiness, so the click is always allowed. An emblem that is actually down
--- refuses harmlessly and the refusal event marks it, which is how an unknown resolves itself.
-function nv_ready()
-    return nv_secs() <= 0
-end
 
-function nv_state()
-    local slot = find_aug(NIGHTVEIL_ITEM)
-    if slot ~= 'charm' then return -1 end
-    local s = nv_secs()
-    if s >= 0 then return s end     -- real countdown: 0 ready, >0 seconds left
-    -- NO SPARE CARRIED, so no read exists on this character - "up or down" is not even knowable here.
-    -- -2 says exactly that. Returning 1 as a placeholder was worse than useless: it displayed as "1s
-    -- left" on every character, which is a specific claim and a false one.
-    return -2
-end
 potLast  = {}
 -- Drink the best tier of `base` I actually hold. II is tried first; I is the fallback ONLY when no II
 -- is carried. If a tier is held but its timer is down we STOP rather than dropping to the lower one -
@@ -2895,7 +2719,9 @@ DI = {
     RUNG_GAP = 12000,
     -- How long SpellReady must stay false before it is believed. A real cooldown holds it false for
     -- minutes; a global cooldown or an in-flight cast blinks it for well under a second.
-    RDY_DEBOUNCE = 2500,
+    -- A gem within this many seconds of ready counts as ready. Above it, something genuinely cast it -
+    -- us, E3, or the player by hand - and the rung is spent. Separates a global cooldown from a recast.
+    RUNG_READY_SLACK = 5,
     -- ITEMS NEED LONGER, because their cooldown read is the slow one. Spell and AA rungs have reported in
     -- 2-5s every time; the boots took ~13s on 2026-07-30 (cast 22:35:21.9, save on Sebbun 22:35:35.4) and
     -- lagged 29s in an earlier session. At a flat 12s the boots were re-cast one second before the first
@@ -3346,13 +3172,19 @@ function di_rung_list()
             -- spell also has its own long reuse, and the two are not the same number. Mamittuk's log
             -- shows rung 1 re-firing every 12 seconds - exactly RUNG_GAP - which is what "the timer we
             -- are reading returns to 0 immediately" looks like.
-            -- SpellReady FLICKERS. It answers "can I cast this instant", not "is it off cooldown", so it
-            -- drops to false during any global cooldown or while another cast is going out. Ejtou's log
-            -- flipped it 31 times true and 31 times false in three minutes - which made the tank's death
-            -- save read as unavailable about half the time.
-            -- So only BELIEVE a false that has held continuously. A real cooldown stays false for
-            -- minutes; a GCD blink is gone within a second.
-            local rdy = spell_ready_stable(nm)
+            -- THE GEM'S OWN COOLDOWN, WITH SLACK. This is the number that actually answers the question,
+            -- and it answers it for a cast by ANYONE - the script, E3, or the player pressing the gem by
+            -- hand - because casting from a gem is what starts that timer. A manual cast was the case
+            -- nothing else could see.
+            -- SpellReady used to gate this and it was the wrong read: it answers "can I cast this
+            -- INSTANT", not "is it off cooldown", so it dropped to false during every global cooldown.
+            -- Ejtou's log flipped it 31 times each way in three minutes, and the tank's death save read
+            -- as unavailable through about half of them.
+            -- The slack is what makes the timer usable on its own: a global cooldown or a cast in flight
+            -- leaves a second or two on the gem, a real recast leaves minutes. Five seconds sits well
+            -- clear of the first and nowhere near the second, and a save that is within five seconds of
+            -- ready is worth waiting for rather than skipping the rung over.
+            local rdy = (s >= 0 and s <= DI.RUNG_READY_SLACK)
             -- I FIRED IT, SO IT IS SPENT UNTIL PROVEN OTHERWISE. Same rule the staff already uses, for
             -- the same reason: a state read taken right after an action can lag or lie, and the cost of
             -- believing "ready" wrongly here is casting a death save on a loop forever.
@@ -3363,16 +3195,17 @@ function di_rung_list()
                 pcall(function() rc = tonumber(mq.TLO.Spell(nm).RecastTime()) or 0 end)
                 if rc > 0 and (mq.gettime() - fired) < (rc * 1000) then spent = true end
             end
-            local ready = (s == 0) and rdy and not spent
+            local ready = rdy and not spent
             -- SAY THE INPUTS when the verdict changes. Three rounds were lost on the placate ceiling
             -- guessing at reads instead of printing them; this one prints them.
             -- Change-detected AND rate limited. Change-detection alone printed 62 lines in a 114 line
             -- log, because the thing it was watching flickers by nature.
-            local k = string.format('%s/%d/%s/%s', tostring(s), gem, tostring(rdy), tostring(spent))
+            local k = string.format('%s/%d/%s', tostring(s), gem, tostring(spent))
             if DI.rungSaid ~= k and (mq.gettime() - (DI.rungSaidAt or 0)) > 30000 then
                 DI.rungSaid, DI.rungSaidAt = k, mq.gettime()
-                rezlog('[di] rung 1 %s: gem %d, gem timer %ss, SpellReady %s, assumed-spent %s -> %s',
-                       nm, gem, tostring(s), tostring(rdy), tostring(spent), ready and 'READY' or 'not ready')
+                rezlog('[di] rung 1 %s: gem %d, gem timer %ss (slack %ds), assumed-spent %s -> %s',
+                       nm, gem, tostring(s), DI.RUNG_READY_SLACK, tostring(spent),
+                       ready and 'READY' or 'not ready')
             end
             out[#out + 1] = { name = nm, kind = 'Spell', ready = ready }
             break                                   -- one or the other is memmed, never both
@@ -5362,419 +5195,60 @@ pcall(function()
             end
         end
     end)
-    -- BRUTE FORCE. The timer exists somewhere - the client knows perfectly well the thing is on cooldown -
-    -- and guessing member names one at a time has not found it. So try every plausible name against every
-    -- plausible object and print whatever answers.
-    -- Anything that returns a value at all is a lead; anything that errors or returns NULL is ruled out
-    -- for good. One command instead of another twenty rounds.
-    mq.bind('/atnvdump', function()
-        local charm = ''
-        pcall(function() charm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-        log('[nvdump] charm = "%s", aug = "%s"', charm, NIGHTVEIL_ITEM)
-
-        local MEMBERS = { 'TimerReady', 'Timer', 'Clicky', 'EffectType', 'Spell', 'CastTime',
-                          'ID', 'Name', 'Stackable', 'Type', 'Charges', 'MaxCharges',
-                          'ItemDelay', 'RecastTime', 'RecastTimerID', 'Ready', 'CanUse' }
-
-        local function try(label, get)
-            local ok, v = pcall(get)
-            if ok and v ~= nil then
-                local t = tostring(v)
-                if t ~= '' and t ~= 'NULL' then log('   %-46s = %s', label, t) end
-            end
-        end
-
-        log('[nvdump] --- the AUG, via the charm ---')
-        for _, m in ipairs(MEMBERS) do
-            try('Me.Inventory[charm].Item[1].' .. m,
-                function() return mq.TLO.Me.Inventory('charm').Item(1)[m]() end)
-        end
-        log('[nvdump] --- the AUG spell ---')
-        for _, m in ipairs({ 'Name', 'ID', 'RecastTime', 'RecastTimerID', 'Duration', 'MyDuration' }) do
-            try('...Item[1].Spell.' .. m,
-                function() return mq.TLO.Me.Inventory('charm').Item(1).Spell[m]() end)
-        end
-        log('[nvdump] --- the CHARM ---')
-        for _, m in ipairs(MEMBERS) do
-            try('Me.Inventory[charm].' .. m,
-                function() return mq.TLO.Me.Inventory('charm')[m]() end)
-        end
-        log('[nvdump] --- FindItem on each name ---')
-        for _, nm in ipairs({ charm, NIGHTVEIL_ITEM }) do
-            if nm ~= '' then
-                for _, m in ipairs({ 'TimerReady', 'Timer', 'ID', 'ItemSlot', 'ItemSlot2' }) do
-                    try(string.format('FindItem[=%s].%s', nm:sub(1, 22), m),
-                        function() return mq.TLO.FindItem('=' .. nm)[m]() end)
-                end
-                try('Me.ItemReady[' .. nm:sub(1, 22) .. ']', function() return mq.TLO.Me.ItemReady(nm)() end)
-                try('Cast.Ready[' .. nm:sub(1, 22) .. ']', function() return mq.TLO.Cast.Ready(nm)() end)
-            end
-        end
-        log('[nvdump] --- the spell it grants, as a spell ---')
-        local sp = ''
-        pcall(function() sp = tostring(mq.TLO.Me.Inventory('charm').Item(1).Spell.Name() or '') end)
-        if sp ~= '' then
-            for _, m in ipairs({ 'RecastTime', 'RecastTimerID', 'ID' }) do
-                try('Spell[' .. sp:sub(1, 20) .. '].' .. m, function() return mq.TLO.Spell(sp)[m]() end)
-            end
-            try('Me.Buff[' .. sp:sub(1, 20) .. '].Duration', function() return mq.TLO.Me.Buff(sp).Duration() end)
-            try('Me.Song[' .. sp:sub(1, 20) .. '].Duration', function() return mq.TLO.Me.Song(sp).Duration() end)
-            try('Me.SpellReady[' .. sp:sub(1, 20) .. ']', function() return mq.TLO.Me.SpellReady(sp)() end)
-        end
-        log('[nvdump] --- gem/recast timers, in case it shares one ---')
-        try('Me.CombatAbilityReady[' .. NIGHTVEIL_ITEM .. ']',
-            function() return mq.TLO.Me.CombatAbilityReady(NIGHTVEIL_ITEM)() end)
-        log('[nvdump] done - anything printed above exists; anything absent does not.')
-    end)
+    -- One command, because there is one thing left to ask. Everything the old probes hunted for -
+    -- which TLO answers, which click form works, whether the pool is shared - was solving the aug's
+    -- unreadability, and a bag item just answers.
     mq.bind('/atnv', function()
-        local nm = NIGHTVEIL_ITEM
-        log('[nv] probing "%s"', nm)
-        local charm = ''
-        pcall(function() charm = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-        log('   charm item        : %s', (charm ~= '') and charm or '(empty)')
-        for a = 1, 6 do
-            local v1, v2 = '', ''
-            pcall(function() v1 = tostring(mq.TLO.Me.Inventory('charm').Item(a).Name() or '') end)
-            pcall(function() v2 = tostring(mq.TLO.Me.Inventory('charm').AugSlot(a)() or '') end)
-            if v1 ~= '' or v2 ~= '' then
-                log('   charm aug %d       : Item[%d]="%s"  AugSlot[%d]="%s"', a, a, v1, a, v2)
-            end
-        end
-        local cnt, rdy, itemslot = 0, -1, ''
-        pcall(function() cnt = tonumber(mq.TLO.FindItemCount('=' .. nm)()) or 0 end)
-        pcall(function() rdy = tonumber(mq.TLO.FindItem('=' .. nm).TimerReady()) or -1 end)
-        pcall(function() itemslot = tostring(mq.TLO.FindItem('=' .. nm).ItemSlot() or '') end)
-        log('   FindItemCount     : %d', cnt)
-        local ir, cr = 'n/a', 'n/a'
-        pcall(function() ir = tostring(mq.TLO.Me.ItemReady(nm)()) end)
-        pcall(function() cr = tostring(mq.TLO.Cast.Ready(nm)()) end)
-        log('   FindItem.TimerReady: %s   <- honest ONLY if a loose copy is carried', tostring(rdy))
-        log('   Me.ItemReady      : %s   <- what the working clicky macros use', ir)
-        log('   Cast.Ready        : %s   (MQ2Cast, if loaded)', cr)
-        -- The CHARM's own readings. An aug lends its clicky to the item it sits in, so these are the
-        -- ones most likely to reflect a real cooldown.
-        local cname, cready, ctimer = '', 'n/a', 'n/a'
-        pcall(function() cname = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-        if cname ~= '' then
-            pcall(function() cready = tostring(mq.TLO.Me.ItemReady(cname)()) end)
-            pcall(function() ctimer = tostring(mq.TLO.Me.Inventory('charm').TimerReady()) end)
-        end
-        log('   charm "%s":', (cname ~= '') and cname or 'none')
-        log('     Me.ItemReady    : %s', cready)
-        log('     charm.TimerReady: %s', ctimer)
-        log('   FindItem.ItemSlot : %s', (itemslot ~= '') and itemslot or 'n/a')
-        local slot, idx, carrier = find_aug(nm)
-        log('   find_aug()        : %s', slot and (slot .. ' aug ' .. tostring(idx) .. ' in ' .. tostring(carrier))
-                                              or 'NOT FOUND - this is why the button refuses')
-        local rpk, rsi = nv_loose_slot()
-        log('   nv_loose()        : %d   at pack%s slot%s', nv_loose(), tostring(rpk), tostring(rsi))
-        -- DELIBERATELY DOES NOT POKE. A probe that fires the thing it is probing is not a probe. On a
-        -- ready pool the right-click on the loose copy casts the socketed emblem, so /atnv reads whatever
-        -- the client happens to be showing and nothing more.
-        log('   raw read (no poke): TimerReady=%s ItemReady=%s',
-            tostring(mq.TLO.FindItem('=' .. nm).TimerReady()), tostring(mq.TLO.Me.ItemReady(nm)()))
-        log('   tracked           : %s', (nv_secs() > 0) and nv_hms(nv_secs()) or 'nothing on record')
-        log('   tracking          : %s', (nv_secs() > 0) and (nv_hms(nv_secs()) .. ' left (from the recorded press)')
-                                          or 'nothing on record - treated as unknown, button green')
-        log('   nv_secs()         : %d (%s)   (-1 = no read available)', nv_secs(), nv_hms(nv_secs()))
-        log('   nv_state()        : %d   (-1 means unusable)', nv_state())
-    end)
-    mq.bind('/atcothaug', function()
-        cothAugOk = nil          -- re-check: this is the command you run after moving the aug
-        coth_aug_report(false)
-    end)
-    mq.bind('/atcurrency', function()
-        log('[currency] item counts vs alt-currency balances:')
-        log('   window open: %s  (not required - the list reads either way)',
-            tostring(mq.TLO.Window(ALTCUR_WND).Open()))
-        local rows = 0
-        pcall(function() rows = tonumber(mq.TLO.Window(ALTCUR_LIST).Items()) or 0 end)
-        log('   currency list rows: %d  (before selecting a tab)', rows)
-        altcur_show_tab()
-        rows = altcur_list_rows()
-        log('   currency list rows: %d  (after altcur_show_tab, tab=%s)', rows, tostring(altcurListTab))
-        -- EVERY row, and every column that has anything in it. The previous version printed a row only
-        -- when column 1 was non-empty, so a list whose names live in column 2 printed nothing at all -
-        -- which is exactly what happened: 10 rows reported and not one shown.
-        for i = 1, math.min(rows, 20) do
-            local cells = {}
-            for c = 1, 6 do
-                local v = ''
-                pcall(function() v = tostring(mq.TLO.Window(ALTCUR_LIST).List(i, c)() or '') end)
-                if v ~= '' then cells[#cells + 1] = string.format('col%d="%s"', c, v) end
-            end
-            log('     row %-2d  %s', i, (#cells > 0) and table.concat(cells, '  ') or '(all columns empty)')
-        end
-        for _, nm in ipairs({ 'Diamond Coin', 'Ruby', 'Emerald', 'Orb of Shadows' }) do
-            local items = 0
-            pcall(function() items = tonumber(mq.TLO.FindItemCount('=' .. nm)()) or 0 end)
-            log('   %-16s bags=%-6d list=%s', nm, items, tostring(altcur_balance(nm) or 'not listed'))
-        end
-    end)
-    -- DUMP THE SONG AND BUFF WINDOWS WITH THEIR EXACT BYTES. EQ is inconsistent about apostrophes -
-    -- some names carry a plain ASCII ' and some a backtick or a typographic quote - and an INI CheckFor
-    -- compares strings, so the wrong one fails to match and simply never fires. Silently, which is the
-    -- worst way for a config to be wrong.
-    -- Printing the codepoint of anything non-alphanumeric settles it: copy the name from the log line
-    -- and the character is whatever it actually is, not whatever the keyboard produced.
-    mq.bind('/atsongs', function(filter)
-        local want = (filter or ''):lower()
-        local function dump(kind, n)
-            for i = 1, n do
-                local nm = ''
-                pcall(function()
-                    nm = tostring((kind == 'song' and mq.TLO.Me.Song(i) or mq.TLO.Me.Buff(i)).Name() or '')
-                end)
-                if nm ~= '' and nm ~= 'NULL' and (want == '' or nm:lower():find(want, 1, true)) then
-                    local odd = {}
-                    for ci = 1, #nm do
-                        local b = nm:byte(ci)
-                        if not nm:sub(ci, ci):match('[%w%s]') then
-                            odd[#odd + 1] = string.format('%q=%d', nm:sub(ci, ci), b)
-                        end
-                    end
-                    log('  %s %-2d %s%s', kind, i, nm,
-                        (#odd > 0) and ('   [' .. table.concat(odd, ' ') .. ']') or '')
-                end
-            end
-        end
-        log('[songs] song window:')
-        dump('song', buff_slot_max(55))
-        log('[songs] buff window:')
-        dump('buff', buff_slot_max(45))
-        log('   bytes shown for any non-alphanumeric character: 39 is a plain apostrophe, 96 a backtick.')
-    end)
-    mq.bind('/atslots', function()
-        for _, sl in ipairs({ 'mainhand', 'offhand', 'ranged', 'primary', 'secondary', 'range' }) do
-            local nm = 'n/a'
-            pcall(function() nm = tostring(mq.TLO.Me.Inventory(sl).Name() or 'EMPTY') end)
-            log('  Inventory[%-10s] = %s', sl, nm)
-        end
-    end)
-    -- Set the gem from anywhere without the window, and report it when asked with no argument. The
-    -- broadcast means it does not matter which toon you type it on.
-    mq.bind('/atplacategem', function(n)
-        local g = tonumber(n)
-        if not g then
-            log('[placate] gem is %d%s', epGem or 8,
-                ep_is_enchanter() and (' - ' .. (ep_spell() or 'that gem is empty')) or '')
+        local have = nv_have()
+        if #have == 0 then
+            log('\\ay[nv] I am carrying none of the four.\\ax')
+            for _, e in ipairs(NV_SPLIT) do log('   looked for: %s (%s)', e.item, e.role) end
             return
         end
-        g = math.max(1, math.min(12, math.floor(g)))
-        epGem = g; save_settings()
-        pcall(function() peer_bcast('/at_epgem %d', g) end)
-        log('[placate] gem set to %d for the group', g)
-    end)
-    mq.bind('/at_pwmark', function(id, st)
-        local _, e = pw_find(tonumber(id) or 0)
-        if e then e.state, e.oor = st, false end
-    end)
-    mq.bind('/at_pwoor', function(id, v)
-        local _, e = pw_find(tonumber(id) or 0); if e then e.oor = (v == '1') end
-    end)
-    -- Carries the disc NAME, not just a flag: the driver's button is labelled with whatever the holder
-    -- will really cast, and only the holder knows which one that is.
-    mq.bind('/at_pwhave', function(who, disc)
-        if who and who ~= '' then pwState[who] = (disc and disc ~= '') and disc:gsub('_', ' ') or true end
+        for _, i2 in ipairs(have) do
+            local e = NV_SPLIT[i2]
+            local raw = nil
+            pcall(function() raw = mq.TLO.FindItem('=' .. e.item).TimerReady() end)
+            log('[nv] %-16s %-16s TimerReady=%-10s -> %s', e.role, e.item, tostring(raw),
+                nv_hms(nv_secs_at(i2)))
+        end
     end)
     mq.bind('/at_arcstate', function(char, have, secs, up)
-        if char then
-            arcState[char] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
-                               up = tonumber(up) or 0, updated = mq.gettime() }
-        end
-    end)
-    mq.bind('/at_nvstate', function(char, secs)
         if not char then return end
-        -- -1 means no emblem in a charm; -2 means it has one and it is down. Both are "not clickable",
-        -- but only the first means the character is not set up for this.
-        local n = tonumber(secs) or -1
-        nvState[char] = { ok = (n ~= -1) and 1 or 0, secs = n, updated = mq.gettime() }
+        arcState[char] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
+                           up = tonumber(up) or 0, updated = mq.gettime() }
     end)
-    -- Click my own Nightveil. Sent by the driver's buttons; refuses rather than clicking a spare from a
-    -- bag, which is the whole reason this is aug-aware.
--- THE CLICK METHODS, in the order they are tried. Hoisted out of the bind so /atnvtest can fire exactly
--- one of them: a discovery run costs the whole two-hour pool, so being able to spend that shot on a
--- single named method - and wait out the cooldown before spending the next - is worth more than an
--- automatic sweep that has to guess which of eight actually landed.
-function nv_methods()
-    local myID = 0
-    pcall(function() myID = tonumber(mq.TLO.Me.ID()) or 0 end)
-    local carrier = nv_carrier()
-    local sp = nv_spell()
-    return {
-        -- CONFIRMED IN GAME 2026-08-05: E3's /nowcast with the aug BY NAME starts the cooldown. Two
-        -- beliefs in this file were wrong - that the aug's own name was the wrong object to ask about,
-        -- and that E3 could not resolve an aug. It resolves it fine.
-        -- The target id is NOT a differentiator either way: the effect lands on the caster whatever is
-        -- targeted, so passing one or omitting one cannot be what makes a method work. That also means
-        -- the other /nowcast forms below are probably fine too - they are simply unconfirmed. First
-        -- place here means observed to work, not proven uniquely correct.
-        { name = '/nowcast (E3), aug by name, no target id',
-          run  = function() mq.cmdf('/nowcast me "%s%s"', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS) end },
-        -- THE SAME THING, QUEUED INSTEAD OF IMMEDIATE. /nowcast interrupts whatever is casting, which is
-        -- correct for a rez or a DI and questionable for a two-hour buff - the All button fires this on
-        -- six characters at once, and on a cleric that lands mid-heal.
-        -- Second, not first: the nowcast form is confirmed to work and this one is not. Test it with
-        -- /atnvtest 2 and promote it if it fires. If the queue swallows it, nothing is lost - the sweep
-        -- falls through to the proven form.
-        { name = '/queuecast (E3), aug by name - TEST ONLY, does not interrupt',
-          sweep = false,
-          run  = function() mq.cmdf('/queuecast me "%s%s"', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS) end },
-            -- MQ2Cast FIRST. Cast.Ready answered correctly about the charm while everything else lied,
-            -- so it is the one thing here that demonstrably understands this item - which makes it the
-            -- most likely to be able to click it too.
-            { name = '/casting the charm, as an item',
-              run  = function() if carrier then mq.cmdf('/casting "%s" item', carrier) end end },
-            { name = '/casting the charm, by slot',
-              run  = function() if carrier then mq.cmdf('/casting "%s" charm', carrier) end end },
-            { name = '/casting the granted spell',
-              run  = function() if sp then mq.cmdf('/casting "%s"', sp) end end },
-            { name = '/itemnotify charm (the item the aug is in)',
-              run  = function() mq.cmd('/itemnotify charm rightmouseup') end },
-            { name = '/useitem the charm by name',
-              run  = function() if carrier then mq.cmdf('/useitem "%s"', carrier) end end },
-            { name = '/nowcast the charm by name',
-              run  = function()
-                  if carrier then mq.cmdf('/nowcast me "%s%s" %d', carrier, NIGHTVEIL_OPTS, myID) end
-              end },
-            { name = '/nowcast with my spawn id (as CoTH does)',
-              run  = function() mq.cmdf('/nowcast me "%s%s" %d', NIGHTVEIL_ITEM, NIGHTVEIL_OPTS, myID) end },
-            { name = '/useitem by name',
-              run  = function() mq.cmdf('/useitem "%s"', NIGHTVEIL_ITEM) end },
-            { name = '/itemnotify aug in charm',
-              run  = function() mq.cmdf('/itemnotify "%s" rightmouseup', NIGHTVEIL_ITEM) end },
-            { name = '/casting by name, item',
-              run  = function() mq.cmdf('/casting "%s" item', NIGHTVEIL_ITEM) end },
-    }
-end
-
-    -- ONE METHOD, ONE SHOT, NO GUESSING. `/atnvtest` lists them; `/atnvtest 6` fires only number 6 and
-    -- reports what actually changed. The automatic sweep cannot attribute a success honestly when the
-    -- methods are seconds apart and a buff takes time to land - it credits whichever method happened to
-    -- be running when the buff from the previous one arrived. This spends the pool deliberately instead.
-    mq.bind('/atnvtest', function(which)
-        local methods = nv_methods()
-        local n = tonumber(which)
-        if not n then
-            log('[nvtest] %d methods - run /atnvtest <n> to fire exactly one:', #methods)
-            for i, m in ipairs(methods) do log('   %d. %s', i, m.name) end
-            log('[nvtest] result rests on the buff and the recorded press - the emblem is never clicked to check')
-            return
+    -- INDEXES, NOT NAMES. The item names contain spaces and mq splits a bind's arguments on spaces, so
+    -- sending "Veiled Bastion" would arrive as two arguments. An index into NV_SPLIT has neither
+    -- problem and is shorter on the wire: "1:0,3:7180" is everything this character holds.
+    mq.bind('/at_nvstate', function(char, list)
+        if not char then return end
+        local items = {}
+        for pair in tostring(list or ''):gmatch('[^,]+') do
+            local i2, s = pair:match('^(%d+):(-?%d+)$')
+            if i2 then items[tonumber(i2)] = tonumber(s) end
         end
-        if not methods[n] then log('\\ar[nvtest] no method %d\\ax', n); return end
-        if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then
-            log('\\ay[nvtest] %s is not in my charm - nothing to test\\ax', NIGHTVEIL_ITEM); return
-        end
-        -- BEFORE. From the record only. Poking here would fire the emblem and the test would be
-        -- measuring its own side effect.
-        local before = nv_secs()
-        local bb = 0
-        pcall(function() bb = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
-        if bb == 0 then pcall(function() bb = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
+        nvState[char] = { items = items, updated = mq.gettime() }
+    end)
+    -- Click mine. One item, one command - no method cascade, no second click to provoke a refusal.
+    -- WHICH ONE. The driver names the index, because a character holding all four needs to be told
+    -- which to use - that choice is the whole point of the split.
+    mq.bind('/at_nvclick', function(idx)
+        local i2 = tonumber(idx or 0) or 0
+        local e = NV_SPLIT[i2]
+        if not e then log('\\ay[nv] click asked for slot %s, which is not one of the four\\ax', tostring(idx)); return end
+        local before = nv_secs_at(i2)
+        if before < 0 then log('\\ay[nv] I do not carry %s\\ax', e.item); return end
         if before > 0 then
-            log('\\ay[nvtest] already on cooldown (%s left) - this proves nothing, wait it out\\ax', nv_hms(before))
+            log('\\ay[nv] %s is on cooldown (%s) - not clicking\\ax', e.item, nv_hms(before))
             return
         end
-        log('[nvtest] %d. %s   before: %s buff=%s', n, methods[n].name, nv_hms(before), (bb > 0) and 'up' or 'down')
-        pcall(methods[n].run)
-        -- A FULL SIX SECONDS. Long enough for a cast to finish and the buff to register, so a slow
-        -- success is not recorded as a failure.
-        mq.delay(6000)
-        nv_mark_clicked()
-        mq.delay(400)
-        local after = nv_secs()
-        local ab = 0
-        pcall(function() ab = tonumber(mq.TLO.Me.Buff(NIGHTVEIL_BUFF).ID()) or 0 end)
-        if ab == 0 then pcall(function() ab = tonumber(mq.TLO.Me.Song(NIGHTVEIL_BUFF).ID()) or 0 end) end
-        log('[nvtest] %d. %s   after : %s buff=%s', n, methods[n].name, nv_hms(after), (ab > 0) and 'up' or 'down')
-        if after > 0 then
-            log('\\ag[nvtest] METHOD %d WORKS - cooldown started (%s)\\ax', n, nv_hms(after))
-            nvMethod = n
-        elseif ab > 0 and bb == 0 then
-            log('\\ag[nvtest] METHOD %d landed the buff (no timer to confirm with - no loose copy)\\ax', n)
-            nvMethod = n
-        else
-            log('\\ar[nvtest] method %d did nothing\\ax', n)
-        end
-        nvLast = ''
-    end)
-
-    mq.bind('/at_nvclick', function()
-        local slot = find_aug(NIGHTVEIL_ITEM)
-        if slot ~= 'charm' then
-            log('\\ay[nv] %s is not in my charm%s - not clicking\\ax', NIGHTVEIL_ITEM,
-                slot and (' (it is in ' .. slot .. ')') or '')
-            return
-        end
-        -- NO POKE IN THE GATE. This used to right-click the loose copy to freshen the read before
-        -- deciding whether to allow the click - which fires the emblem, meaning the gate could set off
-        -- the very thing it was checking on. The record is the gate now.
-        local left = nv_secs()
-        if left > 0 then
-            log('[nv] %s is not ready - %s left', NIGHTVEIL_ITEM, nv_hms(left))
-            nvLast = ''   -- push the real number out so the button matches what just happened
-            return
-        end
-        -- E3'S /nowcast IS THE ONE THAT WORKS - the opposite of what this comment used to claim. It was
-        -- ruled out on the theory that E3 cannot resolve an aug; it resolves it fine, by the aug's own
-        -- name, with no target id. The rest are kept as fallbacks for builds where it does not.
-        -- FOUR METHODS, TRIED IN ORDER, and whichever works is remembered. Guessing which one this build
-        -- supports has cost several rounds already; asking the client once and caching the answer costs
-        -- one slow first click.
-        -- Success is judged by the item going ON COOLDOWN, not by the command returning - a command that
-        -- does nothing returns just as happily as one that works.
-        log('[nv] clicking %s', NIGHTVEIL_ITEM)
-        -- STAMP THE ATTEMPT. The recast-refusal event below has no way of knowing WHICH item the client
-        -- was talking about, so it needs to know whether we just asked for one.
-        nvAttemptAt = mq.gettime()
-        local slotName, augIdx = find_aug(NIGHTVEIL_ITEM)
-        -- MY OWN SPAWN ID, because that is the one difference between this and the CoTH emblem - which is
-        -- also an aug, also in a charm, and works. It passes a target id; this did not. E3's /nowcast
-        -- appears to want one even for something that lands on the caster.
-        -- Tried FIRST for that reason: the working example next door is better evidence than any of the
-        -- alternatives below, all of which were guesses.
-        local methods = nv_methods()
-        -- All copies share pool 71, so reading by name is correct - a spare in a bag shows the same
-        -- timer as the charmed one. FindItem IS picking up the spare, and that is the only reason this
-        -- read works at all: the socketed copy has no readable timer. Where no spare is carried
-        -- nv_ready() returns true unconditionally, so success here rests on the BUFF check alone.
-        -- The BUFF is checked as well, because an effect that landed proves the click worked whatever a
-        -- timer says.
-        -- TWO STEPS, IN THIS ORDER, ALWAYS.
-        --   1. Use the EQUIPPED emblem. This is the one that actually casts.
-        --   2. Use the one in the BAG. With the pool now down it is refused rather than executed, and
-        --      the refusal is what makes the client publish a real countdown.
-        -- Step 2 is only safe because step 1 already happened. Run it on a ready pool and it fires the
-        -- socketed emblem itself - which is what the old ten minute background poke was doing.
-        -- The single method is the confirmed one. No cascade: every extra command is another cast that
-        -- can be held and discharged later.
-        local m = methods[nvMethod or 1]
-        pcall(m.run)
-
-        -- Recorded on the ATTEMPT. Nothing here can confirm a cast went - the socketed copy always
-        -- claims ready - so waiting for proof means never writing the timestamp at all. Two hours is the
-        -- assumption until step 2 replaces it with a real number.
-        nv_mark_clicked()
-        log('[nv] used %s via %s - reading the bagged copy for the real timer', NIGHTVEIL_ITEM, m.name)
-
-        -- Let the cast resolve before asking. Asking too early was what made every method look broken.
-        mq.delay(NV_METHOD_WAIT_MS)
-
-        -- STEP 2 IS GONE. It used to click the bagged copy to measure the real cooldown. Even though the
-        -- pool is down by this point and the click should be refused, it is the same action that fires
-        -- the emblem when the pool is up - and one wrong assumption about the order of events turns it
-        -- into an accidental cast. Not worth a more precise number.
-        mq.delay(400)
-        local real = nv_secs()
-        if real > 0 and real < NV_RECAST_SECS then
-            nv_track_write(real)   -- solidify: persist the measured value, not the guess
-            log('\\ag[nv] %s down for %s (measured)\\ax', NIGHTVEIL_ITEM, nv_hms(real))
-        else
-            log('\\ay[nv] %s marked down for %s - the bagged copy gave no number, so this is the '
-                .. 'two hour assumption\\ax', NIGHTVEIL_ITEM, nv_hms(NV_RECAST_SECS))
-        end
+        pcall(function() mq.cmdf('/nowcast me "%s%s"', e.item, NIGHTVEIL_OPTS) end)
+        mq.delay(1500)
+        log('[nv] used %s (%s) - cooldown now %s', e.item, e.role, nv_hms(nv_secs_at(i2)))
         nvLast = ''   -- force a fresh push so the button greys immediately
     end)
+
     mq.bind('/at_potstate', function(char, key, carries, up, secs, dsecs)
         if not char or not key then return end
         potState[char] = potState[char] or {}
@@ -6253,24 +5727,8 @@ pcall(function()
     -- It cannot tell us HOW LONG is left, so it assumes a full cycle. That overshoots when the refusal
     -- comes late in the cooldown, which is the safe direction to be wrong in: a button that greys too
     -- long costs a few minutes, one that greys too little wastes the whole two hours on a refused click.
-    mq.event('at_nv_recast', 'Spell recast time not yet met#*#', function()
-        if find_aug(NIGHTVEIL_ITEM) ~= 'charm' then return end
-        if nv_secs() > 0 then return end        -- already counting; the refusal tells us nothing new
-        -- ONLY IF WE JUST ASKED. This message does NOT name the item - it is the client's generic recast
-        -- refusal - so without this guard ANY refused clicky was attributed to the emblem. E3 retries
-        -- things constantly, so the moment our own timer expired something unrelated would be refused
-        -- and reset it for another full cycle.
-        -- Sebbun's log shows the loop perfectly: refusals at 05:20, 07:20, 09:20, 11:20, 13:20, 15:20,
-        -- 17:20, 19:21 - exactly two hours apart, with no click of ours anywhere near them. The emblem
-        -- was never actually coming up.
-        -- The cost of the guard is that a click made BY HAND outside the script is no longer noticed.
-        -- That is the lesser problem: the file already carries the history across sessions, and a missed
-        -- manual click greys the button too little rather than locking it out forever.
-        if not nvAttemptAt or (mq.gettime() - nvAttemptAt) > NV_ATTEMPT_WINDOW then return end
-        log('[nv] the client refused on recast - marking %s down', NIGHTVEIL_ITEM)
-        nv_mark_clicked()
-        nvLast = ''
-    end)
+    -- at_nv_recast is gone with the guesswork. It existed to correct a self-tracked countdown from
+    -- the client's refusal message; the item's own TimerReady needs no correcting.
     mq.event('at_ep_immune', 'Your target looks unaffected#*#', function()
         if epCast then
             rezlog('[placate] %s is immune - not retrying', epCast.name)
@@ -7836,14 +7294,17 @@ function magic_state(e)
             end
         end
         if gem <= 0 then return 0, -1, 0, 0 end        -- not memmed: draw nothing
-        -- Debounced: a bard is almost always mid-song, so the raw read had these buttons flickering
-        -- between ready and "cooling 1s" continuously.
-        local rdy = spell_ready_stable(e.spell)
+        -- THE GEM'S OWN TIMER, WITH SLACK - not SpellReady, and not a debounce on it either.
+        -- SpellReady answers "can I cast this INSTANT", so on a bard it is false nearly all the time:
+        -- twisting songs means something is almost always going out. Debouncing only forgives a false
+        -- that is held BRIEFLY, and a bard's is held continuously - so the window expired and the button
+        -- went red anyway, which is the Echoes row staying red after we thought it was fixed.
+        -- The gem timer does not care what else is being cast. A song in flight leaves a second or two
+        -- on it; a real recast leaves far more. Same five second split that fixed the DI save ladder.
         local secs = 0
-        if not rdy then
-            pcall(function() secs = math.floor(tonumber(mq.TLO.Me.GemTimer(e.spell).TotalSeconds()) or 0) end)
-            if secs <= 0 then secs = 1 end             -- not ready but no timer: show as cooling, not ready
-        end
+        pcall(function() secs = math.floor(tonumber(mq.TLO.Me.GemTimer(e.spell).TotalSeconds()) or 0) end)
+        local rdy = (secs <= GEM_READY_SLACK)
+        if rdy then secs = 0 end
         local rem = 0
         pcall(function() rem = tonumber(mq.TLO.Me.Song(e.spell).Duration.TotalSeconds()) or 0 end)
         if rem <= 0 then pcall(function() rem = tonumber(mq.TLO.Me.Buff(e.spell).Duration.TotalSeconds()) or 0 end) end
@@ -11491,7 +10952,9 @@ function pw_mark(id, state, why)
     if not e or e.state then return end
     e.state, e.oor = state, false
     rezlog('[pw] %s - %s', e.name or ('id ' .. id), why)
-    pcall(function() peer_bcast('/at_pwmark %d %s', id, state) end)
+    -- NOT BROADCAST. Nothing binds /at_pwmark - it lands on every peer as an unknown command and does
+    -- nothing else. pwQueue is this character's own assigned work, exactly like epQueue, and the group
+    -- already learns the outcome through pac_reflect on the shared pacify list.
     pac_reflect(id, state)
 end
 
@@ -11591,7 +11054,6 @@ function pw_tick()
                 if d <= reach then
                     if q.oor then
                         q.oor, q.farSince = false, nil
-                        pcall(function() peer_bcast('/at_pwoor %d 0', q.id) end)
                         pac_reflect_oor(q.id, false, d)
                         rezlog('[pw] %s is back in reach (%dm) - picking it up again', q.name, d)
                     end
@@ -11599,7 +11061,6 @@ function pw_tick()
                 else
                     if not q.oor then
                         q.oor = true
-                        pcall(function() peer_bcast('/at_pwoor %d 1', q.id) end)
                         pac_reflect_oor(q.id, true, d)
                         rezlog('[pw] %s is %dm away (reach %d) - skipping it for now', q.name, d, reach)
                     end
@@ -11661,76 +11122,73 @@ end
 -- Colour is the state: green ready, amber counting down, grey unusable (no emblem in a charm). A name
 -- that is grey is not a missing button, it is a character whose emblem is in the wrong place.
 function draw_nightveil()
-    local rows = { Tank = {}, Healer = {}, DPS = {} }
-    for _, nm in ipairs(ordered_members()) do
-        local r = role_of(member_class(nm))
-        rows[r][#rows[r] + 1] = nm
+    -- FOUR FIXED ROWS, ONE PER ITEM. A character can hold all four, so membership is per ITEM rather
+    -- than per character - somebody carrying the lot appears in every row and can be sent whichever one
+    -- the situation wants. That choice is the entire point of the server splitting them.
+    -- Rows keep NV_SPLIT's order so they never shuffle as people zone in and out.
+    local any = false
+    local nMembers, nReported = 0, 0
+    local members = ordered_members()
+    for _, nm in ipairs(members) do
+        nMembers = nMembers + 1
+        if nvState[nm] and nvState[nm].items then nReported = nReported + 1 end
     end
 
-    local function click(nm)
-        if nm:lower() == myName:lower() then
-            pcall(function() mq.cmd('/at_nvclick') end)
-        else
-            pcall(function() peer_cmdf(nm, '/at_nvclick') end)
+    local function click(nm, i)
+        if nm:lower() == myName:lower() then pcall(function() mq.cmdf('/at_nvclick %d', i) end)
+        else pcall(function() peer_cmdf(nm, '/at_nvclick %d', i) end) end
+    end
+
+    for i, e in ipairs(NV_SPLIT) do
+        local holders, ready = {}, {}
+        for _, nm in ipairs(members) do
+            local st = nvState[nm]
+            local s  = st and st.items and st.items[i]
+            if s ~= nil and s >= 0 then
+                holders[#holders + 1] = nm
+                ready[nm] = (s == 0)
+            end
         end
-    end
-
-    for _, role in ipairs({ 'Tank', 'Healer', 'DPS' }) do
-        local list = rows[role]
-        if #list > 0 then
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, role .. ':')
+        if #holders > 0 then
+            any = true
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.role .. ':')
             ImGui.SameLine()
-            -- All first, and only when at least one of them can actually fire - an All that clicks
-            -- nothing is worse than no All.
-            local anyReady = false
-            for _, nm in ipairs(list) do
-                local st = nvState[nm]
-                if st and st.ok == 1 and st.secs == 0 then anyReady = true; break end
-            end
-            -- NO 'All' FOR A ROW OF ONE. With a single tank, All and the name are the same button, and
-            -- two buttons that do the same thing is just something else to look at.
-            if #list > 1 and anyReady then
-                if ImGui.SmallButton('All##nvall_' .. role) then
-                    for _, nm in ipairs(list) do
-                        local st = nvState[nm]
-                        if st and st.ok == 1 and st.secs == 0 then click(nm) end
-                    end
-                    log('[nv] %s: clicking all ready emblems', role)
+            local nReady = 0
+            for _, nm in ipairs(holders) do if ready[nm] then nReady = nReady + 1 end end
+            -- NO 'All' FOR A ROW OF ONE: it would be the same button twice, side by side.
+            if #holders > 1 and nReady > 0 then
+                if ImGui.SmallButton(string.format('All##nvall_%d', i)) then
+                    for _, nm in ipairs(holders) do if ready[nm] then click(nm, i) end end
                 end
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                    pcall(function() ImGui.SetTooltip('Click every ready ' .. NIGHTVEIL_ITEM ..
-                        ' in the ' .. role .. ' row.\nSkips anyone on cooldown or without one in a charm.') end)
+                    pcall(function() ImGui.SetTooltip(string.format('Click %s on all %d ready',
+                                                       e.item, nReady)) end)
                 end
-            elseif #list > 1 then
-                ImGui.TextDisabled('All')      -- placeholder keeps the names aligned across rows
-            end
-            for _, nm in ipairs(list) do
                 ImGui.SameLine()
-                local st = nvState[nm]
-                local secs = st and st.secs or nil
-                local usable = st and st.ok == 1
-                -- Unknown (-2) is drawn GREEN alongside a true ready. The tooltip carries the caveat;
-                -- the colour should not withhold a two hour cooldown that is probably up.
-                if not usable then          ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0)
-                elseif (secs or 0) <= 0 then ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
-                else                        ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.62, 0.25, 1.0) end
-                if ImGui.SmallButton(nm:sub(1, 8) .. '##nv_' .. nm) then click(nm) end
-                ImGui.PopStyleColor(1)
-                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                    local why
-                    if not st then            why = 'no report yet'
-                    elseif st.ok ~= 1 then    why = 'no ' .. NIGHTVEIL_ITEM .. ' socketed in a charm'
-                    -- -2 IS THE HONEST UNKNOWN: no click on record, or the last one was over two hours
-                    -- ago. It used to read "on cooldown", which was a claim we could not support -
-                    -- nothing on this build can tell us, and asking costs a charge. Say we do not know
-                    -- and leave the button live.
-                    elseif secs == -2 then    why = 'not sure on current cooldown\nwill adjust next time you click'
-                    elseif (secs or 0) == 0 then why = 'ready'
-                    else                      why = nv_hms(secs) .. ' left' end
-                    pcall(function() ImGui.SetTooltip(nm .. '\n' .. why) end)
-                end
             end
+            for _, nm in ipairs(holders) do
+                local rdy = ready[nm]
+                if rdy then ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
+                else        ImGui.PushStyleColor(ImGuiCol.Text, 0.62, 0.62, 0.62, 1.0) end
+                if ImGui.SmallButton(nm:sub(1, 8) .. '##nv_' .. i .. '_' .. nm) then
+                    if rdy then click(nm, i) end
+                end
+                ImGui.PopStyleColor()
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    local s = nvState[nm] and nvState[nm].items and nvState[nm].items[i]
+                    pcall(function() ImGui.SetTooltip(string.format('%s - %s\n%s', nm, e.item,
+                        rdy and 'ready' or (nv_hms(s or 0) .. ' left'))) end)
+                end
+                ImGui.SameLine()
+            end
+            ImGui.NewLine()
         end
+    end
+
+    if not any then
+        -- Say WHICH kind of empty this is: no group, nobody reporting, or everyone reporting none.
+        ImGui.TextDisabled(string.format('no Nightveil rows - %d group member(s), %d reporting',
+                                         nMembers, nReported))
     end
 end
 
@@ -11895,7 +11353,11 @@ end
 function draw_coth_mini()
     if COTH.active then
         if ImGui.SmallButton('Stop gather##at_coth_mini') then coth_set(false) end
-        ImGui.SameLine(); ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'on ' .. (coth_anchor() or '?'))
+        -- BELOW, NOT BESIDE. This sits on the mini header at an absolute X near the right edge, so a
+        -- SameLine after it started the text past the window and ImGui grew the window to fit - the
+        -- whole panel stretched off to the right the moment a gather was running.
+        -- A new line starts at the window's left margin, so it costs a row and cannot overflow.
+        ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'CoTH gathering on ' .. (coth_anchor() or '?'))
     else
         if ImGui.SmallButton('CoTH Group##at_coth_mini') then coth_set(true) end
     end
@@ -13108,15 +12570,17 @@ end
 
 -- SEED THE NIGHTVEIL TIMER AT STARTUP - FROM DISK ONLY, NEVER BY POKING. This used to right-click the
 -- loose copy to refresh the read. That is not a read: on a ready pool it FIRES the socketed emblem, so
--- every character with a spare set its own emblem off at load.
--- nv_refresh is a no-op stub now and nothing anywhere clicks the emblem to find out its state.
--- The file is the whole history. Nothing needs to be asked of the client.
+-- Say what this character has and where it stands. One read, no history, no assumption.
 pcall(function()
-    local left = nv_secs()
-    if left > 0 then
-        log('[nv] %s is on cooldown at startup - %s left', NIGHTVEIL_ITEM, nv_hms(left))
-    else
-        log('[nv] no %s cooldown on record - assuming ready until the button is used', NIGHTVEIL_ITEM)
+    local have = nv_have()
+    if #have == 0 then
+        log('[nv] none of the four in my bags yet - will keep looking')
+        return
+    end
+    for _, i in ipairs(have) do
+        local e = NV_SPLIT[i]
+        local s = nv_secs_at(i)
+        log('[nv]   %-11s %s', e.role, (s > 0) and ('on cooldown - ' .. nv_hms(s) .. ' left') or 'ready')
     end
 end)
 
@@ -13434,7 +12898,8 @@ while running do
         if not pwSaidHave and pw_have() then
             pwSaidHave = true
             pwState[myName] = pw_label()
-            pcall(function() peer_bcast('/at_pwhave %s %s', myName, pw_label():gsub(' ', '_')) end)
+            -- /at_pwhave had no handler either; the phantom panel it fed is gone. Left as a no-op
+            -- rather than a command nobody receives.
             log('[pw] I have %s - I will work the queue', pw_label())
         end
         do
@@ -13894,17 +13359,47 @@ while running do
     -- broadcast ran. rezReady never filled, and the visible symptom was "we aren't parsing rez items",
     -- which points nowhere near the actual fault.
     -- A rez chain must not be able to stop because a button could not decide what colour to be.
-    pcall(function()
+    -- BUT SAY WHEN IT FAILS. A bare pcall here swallowed the error completely, so a throw inside looked
+    -- exactly like "this character has nothing to report": nvState stayed empty, the panel said nobody
+    -- was carrying anything, and the log was silent about it. Reported once per distinct error, so a
+    -- repeating fault does not fill the log but also cannot hide.
+    local nvOk, nvErr = pcall(function()
         -- NO POKE HERE. It used to sit on a ten minute timer and it was firing the emblems. nv_secs()
         -- counts down from the recorded click without needing to ask the client anything.
-        local nv = nv_state()
-        local nk = tostring(nv)
+        -- The ITEM NAME rides along, because the panel groups by item now. '-' is the wire form of
+        -- "none", since an empty trailing argument does not survive the trip.
+        -- EVERY ITEM THIS CHARACTER HOLDS, as index:seconds pairs. The change key is the whole list, so
+        -- one item coming off cooldown re-pushes the lot - which is cheaper than tracking four keys and
+        -- cannot get them out of step with each other.
+        local parts = {}
+        for _, i in ipairs(nv_have()) do
+            parts[#parts + 1] = string.format('%d:%d', i, nv_secs_at(i))
+        end
+        local list = (#parts > 0) and table.concat(parts, ',') or '-'
+        local nk = list
+        -- ON CHANGE, PLUS A SLOW KEEPALIVE. Change-gating alone means that if the driver's copy is ever
+        -- dropped - a roster event prunes these tables - nothing re-sends it, because from this side
+        -- nothing changed. The entry then stays missing until the cooldown happens to tick over.
+        if (mq.gettime() - (nvPushAt or 0)) > 30000 then nvLast = '' end
         if nvLast ~= nk then
+            nvPushAt = mq.gettime()
             nvLast = nk
-            if SHOW_UI then nvState[myName] = { ok = (nv ~= -1) and 1 or 0, secs = nv, updated = mq.gettime() }
-            elseif driverName then peer_cmdf(driverName, '/at_nvstate %s %d', myName, nv) end
+            if SHOW_UI then
+                local items = {}
+                for _, i in ipairs(nv_have()) do items[i] = nv_secs_at(i) end
+                nvState[myName] = { items = items, updated = mq.gettime() }
+            elseif driverName then
+                peer_cmdf(driverName, '/at_nvstate %s %s', myName, list)
+            end
         end
     end)
+    if not nvOk then
+        local e = tostring(nvErr)
+        if nvErrLast ~= e then
+            nvErrLast = e
+            log('\\ar[nv] state push failed: %s\\ax', e)
+        end
+    end
     if rezAuto and not distributing then
         -- ON CHANGE, plus a slow keepalive. This used to be a flat 2-5s heartbeat because the baton read
         -- the raw cooldown number; now that peers count it down themselves (rez_peer_secs), the only
@@ -14042,7 +13537,6 @@ pcall(function() mq.unbind('/atsongs') end)
 pcall(function() mq.unbind('/atcurrency') end)
 pcall(function() mq.unbind('/atcothaug') end)
 pcall(function() mq.unbind('/atnv') end)
-pcall(function() mq.unbind('/atnvdump') end)
 pcall(function() mq.unbind('/atrange') end)
 pcall(function() mq.unbind('/atreclaim') end)
 pcall(function() mq.unbind('/attab') end)
