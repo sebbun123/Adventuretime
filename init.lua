@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.05'
-local BUILD_TAG = '1.05'  -- bump on every change; prints on startup
+VERSION = '1.06'
+local BUILD_TAG = '1.06'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -184,6 +184,25 @@ end
 -- MQ bindings are inconsistent about booleans: true, 1 and "TRUE" all turn up depending on the build
 -- and the TLO. Comparing to `true` alone silently reads as false - that is what hid the rez window for
 -- several builds, and there were fourteen more of the same comparison scattered about.
+-- IS THIS SPELL OFF COOLDOWN, ignoring the flicker?
+-- Me.SpellReady answers "can I cast this INSTANT", not "is it off cooldown". It drops to false during
+-- any global cooldown and while another cast is going out, so on a bard - who is essentially always
+-- mid-song - it blinks constantly. Two things were reading it raw: the DI save ladder, where Ejtou's
+-- log flipped it 31 times each way in three minutes and the tank's death save read unavailable about
+-- half of them; and the Echoes buttons, which greyed out every time the bard sang.
+-- A real cooldown holds false for minutes. A GCD blink is gone inside a second. So believe a false only
+-- once it has held - and reset the moment it goes true, so the next real cooldown starts its own clock.
+SPELL_RDY_FALSE_AT = {}
+SPELL_RDY_DEBOUNCE = 2500
+function spell_ready_stable(nm)
+    if not nm or nm == '' then return false end
+    local raw = true
+    pcall(function() raw = tlo_true(mq.TLO.Me.SpellReady(nm)()) end)
+    if raw then SPELL_RDY_FALSE_AT[nm] = nil; return true end
+    SPELL_RDY_FALSE_AT[nm] = SPELL_RDY_FALSE_AT[nm] or mq.gettime()
+    return (mq.gettime() - SPELL_RDY_FALSE_AT[nm]) < SPELL_RDY_DEBOUNCE
+end
+
 function tlo_true(v)
     if v == true or v == 1 then return true end
     if v == nil or v == false then return false end
@@ -262,13 +281,13 @@ end
 -- Globals, not locals: this chunk is at Lua's 200-local ceiling.
 -- ---------------------------------------------------------------------------
 GROUP_POTS = {
-    { key = 'shimmer',   base = 'Draught of Shimmering Reflection', label = 'Group Shimmering Reflection' },
-    { key = 'fortitude', base = 'Draught of Fleeting Fortitude',    label = 'Group Fleeting Fortitude'    },
+    { key = 'shimmer',   base = 'Draught of Shimmering Reflection', label = 'Group Shimmering'           },
+    { key = 'fortitude', base = 'Draught of Fleeting Fortitude',    label = 'Group Fleeting'              },
     -- Inferno Ward moved here from the INIs. As a burn line it fired on every 15 and 30 minute burn
     -- whether or not the fight warranted it; as a button it is spent when someone decides to spend it.
     -- Same shape as the two above, so it gets the tier picking, the per-toon inventory read and the
     -- carries/up/timer display for free.
-    { key = 'inferno',   base = 'Draught of Inferno Ward',        label = 'Group Inferno Ward'          },
+    { key = 'inferno',   base = 'Draught of Inferno Ward',        label = 'Group Inferno'               },
 }
 function pot_base_for(key)
     for _, p in ipairs(GROUP_POTS) do if p.key == key then return p.base, p.label end end
@@ -447,10 +466,10 @@ end
 NV_RECAST_SECS = 7200
 
 function nv_track_path()
-    local dir = ''
-    pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
     local who = ''
     pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
+    local dir = ''
+    pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
     return (dir ~= '' and (dir .. '\\') or '') .. 'adventuretime_nightveil_' .. who .. '.txt'
 end
 
@@ -581,24 +600,30 @@ end
 -- as fresh as the last refresh.
 --   * buff already running -> nothing to gain. pot_state asks once per LINE rather than per tier,
 --     because I and II land the same effect, so a II up correctly blocks a I as well.
---   * drunk within POT_MIN_GAP -> refuse. The item's own cooldown is shorter than the interval these
---     are actually worth spending at, so pressing the button on every 15 and 30 minute burn drank one
---     every time it happened to be off cooldown. This is the "how often do I want to spend one"
---     number, which is a different question from "can I".
-POT_MIN_GAP = 30 * 60 * 1000     -- 30 minutes between draughts of the same line
+--   * drunk within POT_MIN_GAP -> refuse. THIS USED TO BE 30 MINUTES and it was the wrong call.
+--     Nothing drinks these automatically - the only caller is the button - so a press is already a
+--     decision somebody made, and refusing it second-guesses the person who made it. The item's own
+--     timer is 15 minutes; a 30 minute policy on top of it meant the button silently did nothing for
+--     the whole second half of the real cooldown, with no way to tell that from a broken button.
+--     Worst case without the policy is a press landing on a live cooldown, which costs nothing.
+--     What is left is an anti-double-press window: long enough that one click, or the lag between
+--     firing and the buff appearing, cannot drink two - and short enough to never be in the way.
+POT_MIN_GAP = 15 * 1000          -- 15 seconds: stops a double-press, not a second opinion
 potDrankAt  = {}                 -- [base] = when this character last got one down
 
 function pot_drink(base)
-    -- Already running: say so rather than failing silently, so a press that does nothing is explained.
-    local _, up, _, dsecs = pot_state(base)
-    if up == 1 then
-        return false, nil, string.format('%s is already up (%dm left)', base, math.floor((dsecs or 0) / 60))
-    end
+    -- THE BUTTON GUARDS AS LITTLE AS POSSIBLE ON PURPOSE.
+    -- There used to be a refusal here when the buff was already running, on the assumption that drinking
+    -- over it would consume a draught for nothing. It does not - the client will not drink one - so the
+    -- guard was protecting against a cost that does not exist while making the button look broken.
+    -- The one guard left is worth keeping and is about US, not the game: two presses in quick succession
+    -- would send two /nowcast commands, and that is our own spam to avoid. Everything else - buff up,
+    -- item on cooldown, wrong tier, none carried - the game already answers correctly by doing nothing.
     local last = potDrankAt[base]
     if last and (mq.gettime() - last) < POT_MIN_GAP then
-        local left = math.ceil((POT_MIN_GAP - (mq.gettime() - last)) / 60000)
-        return false, nil, string.format('%s drunk %dm ago - holding for another %dm',
-                                         base, math.floor((mq.gettime() - last) / 60000), left)
+        local left = math.ceil((POT_MIN_GAP - (mq.gettime() - last)) / 1000)
+        return false, nil, string.format('%s drunk %ds ago - ignoring the double press (%ds)',
+                                         base, math.floor((mq.gettime() - last) / 1000), left)
     end
     for _, tier in ipairs({ 'II', 'I' }) do
         local nm = base .. ' ' .. tier
@@ -1593,7 +1618,13 @@ end
 rezPingAt   = {}      -- target name:lower -> gettime of my last handshake ping (rate-limit)
 rezExpectUntil = 0    -- until when a rez is inbound for ME (set when I answer a handshake)
 rezBoxAt       = 0    -- when the confirmation box appeared (0 = not showing)
-rezBoxClicked  = false -- have we already clicked this one
+-- TWO FLAGS, NOT ONE. These were a single boolean doing both jobs and the meanings drifted apart:
+-- the decline path set "clicked" purely to stop re-evaluating the dialog every tick, and everything
+-- downstream then believed a rez had been accepted.
+--   rezBoxClicked - we actually pressed it. Arms the corpse watcher.
+--   rezBoxSeen    - we have made a decision about this dialog, whatever it was. Stops re-evaluation.
+rezBoxClicked  = false -- we pressed it
+rezBoxSeen     = false -- we have judged this dialog; do not judge it again every tick
 rezNoBoxWarn   = 0    -- last time we said 'expecting a rez, no box found'
 rezExpectFrom  = 0    -- when the expecting-a-rez window opened
 rezIncAt       = 0    -- when a REZZER last said it was casting on me (not my own readiness)
@@ -1846,6 +1877,21 @@ end
 -- abilities on different timers, and each can go into a combo on its own.
 MGB_WHO = { CLR='Cleric', DRU='Druid', SHM='Shaman', BRD='Bard', ENC='Enchanter',
             BST='Beastlord', RNG='Ranger' }
+-- WHAT EACH ONE SHOUTS. The announce was hardcoded as class name + the entry's say, which is fine as a
+-- default and no use at all if you want the raid to read something of your own.
+-- Keyed by CLASS AND ABILITY, the same key a combo member uses, because a beastlord has two buttons and
+-- should be able to say different things for Mercy and Paragon.
+-- Empty or missing = use the default, so clearing the box restores it rather than announcing nothing.
+mgbSay = mgbSay or {}
+function mgb_say_key(cls, e) return (cls or '?') .. ':' .. ((e and e.key) or '?') end
+function mgb_say_default(cls, e)
+    return string.format('%s %s inc', MGB_WHO[cls] or cls or '?', (e and e.say) or 'MGB')
+end
+function mgb_say_text(cls, e)
+    local v = mgbSay[mgb_say_key(cls, e)]
+    if v and v ~= '' then return v end
+    return mgb_say_default(cls, e)
+end
 MGB_CLICKS = {
     -- short = the button's second word; the first is the caster's class, so a beastlord reads
     -- 'Beastlord Mercy' and 'Beastlord Paragon'. say = the raid announce after the class name.
@@ -1907,7 +1953,7 @@ function mgb_click(key)
         if raiding and i == 1 then
             -- MGB rides the FIRST ability only (it buffs the next cast), so the announce fires once.
             pcall(function() mq.cmdf('/nowcast %s "%s%s/BeforeSpell|%s"', myName, ab, opts, MGB_AA) end)
-            pcall(function() mq.cmdf('/rsay %s %s', MGB_WHO[cls] or cls, e.say or 'MGB') end)
+            pcall(function() mq.cmdf('/rsay %s', mgb_say_text(cls, e)) end)
         else
             pcall(function() mq.cmdf('/nowcast %s "%s%s"', myName, ab, opts) end)
         end
@@ -2228,7 +2274,7 @@ local function settings_path()
     pcall(function() who2 = tostring(mq.TLO.Me.Name() or '') end)
     local base2 = (cfg ~= '') and (cfg .. '\\') or ''
     SETTINGS_FILE = base2 .. 'adventuretime_settings_' .. ((who2 ~= '') and who2 or 'unknown') .. '.txt'
-    SETTINGS_FILE_LEGACY = base2 .. 'adventuretime_settings.txt'
+    SETTINGS_FILE_LEGACY = base2 .. 'adventuretime_settings.txt'   -- the pre-per-character shared file, read only
     return SETTINGS_FILE
 end
 local function save_settings()
@@ -2262,7 +2308,6 @@ local function save_settings()
                 table.sort(pg)
                 f:write('pacGem=' .. table.concat(pg, ',') .. '\n')
             end
-            f:write('epCaster=' .. tostring(epCaster or '') .. '\n')
             do
                 local fold = {}
                 for fk, fv in pairs(miniFold) do if fv then fold[#fold + 1] = fk end end
@@ -2289,6 +2334,15 @@ local function save_settings()
             f:write('miniClicks=' .. (miniClicks and '1' or '0') .. '\n')
             f:write('miniCoth=' .. (miniCoth and '1' or '0') .. '\n')
             f:write('xtankAnnounce=' .. (xtankAnnounce and '1' or '0') .. '\n')
+            -- One line per override. Only the ones that differ from the default are written, so the file
+            -- stays small and a changed default still reaches anyone who never customised that class.
+            for k, v in pairs(mgbSay) do
+                if v and v ~= '' then f:write('mgbsay_' .. k .. '=' .. v .. '\n') end
+            end
+            -- Persisted now that it is a Settings checkbox. It never was before: on the top button
+            -- row it was a per-session toggle you re-ticked after every reload, which is fine for a
+            -- button and useless for a preference.
+            f:write('autoXTank=' .. (autoXTank and '1' or '0') .. '\n')
             f:write('xtankPinned=' .. table.concat(xtankPinned, ',') .. '\n')
             f:close()
         end
@@ -2305,6 +2359,11 @@ local function load_settings()
             -- [%w_] not %w: the show_* keys carry an underscore, so the old pattern returned nil for
             -- them and the k:match below threw. Wrapped in pcall, that aborted the WHOLE load on the
             -- second line of the file - every setting after rezAuto silently never restored.
+            -- CUSTOM ANNOUNCE TEXT HAS SPACES IN IT, and the general pattern below demands a value with
+            -- none - it would silently drop every one. Handled first, with its own pattern. The general
+            -- match cannot collide: these keys contain a colon, which [%w_]+ does not accept.
+            local sk, sv = line:match('^mgbsay_([%w:_]+)%s*=%s*(.-)%s*$')
+            if sk then mgbSay[sk] = (sv ~= '') and sv or nil end
             local k, v = line:match('^([%w_]+)%s*=%s*(%S+)%s*$')
             if k then
             if k == 'rezAuto' then rezAuto = (v == '1' or v:lower() == 'true') end
@@ -2336,7 +2395,6 @@ local function load_settings()
                     if pn then pacGem[pn:lower()] = tonumber(pv) end
                 end
             end
-            if k == 'epCaster' then epCaster = tostring(v or '') end
             if k == 'miniFold' then
                 miniFold = miniFold or {}
                 for fname in pairs(miniFold) do miniFold[fname] = nil end   -- clear in place, keep the table
@@ -2359,6 +2417,7 @@ local function load_settings()
             if k == 'miniBurnTable' then miniBurnView = (v == '1' or v:lower() == 'true') and 2 or 1 end
             if k == 'miniBurnView' then miniBurnView = math.max(0, math.min(2, tonumber(v) or 1)) end
             if k == 'xtankAnnounce' then xtankAnnounce = (v == '1' or v:lower() == 'true') end
+            if k == 'autoXTank'     then autoXTank     = (v == '1' or v:lower() == 'true') end
             if k == 'xtankPinned' then
                 xtankPinned = {}
                 for part in v:gmatch('[^,]+') do
@@ -2834,6 +2893,9 @@ DI = {
     -- because the tank-save gate runs BEFORE the ladder - once a save lands the ladder is not reached at
     -- all, so this only delays the case where the rung genuinely did nothing.
     RUNG_GAP = 12000,
+    -- How long SpellReady must stay false before it is believed. A real cooldown holds it false for
+    -- minutes; a global cooldown or an in-flight cast blinks it for well under a second.
+    RDY_DEBOUNCE = 2500,
     -- ITEMS NEED LONGER, because their cooldown read is the slow one. Spell and AA rungs have reported in
     -- 2-5s every time; the boots took ~13s on 2026-07-30 (cast 22:35:21.9, save on Sebbun 22:35:35.4) and
     -- lagged 29s in an earlier session. At a flat 12s the boots were re-cast one second before the first
@@ -3280,7 +3342,39 @@ function di_rung_list()
         if gem > 0 then
             local s = -1
             pcall(function() s = tonumber(mq.TLO.Me.GemTimer(gem).TotalSeconds()) or -1 end)
-            out[#out + 1] = { name = nm, kind = 'Spell', ready = (s == 0) }
+            -- SpellReady AS WELL AS THE GEM TIMER. The gem's refresh is a short per-gem thing; a save
+            -- spell also has its own long reuse, and the two are not the same number. Mamittuk's log
+            -- shows rung 1 re-firing every 12 seconds - exactly RUNG_GAP - which is what "the timer we
+            -- are reading returns to 0 immediately" looks like.
+            -- SpellReady FLICKERS. It answers "can I cast this instant", not "is it off cooldown", so it
+            -- drops to false during any global cooldown or while another cast is going out. Ejtou's log
+            -- flipped it 31 times true and 31 times false in three minutes - which made the tank's death
+            -- save read as unavailable about half the time.
+            -- So only BELIEVE a false that has held continuously. A real cooldown stays false for
+            -- minutes; a GCD blink is gone within a second.
+            local rdy = spell_ready_stable(nm)
+            -- I FIRED IT, SO IT IS SPENT UNTIL PROVEN OTHERWISE. Same rule the staff already uses, for
+            -- the same reason: a state read taken right after an action can lag or lie, and the cost of
+            -- believing "ready" wrongly here is casting a death save on a loop forever.
+            local spent = false
+            local fired = DI.rungFiredAt and DI.rungFiredAt[nm]
+            if fired then
+                local rc = 0
+                pcall(function() rc = tonumber(mq.TLO.Spell(nm).RecastTime()) or 0 end)
+                if rc > 0 and (mq.gettime() - fired) < (rc * 1000) then spent = true end
+            end
+            local ready = (s == 0) and rdy and not spent
+            -- SAY THE INPUTS when the verdict changes. Three rounds were lost on the placate ceiling
+            -- guessing at reads instead of printing them; this one prints them.
+            -- Change-detected AND rate limited. Change-detection alone printed 62 lines in a 114 line
+            -- log, because the thing it was watching flickers by nature.
+            local k = string.format('%s/%d/%s/%s', tostring(s), gem, tostring(rdy), tostring(spent))
+            if DI.rungSaid ~= k and (mq.gettime() - (DI.rungSaidAt or 0)) > 30000 then
+                DI.rungSaid, DI.rungSaidAt = k, mq.gettime()
+                rezlog('[di] rung 1 %s: gem %d, gem timer %ss, SpellReady %s, assumed-spent %s -> %s',
+                       nm, gem, tostring(s), tostring(rdy), tostring(spent), ready and 'READY' or 'not ready')
+            end
+            out[#out + 1] = { name = nm, kind = 'Spell', ready = ready }
             break                                   -- one or the other is memmed, never both
         end
     end
@@ -3335,6 +3429,12 @@ function di_try_rung(tank, tid, now)
     for i, r in ipairs(di_rung_list()) do
         if r.ready then
             DI.rungName, DI.rungAt, DI.rungKind = r.name, now, r.kind
+            -- RECORD THE FIRE PER RUNG, so di_rung_list can hold it down for its own reuse rather than
+            -- asking a timer that comes straight back as ready. Divine Redemption cannot be observed at
+            -- all - the 2026-07-30 probe read buff=0 song=0 for it - so "did the save land" has no
+            -- answer, and the only honest signal left is "I cast it, so it is spent".
+            DI.rungFiredAt = DI.rungFiredAt or {}
+            DI.rungFiredAt[r.name] = mq.gettime()
             rezlog('[di] LADDER rung %d: %s on %s | %s', i, r.name, tank, di_target_desc(tid, tank))
             local spec = string.format(DI.RUNG_OPTS, r.name, r.kind, tank)
             pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
@@ -3526,7 +3626,16 @@ local function di_tick()
             return
         end
     end
-    local tid = 0; pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end)
+    -- THE GROUP MEMBER'S SPAWN, not a name search. Spawn['pc =Name'] matches a player CORPSE too - a body
+    -- keeps the character's name - so after a death and rez it can hand back the corpse while the live
+    -- character is a different spawn entirely. That is what happened at 01:52:52: the staff fired at
+    -- id 427 and nothing landed, the retry burned the full 12/24/45s and took a strike, and the very
+    -- next commit used id 564 for the same character and landed in 4.5 seconds.
+    -- Group.Member[name].Spawn is the living group member by definition. The name search stays as a
+    -- fallback for the case where the tank is in the raid but not the group.
+    local tid = 0
+    pcall(function() tid = tonumber(mq.TLO.Group.Member(tank).Spawn.ID()) or 0 end)
+    if tid == 0 then pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end) end
     if tid <= 0 then gate('tank not in zone'); return end
     -- ALIVE, not merely present. A death save cannot land on someone who is already dead, and a
     -- freshly-dead PC spawn lingers three to four seconds - exactly the window where the tank dies and
@@ -3569,6 +3678,27 @@ local function di_tick()
     -- is a one-line change. :format on a string with no %s is a no-op, so an empty OPTS is safe.
     local spec = DI.STAFF .. ((DI.OPTS ~= '') and DI.OPTS:format(tank) or '')
     rezlog('[di] target check: %s', di_target_desc(tid, tank))
+    -- A DEAD TANK CANNOT CARRY A SAVE. The line above only DESCRIBES the target - its MATCH is a name
+    -- substring, and a corpse is named after the character it belonged to, so a corpse has always
+    -- matched. Nothing then checked whether the thing was alive.
+    -- Cost when it happens: the staff fires at a corpse, nothing lands, and the no-sign-of-that-cast
+    -- retry runs the full 12/24/45s before giving up and taking a strike - three quarters of a minute
+    -- of the tank's last-ditch save doing nothing, at exactly the moment the group is in trouble.
+    -- The next commit used a different spawn id for the same character and landed in 4.5s, which is the
+    -- corpse-then-rezzed pair showing up in the log.
+    -- Two reads because either can answer on its own: the spawn type says Corpse outright, and PctHPs
+    -- at or below zero catches a body the client is still calling a PC.
+    do
+        local ty, hp = '', 1
+        pcall(function() ty = tostring(mq.TLO.Spawn(tid).Type() or '') end)
+        pcall(function() hp = tonumber(mq.TLO.Spawn(tid).PctHPs()) or 1 end)
+        local dead = (ty:lower() == 'corpse') or (hp <= 0)
+        if dead then
+            rezlog('\\ay[di] NOT firing - %s is dead (%s). Holding the staff for the rez.\\ax',
+                   tank, 'spawn ' .. tid .. ' reads ' .. ((ty ~= '') and ty or ('hp ' .. hp)))
+            return
+        end
+    end
     -- Same cursor rule. The staff is the tank's last-ditch save, so a click that goes astray here costs
     -- more than most - and skipping only means the chain tries again on the next pass.
     -- Best effort. The staff is the tank's last-ditch save - not firing it is the worse failure.
@@ -3789,6 +3919,13 @@ end
 -- One mapping from slot kind to MY seconds-until-ready, so the election and the did-it-actually-fire
 -- retry check can never disagree about what a slot needs.
 function rez_kind_secs(kind)
+    -- 'divine' HAD NO CASE HERE and fell through to the crown, so a divine slot asked about the CROWN's
+    -- cooldown instead of the AA's. my_divine_secs existed and read rank, readiness and timer correctly -
+    -- nothing ever called it. The AA's own cooldown was never consulted by anything, which is exactly
+    -- what "she casts it and it never goes on cooldown" looks like from the outside.
+    -- The comment above this function says the mapping exists so the election and the did-it-fire retry
+    -- can never disagree about what a slot needs. This was the one kind where they did.
+    if kind == 'divine' then return my_divine_secs() end
     if kind == 'cotw'  then return my_cotw_secs() end
     if kind == 'token' then return my_rez_secs(TOKEN_ITEM) end
     return my_rez_secs(CROWN_ITEM)
@@ -4202,13 +4339,13 @@ local function rez_autoaccept()
                 corpseLootUntil = mq.gettime() + 60000
                 rezlog('[corpse] rez accepted - watching for my corpse')
             end
-            rezBoxAt, rezBoxClicked = 0, false
+            rezBoxAt, rezBoxClicked, rezBoxSeen = 0, false, false
         end
         return
     end
 
     if rezBoxAt == 0 then
-        rezBoxAt, rezBoxClicked = now, false
+        rezBoxAt, rezBoxClicked, rezBoxSeen = now, false, false
         rezlog('[rez] rez box OPEN: %s', txt:sub(1, 70))
         -- Announce the moment the box exists, whether or not WE click it. The previous version polled
         -- Window().Open() == true from the main loop - the same truthiness bug that hid the box from us
@@ -4216,7 +4353,7 @@ local function rez_autoaccept()
         rezDone[myName:lower()] = now + 15000
         pcall(function() peer_bcast('/at_rezdone %s', myName) end)
     end
-    if rezBoxClicked or not rezAccept then return end
+    if rezBoxSeen or not rezAccept then return end
 
     -- ONE MORE GATE BEFORE CLICKING YES. Up to here the only thing standing between this and pressing
     -- the Yes button on an arbitrary ConfirmationDialogBox is the REZ_TEXT word list - and that list was
@@ -4235,7 +4372,7 @@ local function rez_autoaccept()
     if not canBeRezzed then
         rezlog('\\ay[rez] a dialog looks like a rez but I am alive with no corpse - not clicking it: %s\\ax',
                txt:sub(1, 80))
-        rezBoxClicked = true    -- do not re-evaluate it every tick
+        rezBoxSeen = true       -- judged, not clicked - do not re-evaluate it every tick
         return
     end
 
@@ -4247,14 +4384,16 @@ local function rez_autoaccept()
         pcall(function() mq.cmdf('/nomodkey /notify %s %s leftmouseup', REZ_WINDOW, b) end)
         mq.delay(60)
         if not win_open(REZ_WINDOW) then
-            rezBoxClicked = true
+            rezBoxClicked, rezBoxSeen = true, true
             rezExpectUntil = 0
             rezlog('[rez] accepted with %s, %dms after the box opened', b, now - rezBoxAt)
             return
         end
     end
     rezlog('\\ay[rez] rez box is open but none of the buttons closed it: %s\\ax', table.concat(REZ_BUTTONS, ', '))
-    rezBoxClicked = true   -- do not hammer it every tick
+    -- SEEN, not clicked. Every button was tried and the window is still open, so nothing was accepted -
+    -- claiming otherwise would arm the corpse watcher for a rez that never happened.
+    rezBoxSeen = true      -- do not hammer it every tick
 end
 
 -- Tell the group I am up the INSTANT I release, instead of waiting for a rezzer to ask. The ping/pong
@@ -4637,7 +4776,11 @@ local function rez_tick()
                              tgtName, tgtID, myClass))
         return
     end
-    local item = (myClicky == 'cotw') and COTW_AA or ((myClicky == 'token') and TOKEN_ITEM or CROWN_ITEM)
+    -- Same omission on the firing side: a divine slot resolved to CROWN_ITEM and clicked the crown. The
+    -- log said "Ejtou(divine) slot1" and then fired Bloodcursed Crown of Vzith one line later.
+    local item = (myClicky == 'divine') and DIVINE_SPELL
+              or ((myClicky == 'cotw') and COTW_AA
+              or ((myClicky == 'token') and TOKEN_ITEM or CROWN_ITEM))
     local pick = { name = myName, token = (myClicky == 'token'), kind = myClicky }
     rezdbg(string.format('target %s(%d) <- ME %s(%s) slot%d @%dm%s', tgtName, tgtID, myName, myClicky,
                          myPos, tgtDist, tgtFar and ' (beyond reach - one attempt)' or ''))
@@ -4990,7 +5133,15 @@ pcall(function()
     mq.bind('/at_epdel', function(id)
         local i = ep_find(tonumber(id) or 0); if i then table.remove(epQueue, i) end
     end)
-    mq.bind('/at_epclear', function() epQueue, epDoneAt = {}, nil; ep_queue_log('cleared') end)
+    -- Kept so a peer still on an older build does not error, but it will NOT throw away work in progress.
+    -- Older builds broadcast this whenever their own queue emptied, which is exactly the message that
+    -- wiped a live queue mid-cast. If we have anything pending or a cast in flight, ignore it.
+    mq.bind('/at_epclear', function()
+        if epCast then return end
+        for _, q in ipairs(epQueue) do if not q.state then return end end
+        epQueue, epDoneAt = {}, nil
+        ep_queue_log('cleared')
+    end)
     mq.bind('/at_epmark', function(id, st)
         local _, e = ep_find(tonumber(id) or 0)
         if e then e.state, e.oor = st, false end
@@ -5058,10 +5209,19 @@ pcall(function()
         pacCap[who] = { cap = tonumber(cap) or 0, range = tonumber(rng) or 0,
                         kind = kind or '?', updated = mq.gettime() }
     end)
-    -- The pin has to reach every toon: each one decides locally whether it is the elected caster, so a
-    -- pin known only to the driver would leave the others still electing by class order.
-    mq.bind('/at_epcaster', function(who)
-        epCaster = (who and who ~= '-' ) and who or ''
+    -- /at_epcaster is gone with the election. Pinning a caster only meant anything when several
+    -- characters shared one queue and one of them had to be chosen; Smart Cast addresses every mob to a
+    -- single caster by name, so there is nothing left to pin.
+    -- THE CHARACTER THAT SPEAKS IT NEEDS IT. mgbSay is saved per character, but the announce is issued
+    -- by whoever casts - so text typed on the driver stayed on the driver and the cleric went on saying
+    -- the default. Same shape as /at_epgem: set it anywhere, broadcast, everyone saves their own copy.
+    -- VARARGS, not one argument: mq splits a bind's arguments on spaces and the whole point of this
+    -- setting is that it contains them. Rejoin everything after the key.
+    mq.bind('/at_mgbsay', function(key, ...)
+        if not key or key == '' then return end
+        local txt = table.concat({ ... }, ' ')
+        -- '-' is the wire form of "cleared", because an empty trailing argument does not survive the trip.
+        if txt == '' or txt == '-' then mgbSay[key] = nil else mgbSay[key] = txt end
         save_settings()
     end)
     mq.bind('/at_epgem', function(n)
@@ -6022,7 +6182,10 @@ end
     end)
 end)
 
-local autoXTank       = true    -- auto-maintain tank XTargets on the group's healers (set-and-forget; on by default)
+-- Declared with the other persisted flags rather than here, so save_settings and load_settings -
+-- which sit above this point in the file - can see it. A local declared below them would be a
+-- different variable entirely and the setting would silently never load.
+autoXTank = (autoXTank ~= false)  -- auto-maintain tank XTargets on the group's healers; on by default
 -- Announce roster changes to the raid? The /rsay used to be unconditional, was removed for being
 -- raid-wide chat on every change, and is now a setting so it can be either. Off by default - the log
 -- line always happens regardless, so turning this off never costs you the ability to check after
@@ -6176,19 +6339,31 @@ end)
 -- Bring the whole group up in PARALLEL: ping everyone at once, launch all the non-responders at once,
 -- then wait a single settle - instead of a launch+wait per toon. Returns the list that's responsive.
 local function bring_up_group(peers)
+    -- STOP AS SOON AS EVERYONE HAS ANSWERED. Every wait here used to run to its full length whatever
+    -- happened, so a group already up and responding in 200ms still cost the driver 1.2 + 3.0 + 2.5
+    -- seconds of frozen client. That is the multi-second startup gap, and it is on the driver only -
+    -- which is why the worker logs go from "ready" to their next line in under half a second.
+    -- The waits are still the same LENGTH; they are just ceilings now instead of fixed costs.
+    local function all_up()
+        for _, p in ipairs(peers) do if not alive[p:lower()] then return false end end
+        return true
+    end
     for _, p in ipairs(peers) do alive[p:lower()] = nil; peer_cmdf(p, '/at_ping %s', myName) end
     local w = 0
-    while w < 1200 do mq.doevents(); mq.delay(100); w = w + 100 end   -- collect the fast pongs
+    while w < 1200 and not all_up() do mq.doevents(); mq.delay(100); w = w + 100 end
 
     local launched = false
     for _, p in ipairs(peers) do
         if not alive[p:lower()] then peer_cmdf(p, '/lua run adventuretime worker %s', myName); launched = true end
     end
     if launched then
-        mq.delay(3000)   -- ONE settle for all the launches
+        -- Only the ones that did NOT answer are being launched, so this settle is for them - and it can
+        -- end the moment they check in rather than always running the full three seconds.
+        local s = 0
+        while s < 3000 and not all_up() do mq.doevents(); mq.delay(100); s = s + 100 end
         for _, p in ipairs(peers) do if not alive[p:lower()] then peer_cmdf(p, '/at_ping %s', myName) end end
         local w2 = 0
-        while w2 < 2500 do mq.doevents(); mq.delay(100); w2 = w2 + 100 end
+        while w2 < 2500 and not all_up() do mq.doevents(); mq.delay(100); w2 = w2 + 100 end
     end
 
     local up = {}
@@ -6547,7 +6722,6 @@ epLast          = 0
 epSaidGem       = nil     -- last gem contents we spoke about, so it is said once not every tick
 epGemSaidAt     = 0       -- rate-limit for the 'waiting on the gem' line
 epCursorTryAt   = 0       -- rate-limit on /autoinventory attempts to clear the cursor
-epElectSaidAt   = 0       -- rate-limit for the 'not the elected caster' stand-down line
 epOorSaidAt     = 0       -- rate-limit for the 'out of range' line
 epMemAt         = nil     -- when we last issued a /memspell, so we do not stack attempts
 epPrevTarget    = 0       -- the caller's target when the run started; put back when the queue finishes
@@ -7611,21 +7785,27 @@ end
 -- Defaults to the label, so an entry that is the only one of its kind needs no group at all.
 -- short = only used to tell two sources apart when ONE toon has both.
 MAGIC_CLICKS = {
-    { key = 'illusionist', label = 'Illusionist Shoes', name = "Forsaken Illusionist's Shoes" },
-    { key = 'jaundiced',   label = 'Jaundiced Boots',   name = 'Forsaken Jaundiced Bone Boots' },
+    -- ONE 'Boots' ROW FOR BOTH. The enchanter shoes and the shaman boots are the same effect from two
+    -- sources, so they share a group and collapse into a single row - two rows become one whenever a
+    -- group happens to hold both. short only shows when ONE character carries both, which is the only
+    -- case where telling them apart matters.
+    { key = 'illusionist', label = 'Boots', group = 'Boots', short = 'shoes',
+      name = "Forsaken Illusionist's Shoes" },
+    { key = 'jaundiced',   label = 'Boots', group = 'Boots', short = 'boots',
+      name = 'Forsaken Jaundiced Bone Boots' },
     { key = 'echoes',      label = 'Rune of Echoes',    group = 'Echoes', short = 'rune',
       name = 'Imbued Rune of Echoes' },
     -- spell = ... rather than name = ...: this one is a SONG, so "do you have it" means memmed in a
     -- gem, not sitting in a bag. Un-memmed and the button simply is not drawn.
-    { key = 'echopast',    label = 'Echoes of the Past', group = 'Echoes', short = 'song',
+    { key = 'echopast',    label = 'Echoes of the Past', group = 'Echoes', short = 'past',
       spell = 'Echoes of the Past' },
     -- Echoes of the Ancient: the glyph and the song are two ways at the SAME effect, so they share a
     -- group and appear as one row with two buttons rather than two near-identical rows. The glyph is an
     -- item (name =, so ownership means it is in a bag); the song is a spell (spell =, so ownership means
     -- memmed in a gem). A toon carrying neither gets no button at all.
-    { key = 'echoancglyph', label = 'Echoes of the Ancient', group = 'Ancient', short = 'glyph',
+    { key = 'echoancglyph', label = 'Echoes of the Ancient', group = 'Echoes', short = 'glyph',
       name = 'Imbued Glyph: Echoes of the Ancient' },
-    { key = 'echoancient',  label = 'Echoes of the Ancient', group = 'Ancient', short = 'song',
+    { key = 'echoancient',  label = 'Echoes of the Ancient', group = 'Echoes', short = 'ancient',
       spell = 'Echoes of the Ancient' },
 }
 magicState = {}   -- driver: magicState[char][key] = { have, secs, up, dsecs, updated }
@@ -7656,11 +7836,9 @@ function magic_state(e)
             end
         end
         if gem <= 0 then return 0, -1, 0, 0 end        -- not memmed: draw nothing
-        local rdy = false
-        pcall(function()
-            local v = mq.TLO.Me.SpellReady(e.spell)()
-            rdy = (v == true) or (tostring(v):upper() == 'TRUE')
-        end)
+        -- Debounced: a bard is almost always mid-song, so the raw read had these buttons flickering
+        -- between ready and "cooling 1s" continuously.
+        local rdy = spell_ready_stable(e.spell)
         local secs = 0
         if not rdy then
             pcall(function() secs = math.floor(tonumber(mq.TLO.Me.GemTimer(e.spell).TotalSeconds()) or 0) end)
@@ -9450,6 +9628,20 @@ function cursor_stow(tag)
     return false, held
 end
 
+-- WHAT TO CALL THE PAUSE IN A LOG LINE. Two messages said "(E3 paused)" and "E3 paused; stripping" as
+-- fixed text, two lines after the probe had printed "E3 WILL NOT PAUSE - it is going to act underneath
+-- us". Shylain then memmed, stripped three weapons and cast for eleven seconds with E3 live, and the log
+-- said it was paused throughout. A log that states an assumption in the same words it would state a fact
+-- is worse than one that says nothing.
+function e3_pause_note()
+    local st = e3_is_paused()
+    if st == true  then return 'E3 paused' end
+    -- No colour codes here: this string is passed as a %s into another format, and the log writer
+    -- stripped the escape and left the letter - Shylain's log reads "(r E3 NOT PAUSED x)".
+    if st == false then return 'E3 NOT PAUSED' end
+    return 'E3 pause state unknown'
+end
+
 epPaused = false
 function ep_pause()
     if epPaused then return end
@@ -9467,16 +9659,23 @@ end
 -- downstream is already class-agnostic: ep_best_placate scans THIS character's spellbook for the Calm
 -- line and takes the highest rank it owns, ep_ensure_gem mems whatever that turns out to be, and the
 -- range comes from the resolved spell. So adding a class is genuinely this one list.
--- Still a CLASS check rather than "owns a placate spell": several classes get one, and only these two
--- have the augment-proc problem the strip exists for. Gating on the spell would rope in a druid who has
--- one and does not need any of this.
-EP_CLASSES = { ENC = true, CLR = true, PAL = true }
+-- Still a CLASS check rather than "owns a placate spell", so which classes are in is a deliberate list.
+-- DRUIDS ADDED. This list used to say a druid "has one and does not need any of this", the reasoning
+-- being the strip: it exists so augment procs cannot break the placate, and that only matters for a
+-- character swinging weapons. A druid usually is not - but the strip is harmless when there is nothing
+-- proccing, and having a fourth caster in the rotation is worth more than skipping a no-op.
+-- Their line is Nature's Serenity; the name hint below is what lets ep_best_placate find it.
+EP_CLASSES = { ENC = true, CLR = true, PAL = true, DRU = true }
 -- WHO ACTUALLY WORKS THE QUEUE when more than one character can. Without this every capable toon in the
 -- group strips its weapons and casts at the same mob - three characters doing one job, three sets of
 -- gear off, and the mob placated twice over.
 -- Class order, best first. Enchanter leads because placate is their line and the rank they carry is
 -- normally the highest; cleric next; paladin last, since theirs tends to be the shortest-ranged.
-EP_CLASS_ORDER = { 'ENC', 'CLR', 'PAL' }
+-- Druid sits at the end: their line is real but it is not what they are there for, so when two casters
+-- can both take a mob from the SHARED list the druid is the one to leave alone.
+-- This order only decides the manual-button queue. Smart Cast routes assigned work by ceiling and load,
+-- and ignores the election entirely - so a druid with the highest ceiling still gets sent the high mobs.
+EP_CLASS_ORDER = { 'ENC', 'CLR', 'PAL', 'DRU' }
 -- `or ''` not `= ''`, same reason as miniFold: this sits above load_settings() today, and a plain
 -- assignment would silently discard a loaded pin if either ever moved.
 pacOff = pacOff or {}     -- [nameLower] = true when taken out of the rotation
@@ -9490,7 +9689,6 @@ function pac_find(id)
     return nil
 end
 pacLast = pacLast or ''
-epCaster = epCaster or ''   -- a character name pins it; empty means pick by class order
 -- Who the group has elected. Every toon computes this from the SAME inputs - the reported capability
 -- list and the class order - so they all reach the same answer without a negotiation.
 -- Ties are broken by name, for the same reason the rez chain sorts its pins: two toons of the same class
@@ -9510,7 +9708,7 @@ pacCap = {}   -- [char] = { cap, spell, range, kind, updated }
 
 -- What I can pacify with, whatever class I am. Returns spell name, level cap, range - or nil.
 function pac_self()
-    local sp, kind
+    local sp, kind, spID
     if ep_can_placate() then
         -- VALIDATE THE GEM, do not just read it. This used to fall back to the spellbook only when the
         -- gem was EMPTY, so a gem holding the wrong spell was taken at face value - a paladin whose
@@ -9522,9 +9720,47 @@ function pac_self()
         -- chance to mem the right spell and fix the very problem. It cannot recover on its own.
         -- Announcing off the best placate in their BOOK breaks the cycle: the ceiling is honest, Smart
         -- Cast routes to them, and ep_tick mems the spell on demand the first time it has work.
-        sp = ep_spell()
-        if not (sp and ep_spell_ok(sp)) then
-            sp = ep_best_placate and ep_best_placate() or nil
+        -- ANNOUNCE THE BEST CEILING AVAILABLE, not merely a valid one.
+        -- The gem was trusted whenever it held ANY placate, so a character sitting on a lower rank
+        -- announced that rank and never looked further - Shela reported 76 while an 80 sat in her book.
+        -- The gem says what is memmed right now; the book says what she can reach. ep_ensure_gem mems on
+        -- demand anyway, so the higher one is what she will actually cast.
+        local gemSp = ep_spell()
+        if gemSp and not ep_spell_ok(gemSp) then gemSp = nil end
+        local bookSp = ep_best_placate and ep_best_placate() or nil
+        -- BY ID where we have one. Same reason as the book scan: a name can resolve to the wrong spell.
+        local function capof(n, id)
+            if id and id > 0 then
+                local c = 0
+                pcall(function() c = tonumber(mq.TLO.Spell(id).MaxLevel()) or 0 end)
+                if c > 0 then return c end
+            end
+            if not n then return -1 end
+            local c = 0
+            pcall(function() c = tonumber(mq.TLO.Spell(n).MaxLevel()) or 0 end)
+            return c
+        end
+        -- ONLY READ THE GEM'S ID IF THE GEM HOLDS A PLACATE. gemSp is set to nil just above when what is
+        -- memmed is not one, but the ID was still being read from that same gem - so capof reported the
+        -- ceiling of the WRONG SPELL entirely. Shylain's startup logged 'gem "none" caps 6006', which is
+        -- Sunburst Blessing's number wearing the gem slot's clothes. It happened to be harmless because
+        -- gemSp was nil and the book branch won, but a large bogus number one branch away from winning
+        -- is not something to leave sitting there.
+        local gemID = 0
+        if gemSp then pcall(function() gemID = tonumber(mq.TLO.Me.Gem(ep_gem_num()).ID()) or 0 end) end
+        local gemCap, bookCap = capof(gemSp, gemID), capof(bookSp, epBestPlacateID)
+        -- CARRY THE ID, not just the name. The whole point of resolving by ID is lost the moment the
+        -- name is handed onward and looked up again - which is exactly what happened: the check below
+        -- reported 80 and the announce two lines later said 76, because it re-read Spell["Placate"].
+        if bookCap > gemCap then sp, spID = bookSp, epBestPlacateID
+        elseif gemSp then        sp, spID = gemSp, gemID
+        else                     sp, spID = bookSp, epBestPlacateID end
+        -- SAY THE WORKING, once. Two separate wrong ceilings were chased on inference alone; the numbers
+        -- this decision is made from were never in the log.
+        if not epCapSaid then
+            epCapSaid = true
+            rezlog('[placate] ceiling check - gem "%s" caps %d | book "%s" caps %d -> using "%s"',
+                   tostring(gemSp or 'none'), gemCap, tostring(bookSp or 'none'), bookCap, tostring(sp or 'none'))
         end
         kind = 'placate'
     end
@@ -9533,8 +9769,16 @@ function pac_self()
         if d then sp, kind = d.name, 'phantom' end
     end
     if not sp then return nil end
+    -- THE ANNOUNCED CEILING, read by ID when we have one. This was a by-name lookup and it is the line
+    -- that produced the wrong number the whole time: every fix upstream computed 80 correctly and then
+    -- this threw it away and asked about a different spell of the same name.
     local cap = 0
-    pcall(function() cap = tonumber(mq.TLO.Spell(sp).MaxLevel()) or 0 end)
+    if spID and spID > 0 then
+        pcall(function() cap = tonumber(mq.TLO.Spell(spID).MaxLevel()) or 0 end)
+    end
+    if cap <= 0 then
+        pcall(function() cap = tonumber(mq.TLO.Spell(sp).MaxLevel()) or 0 end)
+    end
     -- A ceiling of 0 covers nothing, so announcing it just puts a caster on the panel that can never be
     -- given a mob. Say so plainly instead - a missing caster with a reason beats a silent useless one.
     if cap <= 0 then
@@ -9827,25 +10071,6 @@ function pac_assign(mobLevel, dist)
     return best, bestCap, bestRng
 end
 
-function ep_elected()
-    if epCaster ~= '' then return epCaster end
-    local best, bestRank = nil, 99
-    for _, nm in ipairs(group_members()) do
-        if epState[nm] then
-            local cls = ''
-            pcall(function() cls = tostring(member_class(nm) or ''):upper() end)
-            for i, c in ipairs(EP_CLASS_ORDER) do
-                if c == cls then
-                    if i < bestRank or (i == bestRank and best and nm:lower() < best:lower()) then
-                        best, bestRank = nm, i
-                    end
-                    break
-                end
-            end
-        end
-    end
-    return best
-end
 
 -- Summon my own corpse, loot everything, close the window.
 -- Ordered deliberately: summon FIRST, because a corpse that is out of reach cannot be looted and /corpse
@@ -9858,6 +10083,24 @@ function loot_my_corpse(wantID)
     end
     if id <= 0 then return end
 
+    -- STOP CASTING FIRST. The client will not open a loot window while a spell is going out, and this
+    -- runs right after a rez - the moment everything else starts casting again. A cast that began a
+    -- fraction earlier silently ate the /loot, the window never opened, and the corpse was left lying
+    -- there with only "the loot window did not open - corpse may be out of reach" to explain it, which
+    -- points at the wrong thing entirely.
+    -- Cheap to give up: /stopcast costs one spell that is about to be re-cast a second later anyway,
+    -- and the alternative is a corpse that stays on the ground until someone notices.
+    -- Only if something IS casting, so this does not interrupt for nothing on the normal path.
+    do
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if casting then
+            rezlog('[corpse] stopping a cast so the loot window can open')
+            pcall(function() mq.cmd('/stopcast') end)
+            mq.delay(600, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+        end
+    end
+
     pcall(function() mq.cmdf('/target id %d', id) end)
     mq.delay(1000, function() return (tonumber(mq.TLO.Target.ID()) or 0) == id end)
     if (tonumber(mq.TLO.Target.ID()) or 0) ~= id then
@@ -9866,10 +10109,25 @@ function loot_my_corpse(wantID)
     pcall(function() mq.cmd('/corpse') end)
     mq.delay(600)
 
+    -- AND AGAIN IMMEDIATELY BEFORE THE LOOT. Targeting and /corpse take about a second between them,
+    -- which is long enough for E3 to have started something new.
+    do
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if casting then
+            pcall(function() mq.cmd('/stopcast') end)
+            mq.delay(600, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+        end
+    end
     pcall(function() mq.cmd('/loot') end)
     mq.delay(2500, function() return mq.TLO.Window('LootWnd').Open() end)
     if not mq.TLO.Window('LootWnd').Open() then
-        rezlog('[corpse] the loot window did not open - corpse may be out of reach')
+        -- Name the two possibilities rather than only the one. The cast case is now stopped for above,
+        -- so if this still fires while casting, /stopcast is not taking and that is worth knowing.
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        rezlog('[corpse] the loot window did not open - %s',
+               casting and 'still casting despite /stopcast' or 'corpse may be out of reach')
         return
     end
 
@@ -9894,6 +10152,16 @@ function loot_my_corpse(wantID)
         rezlog('[corpse] still there after looting - one more go')
         pcall(function() mq.cmdf('/target id %d', id) end)
         mq.delay(800, function() return (tonumber(mq.TLO.Target.ID()) or 0) == id end)
+        -- The retry is the MOST likely one to be eaten by a cast: a second or two has passed since the
+        -- first attempt and E3 has had every chance to start something.
+        do
+            local casting = false
+            pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+            if casting then
+                pcall(function() mq.cmd('/stopcast') end)
+                mq.delay(600, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+            end
+        end
         pcall(function() mq.cmd('/loot') end)
         mq.delay(2000, function() return mq.TLO.Window('LootWnd').Open() end)
         pcall(function() mq.cmd('/notify LootWnd LW_DoneButton leftmouseup') end)
@@ -9931,7 +10199,9 @@ end
 -- so it catches every rank including ones nobody thought to list. The name fragments are a fallback for
 -- when that TLO does not resolve, and both are logged the first time so the actual values can be seen
 -- rather than guessed at - the subcategory string on this build is not something to assume.
-EP_NAME_HINTS = { 'placate', 'pacify', 'calm', 'lull', 'soothe', 'wake of tranquility' }
+-- 'serenity' rather than the full "Nature's Serenity": these are plain substring matches, so the short
+-- form catches the whole line however the apostrophe is punctuated and whatever the rank is called.
+EP_NAME_HINTS = { 'placate', 'pacify', 'calm', 'lull', 'soothe', 'wake of tranquility', 'serenity' }
 EP_SUBCAT_HINT = 'calm'
 function ep_spell_ok(nm)
     if not nm or nm == '' then return false, 'gem is empty' end
@@ -9953,23 +10223,67 @@ end
 -- Scanning is ~720 lookups, so it happens ONCE per session and only when it is actually needed, which
 -- is when the chosen gem does not already hold a placate.
 epBestPlacate = nil     -- false = looked and found none, so we do not scan again every tick
+epBestMissAt = 0        -- when the last fruitless scan ran, so a miss can be retried
+epCapSaid    = false    -- log the ceiling working once per session
+epBestPlacateID = 0     -- the ID of the book spell we chose, so nothing re-looks it up by name
 function ep_best_placate()
-    if epBestPlacate ~= nil then return epBestPlacate or nil end
-    local best, bestLvl = nil, -1
+    if epBestPlacate then return epBestPlacate end
+    -- A MISS IS NOT A FACT, IT IS A READING - and readings this early are unreliable.
+    -- This used to cache false forever. That was safe while the only caller was "the gem is EMPTY",
+    -- which is rare and late. Since pac_self started validating the gem, this is also called whenever
+    -- the gem holds something that is not a placate - which at startup is the NORMAL state, because the
+    -- gem still holds whatever was memmed last session. Shela's gem 8 holds her pet spell, so the scan
+    -- ran seconds into load, before Me.Book was readable, cached false, and she never announced a
+    -- ceiling again for the whole session. The enchanter with the highest cap in the group vanished.
+    -- So: retry a miss every 30s instead of never, and do not even scan until the book reads back.
+    if epBestPlacate == false and (mq.gettime() - (epBestMissAt or 0)) < 30000 then return nil end
+    local bookOk = false
+    pcall(function() bookOk = tostring(mq.TLO.Me.Book(1).Name() or '') ~= '' end)
+    if not bookOk then
+        -- Not "no placate" - "cannot read the book yet". Leave the cache alone so this is retried.
+        return nil
+    end
+    local best, bestCap, bestLvl = nil, -1, -1
     for i = 1, 720 do
-        local nm = ''
+        local nm, sid = '', 0
         pcall(function() nm = tostring(mq.TLO.Me.Book(i).Name() or '') end)
-        if nm ~= '' and nm ~= 'NULL' then
+        -- THE SPELL ID FROM THE BOOK SLOT, not a second lookup by name.
+        -- Spell["Placate"] resolves a NAME to one particular spell, and more than one spell is called
+        -- Placate. So walking the book and then asking Spell[name] threw away which one we had found and
+        -- asked about a different one: Shela's scan reported ceiling 76 / spell level 255 for an entry
+        -- that an earlier session had read as level 67. Two different spells, one name, and every number
+        -- after that point was about the wrong one.
+        -- Me.Book(i).ID() is the spell that is actually in that slot. Ask about that.
+        pcall(function() sid = tonumber(mq.TLO.Me.Book(i).ID()) or 0 end)
+        if nm ~= '' and nm ~= 'NULL' and sid > 0 then
             if ep_spell_ok(nm) then
-                local lvl = 0
-                pcall(function() lvl = tonumber(mq.TLO.Spell(nm).Level()) or 0 end)
-                if lvl > bestLvl then best, bestLvl = nm, lvl end
+                -- RANK BY MaxLevel, NOT BY THE SPELL'S OWN LEVEL.
+                -- MaxLevel is the ceiling - the highest mob this will hold - and it is the only number
+                -- Smart Cast routes on. The spell's Level is what you needed to scribe it, and the two
+                -- do not have to move together: Shela's book has a higher-Level placate whose CEILING is
+                -- 76, alongside the one she had memmed that reaches 80. Picking by Level chose the 76
+                -- and quietly cost the group its highest-capped caster.
+                -- Level stays as the tie-break, so two ranks with the same ceiling still resolve to the
+                -- later one.
+                local cap, lvl = 0, 0
+                pcall(function() cap = tonumber(mq.TLO.Spell(sid).MaxLevel()) or 0 end)
+                pcall(function() lvl = tonumber(mq.TLO.Spell(sid).Level()) or 0 end)
+                if cap > bestCap or (cap == bestCap and lvl > bestLvl) then
+                    best, bestCap, bestLvl, epBestPlacateID = nm, cap, lvl, sid
+                end
             end
         end
     end
     epBestPlacate = best or false
-    if best then rezlog('[placate] best placate in my book: %s (level %d)', best, bestLvl)
-    else         rezlog('\\ar[placate] no placate-line spell found in my spellbook\\ax') end
+    if best then
+        -- Both numbers, because they differ and the difference is the whole point of this choice.
+        -- ID included: if two spells share a name, this is the one that decided the ceiling.
+        rezlog('[placate] best placate in my book: %s [id %d] (ceiling %d, spell level %d)',
+               best, epBestPlacateID or 0, bestCap, bestLvl)
+    else
+        epBestMissAt = mq.gettime()
+        rezlog('\\ar[placate] no placate-line spell found in my spellbook - will look again in 30s\\ax')
+    end
     return best
 end
 
@@ -9977,8 +10291,17 @@ end
 -- user pointing at a gem IS the instruction that the gem is for placate.
 function ep_ensure_gem()
     local have = ep_spell()
-    if have and ep_spell_ok(have) then return true end
     local want = ep_best_placate()
+    -- ACCEPT WHAT IS THERE ONLY IF NOTHING BETTER EXISTS. This returned true for any valid placate, so a
+    -- gem holding a lower rank was left alone forever and the higher one in the book was never memmed.
+    if have and ep_spell_ok(have) then
+        if not want or want == have then return true end
+        local hc, wc = 0, 0
+        pcall(function() hc = tonumber(mq.TLO.Spell(have).MaxLevel()) or 0 end)
+        pcall(function() wc = tonumber(mq.TLO.Spell(want).MaxLevel()) or 0 end)
+        if wc <= hc then return true end
+        rezlog('[placate] gem holds "%s" (ceiling %d) but "%s" reaches %d - upgrading', have, hc, want, wc)
+    end
     if not want then return false end
     if epMemAt and (mq.gettime() - epMemAt) < 15000 then return false end   -- one attempt in flight
     epMemAt = mq.gettime()
@@ -9988,8 +10311,8 @@ function ep_ensure_gem()
     -- Self-contained pause and resume: ep_strip takes its own immediately afterwards, and /e3p is
     -- idempotent, so the two cannot fight.
     ep_pause()
-    rezlog('[placate] gem %d holds %s - memming %s instead (E3 paused)', ep_gem_num(),
-           (have and ('"' .. have .. '"')) or 'nothing', want)
+    rezlog('[placate] gem %d holds %s - memming %s instead (%s)', ep_gem_num(),
+           (have and ('"' .. have .. '"')) or 'nothing', want, e3_pause_note())
     pcall(function() mq.cmdf('/memspell %d "%s"', ep_gem_num(), want) end)
     mq.delay(10000, function() return (mq.TLO.Me.Gem(ep_gem_num()).Name() or '') == want end)
     local now = ''
@@ -10162,7 +10485,9 @@ function ep_mark(id, state, why)
     rezlog('[placate] %s#%d - %s', e.name or '?', id or 0, why)
     pac_reflect(id, state)
     ep_queue_log('after mark')
-    pcall(function() peer_bcast('/at_epmark %d %s', id, state) end)
+    -- Local only, same reason. A mob belongs to exactly one caster now, so a peer has no entry to mark -
+    -- and pac_reflect already reports the outcome to the shared pacify list, which is what the group
+    -- actually reads. Two paths saying the same thing is how they end up disagreeing.
 end
 
 -- Strip the three slots. Records what was there first, INCLUDING empty, so the restore knows the
@@ -10268,7 +10593,7 @@ function ep_strip()
     -- One save here, one restore at the end.
     epPrevTarget = 0
     pcall(function() epPrevTarget = tonumber(mq.TLO.Target.ID()) or 0 end)
-    rezlog('[placate] E3 paused; stripping weapons before the first cast...')
+    rezlog('[placate] %s; stripping weapons before the first cast...', e3_pause_note())
     -- Record BEFORE removing anything. Written first so a crash between the read and the click still
     -- leaves a file naming what should be worn - the opposite order would lose exactly the case this
     -- exists for.
@@ -10635,7 +10960,15 @@ function ep_tick()
     -- is an item in a bag rather than on the cursor.
     -- If it will NOT stow - bags full, or something the client refuses to put away - fall back to exactly
     -- the old behaviour and stand down, because then it really is stuck and worth stopping for.
-    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+    --
+    -- ONLY WHEN THERE IS SOMETHING TO CAST AT. This used to run on every pulse of every tick, so simply
+    -- HAVING placate enabled meant an /autoinventory every three seconds for as long as anything sat on
+    -- the cursor - stowing loot, gems and shards all day for a queue that was empty. The cursor is only
+    -- our business when we are about to act on this character; the rest of the time what is held is the
+    -- player's, or E3's, and none of ours to move.
+    local epWork = false
+    for _, q in ipairs(epQueue) do if not q.state then epWork = true; break end end
+    if epWork and (mq.TLO.Cursor.ID() or 0) ~= 0 then
         local held = tostring(mq.TLO.Cursor.Name() or '?')
         -- Rate limited so a genuinely stuck cursor does not mean an /autoinventory every pulse.
         if (mq.gettime() - (epCursorTryAt or 0)) > 3000 then
@@ -10663,13 +10996,17 @@ function ep_tick()
     -- emptied - would leave E3 held with epSaved never set, and the backstop above cannot see it.
     -- If we are paused, holding nothing, with no cast in flight and no work queued, let go.
     if epPaused and not epSaved and not epCast then
-        local pending = 0
+        local pending, casting = 0, false
         for _, q in ipairs(epQueue) do if not q.state then pending = pending + 1 end end
-        if pending == 0 then ep_resume('nothing left to do') end
+        -- Same reason as the queue-finished release: epCast being nil does not prove nothing is being
+        -- cast, only that we have stopped tracking it.
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if pending == 0 and not casting then ep_resume('nothing left to do') end
     end
 
     -- CLEARING IS THE TICK'S JOB, not the panel's - the same fault the phantom queue had.
-    -- This lived only inside draw_placate, so it ran only on a character with the window open. Every
+    -- This lived only inside the placate panel's draw, so it ran only on a character with that
+    -- window open. Every
     -- headless worker accumulated resolved entries forever: Ejtou's queue grew 1, 2, 3, 4 with every
     -- entry already done or failed, and the stand-down line kept reporting a queue that should have
     -- emptied minutes earlier.
@@ -10681,7 +11018,11 @@ function ep_tick()
             local hold = (#epQueue == 1) and 10000 or EP_LINGER
             if (mq.gettime() - epDoneAt) > hold then
                 epQueue, epDoneAt = {}, nil
-                pcall(function() peer_bcast('/at_epclear') end)
+                -- NOT BROADCAST ANY MORE. epQueue used to be one shared list every capable caster held a
+                -- copy of, so clearing it everywhere was the point. Since the manual queue went, it is
+                -- THIS character's assigned work - and telling the group to clear meant Ejtou finishing
+                -- her mob wiped Shela's queue mid-cast, dropping a second mob she had been given and
+                -- ending the run early. Each character clears its own.
                 ep_queue_log('linger expired')
             end
         else
@@ -10689,46 +11030,12 @@ function ep_tick()
         end
     end
 
-    -- ELECTED ONLY - BUT NOT FOR WORK ADDRESSED TO ME.
-    -- Capability is not permission: with an enchanter, a cleric and a paladin in one group all three pass
-    -- the class check, and on the SHARED list all three would strip and cast at the same mob. That is
-    -- what the election is for, and for the manual button it is still correct.
-    -- Smart Cast changed the premise. It routes each mob to exactly one caster by level ceiling - lowest
-    -- that still covers it - so the collision the election prevents cannot happen for assigned work. With
-    -- the election in front of it, the two systems disagreed and the election won: Ejtou (cap 76) was
-    -- correctly given level 69 mobs, was not the elected caster, and returned here SILENTLY. The mobs sat
-    -- in her queue while Shela, the only one allowed to cast, had never been given them.
-    -- So: if anything pending was assigned to me, I am the right caster for it by definition.
-    -- This now sits BELOW the backstops rather than above them. A stand-down must not skip the code that
-    -- puts someone's weapons back on.
-    do
-        local who = ep_elected()
-        if who and who:lower() ~= myName:lower() then
-            local mine = false
-            for _, q in ipairs(epQueue) do if not q.state and q.mine then mine = true; break end end
-            if not mine then
-                -- STAND DOWN CLEANLY, do not just leave.
-                -- This return is ABOVE the queue scan, and the queue scan is where the "nothing left to
-                -- do -> put the weapons back" branch lives. So a caster that finished its own mobs and
-                -- then found it was not the elected one walked away still stripped and still holding E3.
-                -- Ejtou did exactly that: stripped at 04:17:31, stood down from 04:17:38, and was only
-                -- rescued at 04:20:32 by the EP_STRIP_MAX backstop - three minutes with no weapons and
-                -- E3 paused, which is three minutes of no heals and no manastone.
-                -- Nothing of mine is pending, so there is nothing to be stripped or paused FOR.
-                if epSaved then ep_restore('nothing of mine left to placate')
-                elseif epPaused then ep_resume('nothing of mine left to placate') end
-                -- Said out loud, rate limited. The silent version of this line is the reason the above
-                -- took a log read to find: a queue with entries and no activity looked identical to a
-                -- queue that had stalled.
-                if #epQueue > 0 and (mq.gettime() - (epElectSaidAt or 0)) > 15000 then
-                    epElectSaidAt = mq.gettime()
-                    rezlog('[placate] %s is the elected caster - standing down (%d queued here, none assigned to me)',
-                           who, #epQueue)
-                end
-                return
-            end
-        end
-    end
+    -- THE ELECTION IS GONE. It decided which of several capable casters worked the SHARED queue, which
+    -- only ever existed for the manual Placate button. Smart Cast assigns every mob to exactly one
+    -- caster by ceiling and load, so the collision the election prevented cannot happen, and the
+    -- election itself caused two real failures: it silently refused mobs Smart Cast had assigned, and
+    -- standing down left a character stripped with E3 paused for three minutes.
+    -- Everything in epQueue is now, by construction, work addressed to this character.
 
     if epCast then
         -- PLACATE HAS A CAST TIME, so nothing can be concluded while it is still going out. This used to
@@ -10780,7 +11087,27 @@ function ep_tick()
         if (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id then
             local sp = ep_spell()
             if sp then
-                pcall(function() landed = (tonumber(mq.TLO.Target.Buff(sp).ID()) or 0) > 0 end)
+                local has = false
+                pcall(function() has = (tonumber(mq.TLO.Target.Buff(sp).ID()) or 0) > 0 end)
+                if not epCast.hadBuff then
+                    -- It had none before, so its having one now is our cast and nothing else.
+                    landed = has
+                elseif has then
+                    -- IT ALREADY HAD ONE. Presence proves nothing here - it was true before we cast. The
+                    -- honest signal is the DURATION going back up, which only a landed refresh does.
+                    local dur = 0
+                    pcall(function() dur = tonumber(mq.TLO.Target.Buff(sp).Duration.TotalSeconds()) or 0 end)
+                    if dur > (epCast.preDur or 0) + 2 then
+                        landed = true
+                    else
+                        -- Duration unreadable or not yet updated: fall back to the cast having actually
+                        -- COMPLETED. sawCast means we watched it go out, and Casting clearing means it is
+                        -- finished - which is the thing we were concluding without ever checking.
+                        local casting = false
+                        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+                        landed = epCast.sawCast and not casting
+                    end
+                end
             end
         else
             -- STILL NOT ON IT. Do not assume either way - keep trying. Assuming it landed marks a mob
@@ -10896,6 +11223,16 @@ function ep_tick()
         rezlog('[placate] %d queued mob(s) out of reach (%d) - waiting', farOnes, reach)
     end
     if not next_e then
+        -- NOT WHILE STILL CASTING. epCast is cleared the moment the mob is seen to hold the buff, and
+        -- that read is "does it have a placate on it" - not "did MY cast land". If Shela got there
+        -- first, or a previous attempt took, it reads true straight away and this tick concludes while
+        -- our own spell is still going out. The next tick then finds the queue finished and re-equips
+        -- and releases E3 mid-cast, which is the rare unpause-too-early.
+        -- Waiting costs a tick. Putting weapons back on and handing E3 the character in the middle of a
+        -- cast costs the cast, and possibly the placate.
+        local casting = false
+        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+        if casting then return end
         -- Queue finished. Put the weapons back - this is the "once everything is placated" half.
         if epSaved then ep_restore('queue finished') end
         return
@@ -11008,9 +11345,22 @@ function ep_tick()
     -- is paused for the whole run - one target per mob rather than one to cast plus one to check.
     pcall(function() mq.cmdf('/target id %d', next_e.id) end)
     mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == next_e.id end)
-    rezlog('[placate] %s on %s#%d', sp, next_e.name, next_e.id or 0)
+    -- DID IT ALREADY HAVE ONE, AND FOR HOW LONG? Read BEFORE the cast, because afterwards there is no
+    -- way to tell a fresh placate from the one that was already there.
+    -- Placate runs about 40 seconds, so refreshing a mob before it drops is normal play - and on a
+    -- refresh the verification "does the target have the buff" is true the instant we look, whether or
+    -- not our cast did anything. It marked done, dropped the cast, and the next tick re-equipped and
+    -- released E3 with the spell still going out.
+    local hadBuff, preDur = false, 0
+    pcall(function() hadBuff = (tonumber(mq.TLO.Target.Buff(sp).ID()) or 0) > 0 end)
+    if hadBuff then
+        pcall(function() preDur = tonumber(mq.TLO.Target.Buff(sp).Duration.TotalSeconds()) or 0 end)
+    end
+    rezlog('[placate] %s on %s#%d%s', sp, next_e.name, next_e.id or 0,
+           hadBuff and string.format(' (refresh - %ds left)', preDur) or '')
     pcall(function() mq.cmdf('/nowcast me "%s" %d', sp, next_e.id) end)
-    epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false, checkTries = 0 }
+    epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false,
+               checkTries = 0, hadBuff = hadBuff, preDur = preDur }
 end
 
 -- ===== PHANTOM LINE (placate) =====
@@ -11156,7 +11506,12 @@ function pw_tick()
     -- and it targets and re-targets exactly the same way. An item on the cursor through any of that is
     -- how it gets put somewhere nobody expects.
     -- Stow it if it will go; only stand down if it will not.
-    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+    -- ONLY WHEN THERE IS SOMETHING TO CAST AT - same fix as the placate tick, and this side had it worse:
+    -- cursor_stow has no rate limit of its own, so an unconditional check here meant an /autoinventory
+    -- on EVERY pulse rather than every three seconds.
+    local pwWork = false
+    for _, q in ipairs(pwQueue) do if not q.state then pwWork = true; break end end
+    if pwWork and (mq.TLO.Cursor.ID() or 0) ~= 0 then
         local ok, held = cursor_stow('pw')
         if not ok then
             if (mq.gettime() - (pwCursorSaidAt or 0)) > 5000 then
@@ -11500,134 +11855,6 @@ function draw_pacify()
     end
 end
 
-function draw_placate()
-    local holder = nil
-    for _, nm in ipairs(group_members()) do
-        if epState[nm] then holder = nm; break end
-    end
-
-    -- WHO IS CASTING. Click a name to pin it, click the pinned one again to go back to automatic.
-    -- Shown whenever more than one character can placate, because that is exactly when the automatic
-    -- choice might not be the one you want - and hidden when there is only one, since a picker with a
-    -- single option is just a line of clutter.
-    do
-        local able = {}
-        for _, nm in ipairs(group_members()) do if epState[nm] then able[#able + 1] = nm end end
-        if #able > 1 then
-            local elected = ep_elected()
-            ImGui.TextDisabled('caster:')
-            for _, nm in ipairs(able) do
-                ImGui.SameLine()
-                local pinned = (epCaster ~= '' and epCaster:lower() == nm:lower())
-                local isElected = elected and elected:lower() == nm:lower()
-                if pinned then          ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
-                elseif isElected then   ImGui.PushStyleColor(ImGuiCol.Text, 0.80, 0.80, 0.80, 1.0)
-                else                    ImGui.PushStyleColor(ImGuiCol.Text, 0.55, 0.55, 0.55, 1.0) end
-                if ImGui.SmallButton(nm:sub(1, 8) .. '##epcaster_' .. nm) then
-                    epCaster = pinned and '' or nm
-                    save_settings()
-                    pcall(function() peer_bcast('/at_epcaster %s', (epCaster ~= '') and epCaster or '-') end)
-                    rezlog('[placate] caster %s', (epCaster ~= '') and ('pinned to ' .. epCaster)
-                                                                    or 'back to automatic')
-                end
-                ImGui.PopStyleColor(1)
-                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                    local cls = tostring(member_class(nm) or '?')
-                    pcall(function() ImGui.SetTooltip(string.format('%s (%s)\n%s\n\nclick to %s',
-                        nm, cls,
-                        pinned and 'PINNED - always this one'
-                                or (isElected and 'chosen automatically by class order' or 'can placate, not chosen'),
-                        pinned and 'go back to automatic' or 'pin the placate queue to this character')) end)
-                end
-            end
-        end
-    end
-
-    if ImGui.Button('Placate##epadd', 160, 0) then
-        local id, nm, ty, hp = 0, '', '', 0
-        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
-        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
-        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
-        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
-        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
-            log('\\ay[placate] target an NPC first\\ax')
-        elseif ep_find(id) then
-            log('[placate] %s is already queued', nm)
-        else
-            epQueue[#epQueue + 1] = { id = id, name = nm, oor = false, farSince = nil }
-            log('[placate] queued %s (%d in the list)', nm, #epQueue)
-            ep_queue_log('added here')
-            pcall(function() peer_bcast('/at_epadd %d %s', id, nm:gsub(' ', '_')) end)
-        end
-    end
-    ImGui.SameLine()
-    if ImGui.SmallButton('Clear list##epclear') then
-        epQueue, epDoneAt = {}, nil
-        pcall(function() peer_bcast('/at_epclear') end)
-        log('[placate] queue cleared')
-        ep_queue_log('cleared here')
-    end
-    -- Say when the weapons are off, because it is a state with a cost and it should never be a surprise.
-    if epSaved then
-        ImGui.SameLine()
-        ImGui.TextColored(0.90, 0.72, 0.35, 1.0, 'weapons off')
-        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-            pcall(function() ImGui.SetTooltip(
-                'primary, secondary and range are stowed so augment procs\ncannot break a placate.\nThey go back on when the queue finishes.') end)
-        end
-    end
-    if #epQueue == 0 then return end
-
-    local pending = 0
-    for i, e in ipairs(epQueue) do
-        if not e.state then pending = pending + 1 end
-        ImGui.Text(string.format('%d.', i)); ImGui.SameLine()
-        local tip
-        if e.state == 'done' then
-            ImGui.TextColored(0.36, 0.85, 0.46, 1.0, e.name .. '  (cast)')
-            tip = e.name .. '\nplacate was cast at it'
-        elseif e.state == 'unknown' then
-            -- Deliberately its own colour and word. "We could not tell" is not the same as landed or
-            -- failed, and showing it as either would be inventing a result.
-            ImGui.TextColored(0.62, 0.62, 0.85, 1.0, e.name .. '  (?)')
-            tip = e.name .. '\nthe cast went out, but the mob could not be targeted to check'
-        elseif e.state == 'immune' then
-            ImGui.TextColored(0.85, 0.30, 0.30, 1.0, e.name .. '  (immune)')
-            tip = e.name .. '\nthe game says it looks unaffected - it cannot be placated'
-        elseif e.state == 'failed' then
-            ImGui.TextColored(0.90, 0.72, 0.35, 1.0, e.name .. '  (--)')
-            tip = e.name .. '\ngave up - dead, gone, or the cast would not go off'
-        elseif e.oor then
-            -- RED and spelled out. This was amber, on the reasoning that it is not a failure - but the
-            -- thing being communicated is "this one is not happening right now", and amber next to a
-            -- grey pending entry does not say that loudly enough. A queue that looks frozen is the
-            -- complaint that started this, so the entry that is holding says so in red.
-            ImGui.TextColored(0.93, 0.42, 0.42, 1.0, e.name .. '  OOR')
-            tip = e.name .. '\nOUT OF RANGE - skipped for now, retried as it closes'
-        else
-            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, e.name)
-            tip = e.name .. '\nwaiting its turn'
-        end
-        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-            pcall(function() ImGui.SetTooltip(tip) end)
-        end
-        ImGui.SameLine()
-        if ImGui.SmallButton('x##epdel' .. i) then
-            pcall(function() peer_bcast('/at_epdel %d', e.id) end)
-            table.remove(epQueue, i)
-            ep_queue_log('removed here')
-            break
-        end
-    end
-    -- REPORTS the countdown; ep_tick owns epDoneAt and does the clearing, so it happens on headless
-    -- workers too. A panel that only tidies while you are looking at it is the same as no panel.
-    if pending == 0 and #epQueue > 0 and epDoneAt then
-        local hold = (#epQueue == 1) and 10000 or EP_LINGER
-        local left = math.max(0, hold - (mq.gettime() - epDoneAt))
-        ImGui.TextDisabled(string.format('all done - clearing in %.0fs', left / 1000))
-    end
-    ImGui.Spacing()
-end
 
 function draw_phantom()
     local holder = nil
@@ -11782,7 +12009,36 @@ miniFold = miniFold or {}
 -- buttons it takes up more room than it saves - header plus panel is bigger than the panel was.
 -- These three are tables that can run many rows deep; everything else is a button strip and is better
 -- served by the Settings on/off box, which removes it entirely rather than trading one line for another.
-MINI_FOLDABLE = { rez = true, di = true, burns = true }
+-- MERGED CLICKY SECTIONS. Cures, magic protection and Arcane Reprisal were three separate sections
+-- drawing four rows between them, each paying for its own separator, its own Settings on/off box and
+-- its own slot in the order list. They are all the same shape - an amber label and one small button per
+-- owner - and they all answer the same question, so they are one section now.
+-- Arcane Reprisal sits here rather than with the heals: it is a protection-ish click, which is where it
+-- reads naturally even though it is a proc.
+function draw_protect_buttons()
+    -- DRAUGHTS FIRST. They were their own section for one row of three buttons, paying a separator and
+    -- a settings entry for it. They are consumables you press when something is going wrong, which is
+    -- what everything else in here is - and putting them under the fold means one click hides the whole
+    -- lot rather than leaving three orphan buttons behind.
+    draw_pot_buttons()
+    draw_cure_buttons()
+    draw_magic_buttons()
+    draw_arcane_buttons()
+end
+-- MGB and the combo buttons, same reasoning: two rows, two separators, two settings entries, one job.
+function draw_groupheal_buttons()
+    -- TWO HALVES, TWO SWITCHES. Merging these into one section saved a separator, and then took away the
+    -- ability to show combos WITHOUT the individual class buttons - which is the normal setup once you
+    -- have a combo, because the combo already presses them and the row of singles is just noise.
+    -- The section checkbox in Settings is the master; these two decide what is inside it.
+    if miniClicks then draw_mgb_buttons() end
+    if miniCombos then draw_combo_buttons() end
+end
+
+-- FOLD WHERE FOLDING BUYS SOMETHING. The header costs a row of its own, so a two-row section that folds
+-- is three rows open to save one - not worth the click. Protection draws four rows and the emblems up
+-- to four, so those fold; group heals is two rows and stays plain.
+MINI_FOLDABLE = { rez = true, di = true, burns = true, protect = true, nightveil = true }
 
 MINI_SECTIONS = {
     { key = 'rez',    label = 'Rez',                   draw = draw_rez_mini,
@@ -11813,28 +12069,28 @@ MINI_SECTIONS = {
           draw_burn_table(miniBurnFilter)
       end,
       get = function() return miniBurns end,  set = function(v) miniBurns = v end },
-    { key = 'pots',   label = 'Group draught buttons', draw = draw_pot_buttons,
-      get = function() return miniPots end,   set = function(v) miniPots = v end },
-    { key = 'mgb',    label = 'Class MGB buttons',     draw = draw_mgb_buttons,
-      get = function() return miniClicks end, set = function(v) miniClicks = v end },
-    { key = 'combos', label = 'Combo buttons',         draw = draw_combo_buttons,
-      get = function() return miniCombos end, set = function(v) miniCombos = v end },
-    { key = 'cures',  label = 'Cure buttons',          draw = draw_cure_buttons,
-      get = function() return miniCures end,  set = function(v) miniCures = v end },
-    { key = 'magic',  label = 'Magic protection',      draw = draw_magic_buttons,
-      get = function() return miniMagic end,  set = function(v) miniMagic = v end },
+    -- ON IF EITHER OF THE OLD FLAGS WAS ON. MGB and combos were separate sections with separate
+    -- visibility, so gating the merged one on miniClicks alone hid it for anyone who had combos on and
+    -- MGB off - a merge is not supposed to lose a section you were already showing.
+    -- set writes BOTH, so the checkbox stays authoritative from here on.
+    { key = 'groupheals', label = 'Group heals',       draw = draw_groupheal_buttons,
+      get = function() return (miniClicks or miniCombos) and true or false end,
+      set = function(v) miniClicks = v; miniCombos = v end },   -- master: both halves follow
+    -- 'Countermeasures', not 'Magic protection': cures are not protection, and the four things in here
+    -- are united by being pressed BECAUSE something is being done to you - two strip a debuff, the boots
+    -- resist, Arcane Reprisal punishes the caster. Not 'Defense Cooldowns' either, which would read as a
+    -- planned defensive window and collide with the burn tiers, which genuinely are cooldowns.
+    { key = 'protect', label = 'Countermeasures',      draw = draw_protect_buttons,
+      get = function() return (miniCures or miniMagic or miniArcane or miniPots) and true or false end,
+      set = function(v) miniCures = v; miniMagic = v; miniArcane = v; miniPots = v end },
     { key = 'coth',   label = 'CoTH Group button',     draw = draw_coth_mini,
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
-    { key = 'arcane', label = 'Arcane Reprisal',        draw = draw_arcane_buttons,
-      get = function() return miniArcane end, set = function(v) miniArcane = v end },
     { key = 'phantom', label = 'Phantom (placate)',     draw = draw_phantom,
       get = function() return miniPhantom end, set = function(v) miniPhantom = v end },
     { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
       get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
-    { key = 'pacify',  label = 'Smart Cast',              draw = draw_pacify,
+    { key = 'pacify',  label = 'Pacify',                  draw = draw_pacify,
       get = function() return miniPacify end, set = function(v) miniPacify = v end },
-    { key = 'placate', label = 'Placate',                draw = draw_placate,
-      get = function() return miniPlacate end, set = function(v) miniPlacate = v end },
 }
 miniOrder = {}   -- list of keys, in display order; rebuilt from settings, defaults to the list above
 function mini_section(key)
@@ -11844,8 +12100,17 @@ end
 function mini_order_normalise()
     -- Keep only keys we know, then append anything missing. Survives an old settings file that
     -- predates a section, and drops a key from a future one without breaking the list.
+    -- LEGACY KEYS MAP TO THE SECTION THAT ABSORBED THEM, rather than being dropped as unknown.
+    -- Without this, merging cures/magic/arcane into 'protect' would quietly delete wherever you had put
+    -- them and re-add the merged section at the bottom - an upgrade silently rearranging a layout you
+    -- set by hand. The first legacy key wins the position, the rest collapse into it.
+    -- 'placate' folded into 'pacify': the manual single-target queue is gone, Smart Cast is the
+    -- only placate view, so an old layout keeps its position rather than losing the entry.
+    local MERGED = { cures = 'protect', magic = 'protect', arcane = 'protect', pots = 'protect',
+                     mgb = 'groupheals', combos = 'groupheals', placate = 'pacify' }
     local out, seen = {}, {}
-    for _, k in ipairs(miniOrder) do
+    for _, k0 in ipairs(miniOrder) do
+        local k = MERGED[k0] or k0
         if mini_section(k) and not seen[k] then seen[k] = true; out[#out + 1] = k end
     end
     for _, s in ipairs(MINI_SECTIONS) do
@@ -11927,7 +12192,11 @@ function resync_group()
                   + prune(counts)
 
     if #peers > 0 then
+        -- TIMED. This is where the startup gap lived, and it was blamed on three other things first.
+        local t0 = mq.gettime()
         bring_up_group(peers)   -- pings first; only launches on toons that do not answer
+        local ms = mq.gettime() - t0
+        if ms >= 250 then log('[boot] bringing the group up took %dms', ms) end
         for _, nm in ipairs(peers) do
             peer_cmdf(nm, '/at_ping %s', myName)                              -- make sure they know the driver
             peer_cmdf(nm, '/at_rezauto %s', rezAuto and 'on' or 'off')
@@ -12230,6 +12499,19 @@ local function render()
             -- Deliberately NOT a new /at_close bind: that name is already the group shutdown, and binding
             -- it again here would have silently replaced it with something that only hides a window.
             if ImGui.SmallButton('Close all##miniclose') then closeAllRequested = true end
+            -- COTH ON THE HEADER, HARD RIGHT. As its own section it cost a separator and a full row for
+            -- one button. Up here it costs nothing: the header row already exists and its right-hand end
+            -- was empty. Pushed to the far edge rather than tucked beside Close all deliberately - those
+            -- two are the most and least reversible buttons in the window, and they should not be
+            -- neighbours where a mis-click swaps one for the other.
+            -- SameLine takes an absolute X, so this is measured from the window rather than guessed. If
+            -- the window is too narrow to place it, it falls back to simply following on.
+            if miniCoth then
+                local ww = 0
+                pcall(function() ww = tonumber(ImGui.GetWindowWidth()) or 0 end)
+                if ww > 220 then ImGui.SameLine(ww - 100) else ImGui.SameLine() end
+                draw_coth_mini()
+            end
             -- The Burns and Rez toggles that used to sit here are gone. They predated Settings owning
             -- section visibility, covered only 2 of the 8 sections, and - the real problem - flipped
             -- the flag WITHOUT saving, so anything set from here reverted on the next restart while
@@ -12243,6 +12525,10 @@ local function render()
             -- A folded section draws only its title, so it costs a line rather than a panel.
             for _, k in ipairs(miniOrder) do
                 local sec = mini_section(k)
+                -- CoTH is drawn on the header row above, so it is skipped here. It stays in the section
+                -- list so its Settings checkbox still turns it on and off - only its position in the
+                -- order list is now inert, since the header is a fixed spot.
+                if k == 'coth' then sec = nil end
                 if sec and sec.get and sec.get() and sec.draw then
                     ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                     local folded = false
@@ -12300,13 +12586,14 @@ local function render()
                 or  'Unlocked. Click to pin it in place so a stray click cannot drag it.') end)
         end
         ImGui.SameLine()
-        if ImGui.Button('Counts', 70, 0) then refreshRequested = true end   -- the 80-query pass; not cheap
-        ImGui.SameLine()
         if ImGui.Button('Mini', 50, 0) then miniMode = true; save_settings() end
+        -- CLOSE ALL MOVED UP HERE from the bottom of the window. At the bottom it sat below the tab bar,
+        -- so where it landed depended on which tab was open and how long that tab's content was - the
+        -- one button in the window that shuts down every instance in the group was also the one that
+        -- moved around. Top row, fixed position, next to the other window-level controls.
         ImGui.SameLine()
-        if ImGui.Button('Tank XT', 70, 0) then xtankRequested = true end
-        ImGui.SameLine()
-        do local prev = autoXTank; autoXTank = ImGui.Checkbox('Auto', autoXTank); if autoXTank and not prev then xtankAutoRequested = true end end
+        if ImGui.Button('Close all', 80, 0) then closeAllRequested = true end   -- global: shuts every instance
+        -- Counts, Tank XT and its Auto checkbox removed from this row - see the note by the tab bar.
         if #statusNames == 0 then ImGui.SameLine(); ImGui.TextDisabled('reading counts...') end
         if showSec.tribute then ImGui.Spacing(); draw_tribute_grid() end
 
@@ -12377,7 +12664,7 @@ local function render()
                     end
                     if #casters > 0 then
                         table.sort(casters)
-                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Smart Cast gems')
+                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Pacify gems')
                         ImGui.TextDisabled('which gem holds each caster\'s pacify spell')
                         for _, nm in ipairs(casters) do
                             ImGui.SetNextItemWidth(70)
@@ -12412,11 +12699,29 @@ local function render()
                 chk('burns',   'Burns tab')
                 chk('rez',     'Rez tab')
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Raid chat')
+                -- Was 'Raid chat', which named the MECHANISM of the one setting under it rather than the
+                -- feature. Both settings here are about tank XTargets, so the heading says that.
+                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Auto-XTarget')
                 ImGui.Spacing()
                 do
+                    -- MOVED OFF THE TOP BUTTON ROW. It sat there as a bare 'Auto' next to the Tank XT
+                    -- button, which told you nothing without the button beside it for context - and the
+                    -- button has gone. This is a set-once preference, which is what Settings is for.
+                    local prev = autoXTank
+                    autoXTank = ImGui.Checkbox('Keep tank XTargets up to date automatically', autoXTank)
+                    if autoXTank ~= prev then
+                        save_settings()
+                        if autoXTank then xtankAutoRequested = true end
+                    end
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(
+                            'Healers put the raid\'s tanks on their XTarget list so E3 XTarget heals\n'
+                            .. 'can reach them. On: rechecked periodically and after a roster change.') end)
+                    end
+                end
+                do
                     local prev = xtankAnnounce
-                    xtankAnnounce = ImGui.Checkbox('/rsay XTarget tank swaps', xtankAnnounce)
+                    xtankAnnounce = ImGui.Checkbox('Announce tank swaps in /rsay', xtankAnnounce)
                     if xtankAnnounce ~= prev then
                         save_settings()
                         peer_bcast('/at_xtsay %s', xtankAnnounce and 'on' or 'off')
@@ -12464,7 +12769,23 @@ local function render()
                             -- the enchanter - so the field only appeared on the one character nobody has
                             -- on screen. Set it anywhere and it is broadcast to whoever does the casting,
                             -- the same way the rez order and the CotW toggle already work.
-                            if k == 'placate' and miniPlacate then
+                            -- MOVED FROM THE 'placate' ROW, which no longer exists. This is the
+                            -- placate gem number and it is still very much needed - it is what
+                            -- decides which gem ep_ensure_gem mems into. It now rides on the
+                            -- Smart Cast row, which is where placate is configured from.
+                            -- The two halves of Group heals. Shown on its row so they read as part of
+                            -- that section rather than as two more top-level settings.
+                            if k == 'groupheals' and (miniClicks or miniCombos) then
+                                ImGui.SameLine()
+                                local wasC = miniClicks
+                                miniClicks = ImGui.Checkbox('class buttons##at_gh_mgb', miniClicks)
+                                if miniClicks ~= wasC then dirty = true end
+                                ImGui.SameLine()
+                                local wasK = miniCombos
+                                miniCombos = ImGui.Checkbox('combos##at_gh_combo', miniCombos)
+                                if miniCombos ~= wasK then dirty = true end
+                            end
+                            if k == 'pacify' and miniPacify then
                                 ImGui.SameLine()
                                 ImGui.SetNextItemWidth(70)
                                 local g = ImGui.InputInt('gem##at_epgem', epGem or 8, 0)
@@ -12604,6 +12925,42 @@ local function render()
                                 comboDirty = true
                             end
                         end
+                        -- WHAT EACH CHECKED HEAL SHOUTS. One field per member of THIS combo, because the
+                        -- announce is per class-and-ability and that is exactly what a member is.
+                        -- Placeholder shows the default, so an empty box reads as "the normal one" rather
+                        -- than as silence - and clearing a box restores the default rather than muting it.
+                        for _, m in ipairs(c.members) do
+                            local mcls, mkey = combo_parse(m)
+                            local me = mkey and mgb_entry(mkey)
+                            if mcls and me then
+                                local sk  = mgb_say_key(mcls, me)
+                                local cur = mgbSay[sk] or ''
+                                -- The DEFAULT goes in the label, not as an InputText hint. Nothing else in
+                                -- this file uses InputText at all, so its exact binding here is unproven,
+                                -- and InputTextWithHint is a newer overload that some MQ ImGui builds do
+                                -- not expose - it would fail inside a pcall and draw nothing at all.
+                                -- Label text costs nothing and cannot fail.
+                                ImGui.TextDisabled(string.format('   /rsay for %s  (default: %s)',
+                                                   mgb_label(mcls, me), mgb_say_default(mcls, me)))
+                                ImGui.SameLine()
+                                ImGui.SetNextItemWidth(220)
+                                local nv = cur
+                                local okIn = pcall(function()
+                                    nv = ImGui.InputText('##at_say_' .. ci .. '_' .. sk, cur)
+                                end)
+                                if okIn and type(nv) == 'string' and nv ~= cur then
+                                    mgbSay[sk] = (nv ~= '') and nv or nil
+                                    dirty = true
+                                    -- Tell the group, so the character that actually says this line has it.
+                                    pcall(function()
+                                        peer_bcast('/at_mgbsay %s %s', sk, (nv ~= '') and nv or '-')
+                                    end)
+                                elseif not okIn then
+                                    -- Say so rather than showing an empty gap where a field should be.
+                                    ImGui.TextColored(0.95, 0.85, 0.30, 1.0, '(text field unavailable in this ImGui build)')
+                                end
+                            end
+                        end
                         for k = #c.members, 1, -1 do
                             local mcls, mkey = combo_parse(c.members[k])
                             if mcls and not inGroup[mcls] then
@@ -12633,8 +12990,6 @@ local function render()
             ImGui.EndTabBar()
         end
 
-        ImGui.Spacing()
-        if ImGui.Button('Close all', 100, 0) then closeAllRequested = true end   -- global: shuts every instance
     end
     ImGui.End()
 end
@@ -12673,6 +13028,22 @@ pcall(function() mq.bind('/atuie', function()
     save_settings()
     printf('\ag[AdventureTime]\ax expanded window open (\ay/atui\ax for the mini one)')
 end) end)
+-- TOP LEVEL, NOT INSIDE `if SHOW_UI`. It was moved next to its first use and landed inside the
+-- driver-only branch, so on a WORKER the global was never created and the call further down - which is
+-- outside that branch - died with "attempt to call global 'boot_step' (a nil value)".
+-- The driver was fine, every worker crashed on load, and the driver kept relaunching them into the same
+-- crash. Anything called from outside a SHOW_UI branch has to be DEFINED outside one.
+atBootT0 = mq.gettime()
+function boot_step(label, fn)
+    local t0 = mq.gettime()
+    local ok, err = pcall(fn)
+    local ms = mq.gettime() - t0
+    if ms >= 250 then
+        log('[boot] %s took %dms', label, ms)
+    end
+    if not ok then log('\ar[boot] %s failed: %s\ax', label, tostring(err)) end
+    return ms
+end
 if SHOW_UI then
     log('AdventureTime %s ready [%s] - \\ay/lua run adventuretime\\ax on each toon; open \\ay/at\\ax here and Give out.',
         VERSION, BUILD_TAG)
@@ -12682,11 +13053,21 @@ if SHOW_UI then
     log('   \\ay/atui\\ax reopens the mini window, \\ay/atuie\\ax the expanded one.')
     log('   \\ay/atpac\\ax re-announces my pacify ceiling (run it after memming a new rank).')
     log('   \\ay/atwipe\\ax holds all rezzes until the group zones (\\ay/atwipe off\\ax to release).')
+
 -- RECOVER STRIPPED GEAR AT STARTUP. A file here means a placate run did not put the weapons back -
 -- almost always because the client died mid-run. Nothing else will ever notice: the character just
 -- fights on without an epic, and the only clue is a stack of DPS that quietly is not there.
 -- Runs before anything else touches the character, and holds E3 while it works.
-pcall(function()
+-- OFF THE CRITICAL PATH. This still has to happen - gear left stripped by a run that died mid-way is
+-- invisible otherwise, and the character fights the whole session without an epic while nothing
+-- notices - but it does not have to happen DURING load.
+-- It reads a file, and if there is one it pauses E3, which now waits up to 2.5 seconds for confirmation
+-- and retries once. That is several seconds of a startup that is already slow, spent on a case that is
+-- rare and not urgent to the millisecond.
+-- Deferred to the first tick five seconds in: late enough that the client has settled and Me.Inventory
+-- reads properly, early enough that nobody has fought a pull unarmed.
+epRecoverAt = mq.gettime() + 5000
+function ep_recover_startup()
     local saved = ep_recovery_read()
     if not saved then return end
     log('\\ay[placate] found gear stripped by an unfinished run - putting it back\\ax')
@@ -12724,7 +13105,7 @@ pcall(function()
     end
     if ok then ep_recovery_clear(); log('[placate] gear recovery complete')
     else log('\\ar[placate] gear recovery INCOMPLETE - will try again next start\\ax') end
-end)
+end
 else
     log('AdventureTime %s ready [%s] (worker - headless; obeying the driver).', VERSION, BUILD_TAG)
     -- FIND THE CURRENCY TAB ONCE, NOW, while nothing is waiting on an answer. The sweep costs up to
@@ -12739,6 +13120,7 @@ end
 if SHOW_UI then refreshRequested = true end
 DI.startedAt = mq.gettime()   -- clock the settling window from load, not from the first tick
 
+-- Timed, because this was the multi-second startup gap and it took three attempts to find.
 -- Driver only, ONCE at startup: spread a headless worker to each GROUP member so they're present to take
 -- commands (tank XTargets, etc.). Not a recurring ping - no pingpong. Counts still come straight from
 -- DanNet whether or not they run this; this just lets them ACT on /at_* commands.
@@ -12778,7 +13160,13 @@ local function check_peer_network()
     log('\\ayclient matches, then FULLY restart them. See the AdventureTime readme.\\ax')
 end
 
-load_settings()   -- restore persisted toggles (auto-rez) before we start talking to anyone
+-- ===== WHERE STARTUP TIME GOES =====
+-- There is a consistent multi-second gap between the banner and the first setting being restored, and it
+-- has been blamed on whatever changed most recently more than once - the file migration took the blame
+-- despite the same gap being in logs from before that code existed.
+-- So: time each step and print anything slow. One number ends the argument.
+-- Only slow steps are logged, so a healthy startup stays quiet.
+boot_step('load settings', load_settings)   -- restore persisted toggles before we talk to anyone
 -- Announce what this character can pacify, once. Not on the heartbeat: the spell and its ceiling do not
 -- change during a session unless something is re-memmed, and /atpac covers that.
 -- Deferred slightly - the spellbook and gems are not reliably readable the instant a script starts.
@@ -13125,6 +13513,11 @@ while running do
         -- Cheap: it exits immediately unless there is an un-sent entry past its grace worth moving.
         -- Check E3 is still where we put it BEFORE the placate and phantom ticks run, since those are
         -- the two that act on the assumption that it is held.
+        -- ONE-SHOT, five seconds in. Cleared before it runs, so a throw inside cannot make it repeat.
+        if epRecoverAt and mq.gettime() >= epRecoverAt then
+            epRecoverAt = nil
+            atphase('gear_recovery'); pcall(ep_recover_startup)
+        end
         atphase('e3hold'); pcall(e3_assert_held)
         atphase('pacify'); pcall(pac_dispatch); pcall(pac_rebalance); pcall(pac_autoclear)
         atphase('placate'); pcall(ep_tick)
@@ -13772,6 +14165,7 @@ pcall(function() mq.unbind('/at_pacgem') end)
 pcall(function() mq.unbind('/at_pacoff') end)
 pcall(function() mq.unbind('/at_epcaster') end)
 pcall(function() mq.unbind('/at_epgem') end)
+pcall(function() mq.unbind('/at_mgbsay') end)
 pcall(function() mq.unbind('/at_epmark') end)
 pcall(function() mq.unbind('/at_epclear') end)
 pcall(function() mq.unbind('/at_epdel') end)
