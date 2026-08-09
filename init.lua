@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.08'
-local BUILD_TAG = '1.08'  -- bump on every change; prints on startup
+VERSION = '1.08.1'
+local BUILD_TAG = '1.08.1'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -59,6 +59,12 @@ expectTradeUntil = 0
 
 -- File logging: mirror every line to AdventureTime_<name>_log.txt (fresh each run, flushed per line) so a
 -- run can be reconstructed from the file - same as the crafter/listener.
+-- FORWARD SLASHES WHEN PRINTING A PATH. MQ reads \a as the start of a colour code and eats the next
+-- character with it, so "Config\adventuretime_settings.txt" prints as "Configventuretime_settings.txt" -
+-- the \a and the d are swallowed. The path is right; the display was not, and it points at a file that
+-- does not exist, which is a fine way to spend twenty minutes.
+-- Windows takes forward slashes anywhere a path is typed, so this stays copy-pasteable.
+function path_show(p) return (tostring(p or ''):gsub('\\', '/')) end
 local LOG_FILE_PATH
 do
     local dir
@@ -69,6 +75,31 @@ do
         pcall(function() luaPath = mq.TLO.MacroQuest.Path('lua')() end)
         -- keep logs inside the module folder rather than dumping six of them in the lua root
         if luaPath and luaPath ~= '' then dir = luaPath .. '\\adventuretime\\' end
+    end
+    -- THE MODULE FOLDER, kept for at_dir() below - the Logs step reassigns `dir` a moment from now.
+    AT_MODULE_DIR = dir or ''
+    -- LOGS LIVE IN Logs\. No migration: old logs are not worth moving, they just stop growing where
+    -- they are and new ones start here.
+    -- PROBE BEFORE MKDIR. Writing a file into a folder that already exists is cheap and answers the
+    -- same question; lfs.mkdir returns FALSE when the directory is already there, so treating that as
+    -- failure meant the os.execute fallback spawned a shell on EVERY startup. That was the freeze.
+    if dir and dir ~= '' then
+        local logdir = dir .. 'Logs'
+        local probe  = logdir .. '\\.atwrite'
+        local pf = io.open(probe, 'w')
+        if not pf then
+            local made = false
+            pcall(function() local lfs = require('lfs'); made = lfs.mkdir(logdir) end)
+            if not made then pcall(function() os.execute('mkdir "' .. logdir .. '"') end) end
+            pf = io.open(probe, 'w')
+        end
+        -- Only move in if it is genuinely writable. A log that cannot be written is worse than a log in
+        -- an untidy place, and this runs before there is any way to report the problem.
+        if pf then
+            pf:close()
+            pcall(function() os.remove(probe) end)
+            dir = logdir .. '\\'
+        end
     end
     local who = '?'
     pcall(function() who = mq.TLO.Me.Name() or '?' end)
@@ -1947,7 +1978,7 @@ local function parse_burns()
             local fh = io.open(found .. '\\' .. foundFile, 'r')
             if fh then
                 f, path = fh, found .. '\\' .. foundFile
-                log('[burns] found E3 config by searching: %s', path)
+                log('[burns] found E3 config by searching: %s', path_show(path))
                 write_e3_path(found)
             end
         end
@@ -1998,7 +2029,7 @@ local function parse_burns()
     for nm, ti in pairs(tierOf) do list[#list + 1] = { name = nm, tier = ti, tkey = keyOf[nm] or '?' } end
     for k in pairs(seen) do keys[#keys + 1] = k end
     table.sort(keys, function(a, b) return rank_for(a) < rank_for(b) end)
-    log('[burns] parsed %d burn item(s) from %s', #list, path)
+    log('[burns] parsed %d burn item(s) from %s', #list, path_show(path))
     log('[burns] tiers found: %s', table.concat(keys, ', '))
     return list
 end
@@ -2026,7 +2057,8 @@ local REZ_FILE
 local function rez_file_path()
     if REZ_FILE then return REZ_FILE end
     local cfg = ''; pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    REZ_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_rezpriority.txt')) or 'adventuretime_rezpriority.txt'
+    -- Settings folder, with the old flat path as a read fallback. Written to the new one from then on.
+    REZ_FILE = at_read('adventuretime_rezpriority.txt')
     return REZ_FILE
 end
 local function rez_rank(cls)
@@ -2088,20 +2120,71 @@ end
 -- ===== Rezzer cast order: a reorderable, persisted list of (name, clicky) slots that DRIVES the baton =====
 -- Persisted toggles, so they survive a reload. One key=value per line; add more keys freely.
 local SETTINGS_FILE
-local function settings_path()
-    if SETTINGS_FILE then return SETTINGS_FILE end
-    local cfg = ''; pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    -- PER CHARACTER, same reason as the rez order: every toon shared one settings file, so mini sections,
-    -- targets, toggles and the rez scope all belonged to whoever saved last.
-    -- Always the per-character path for writing; the loader falls back to the old shared file once.
-    local who2 = ''
-    pcall(function() who2 = tostring(mq.TLO.Me.Name() or '') end)
-    local base2 = (cfg ~= '') and (cfg .. '\\') or ''
-    SETTINGS_FILE = base2 .. 'adventuretime_settings_' .. ((who2 ~= '') and who2 or 'unknown') .. '.txt'
-    SETTINGS_FILE_LEGACY = base2 .. 'adventuretime_settings.txt'   -- the pre-per-character shared file, read only
-    return SETTINGS_FILE
+-- ===== WHERE STATE LIVES: lua\adventuretime\Settings\ =====
+-- Probe before mkdir, for the reason spelled out at the log folder above: lfs.mkdir reports false when
+-- the directory already exists, so treating that as failure spawned a shell every single startup.
+-- Falls back to the old flat config folder if the folder cannot be made or written - losing the tidy
+-- layout is a nuisance, losing settings is not.
+AT_DIR = nil
+function at_dir()
+    if AT_DIR ~= nil then return AT_DIR end
+    local cfg = ''
+    pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    local flat = (cfg ~= '') and (cfg .. '\\') or ''
+    local sub  = (AT_MODULE_DIR ~= '' and AT_MODULE_DIR or flat) .. 'Settings'
+    if sub == 'Settings' then AT_DIR = flat; return AT_DIR end
+    local probe = sub .. '\\.atwrite'
+    local pf = io.open(probe, 'w')
+    if not pf then
+        local made = false
+        pcall(function() local lfs = require('lfs'); made = lfs.mkdir(sub) end)
+        if not made then pcall(function() os.execute('mkdir "' .. sub .. '"') end) end
+        pf = io.open(probe, 'w')
+    end
+    if pf then
+        pf:close(); pcall(function() os.remove(probe) end)
+        AT_DIR = sub .. '\\'
+    else
+        AT_DIR = flat
+    end
+    return AT_DIR
 end
+
+-- Where a state file is WRITTEN. Always the new folder.
+function at_write(name) return at_dir() .. name end
+-- Where a state file is READ from. New folder if something is there, otherwise the old flat location -
+-- so an existing install is picked up on first run with nothing copied anywhere. Whatever is loaded is
+-- then saved to the new path by the normal save, and the old file is simply never read again.
+function at_read(name)
+    local newp = at_dir() .. name
+    local f = io.open(newp, 'r')
+    if f then f:close(); return newp end
+    local cfg = ''
+    pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    if cfg == '' then return newp end
+    local oldp = cfg .. '\\' .. name
+    local g = io.open(oldp, 'r')
+    if g then g:close(); return oldp end
+    return newp
+end
+
+-- ONE SETTINGS FILE FOR THE GROUP. It was per character because a worker's save wrote all 35 keys from
+-- its own state - and a worker has no UI, so its layout keys are always defaults. One broadcast setting
+-- change and eleven workers overwrote the driver's customised layout with blanks. That is not a
+-- concurrency problem, it is a CONTENT problem, and the fix is that workers do not save at all: they
+-- cannot customise anything, they receive every shared value by broadcast, and a worker is only ever
+-- launched by a driver, so it never needs a file of its own.
+-- Nothing in here is genuinely per character - pacGem is keyed by character inside the value, mgbSay by
+-- class and ability - so one file loses nothing.
+SETTINGS_NAME = 'adventuretime_settings.txt'
+local function settings_path() return at_write(SETTINGS_NAME) end
 local function save_settings()
+    -- DRIVER ONLY. A worker has no UI, so every layout key it holds is a default - and it saves whenever
+    -- a broadcast setting arrives. Letting it write meant one gem change on the driver was followed by
+    -- eleven workers replacing the shared file with their own blank layout.
+    -- Nothing is lost: a worker is launched by a driver and gets every shared value by broadcast, so it
+    -- has nothing of its own worth keeping.
+    if not SHOW_UI then return end
     pcall(function()
         local f = io.open(settings_path(), 'w')
         if f then
@@ -2174,11 +2257,33 @@ local function save_settings()
 end
 local function load_settings()
     pcall(function()
-        local f = io.open(settings_path(), 'r')
-        -- Per-character file first; the old shared one only if that does not exist, so an existing setup
-        -- carries over rather than coming up on defaults. The next save writes per-character.
-        if not f and SETTINGS_FILE_LEGACY then f = io.open(SETTINGS_FILE_LEGACY, 'r') end
+        -- FIRST RUN PICKS UP AN EXISTING INSTALL, with nothing copied anywhere. Try the new shared file;
+        -- then this character's old per-character file, which is where a current setup's real
+        -- customisation lives; then the pre-per-character shared file from before that.
+        -- Whatever is found is loaded and then written to the new path by the next save, so the old
+        -- files are simply never read again. No migration step, no copying, nothing to go wrong twice.
+        local cfg = ''
+        pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+        local who = ''
+        pcall(function() who = tostring(mq.TLO.Me.Name() or '') end)
+        local base = (cfg ~= '') and (cfg .. '\\') or ''
+        local tries = {
+            -- at_write, NOT at_read: at_read falls back to the flat file of the SAME NAME, which is the
+            -- stale pre-per-character shared file - and it would win over this character's real settings.
+            -- The new path has to be tried on its own, with the older ones ranked deliberately below it.
+            at_write(SETTINGS_NAME),
+            (who ~= '') and (base .. 'adventuretime_settings_' .. who .. '.txt') or nil,
+            base .. 'adventuretime_settings.txt',
+        }
+        local f, from
+        for _, path in ipairs(tries) do
+            if path then
+                local h = io.open(path, 'r')
+                if h then f, from = h, path; break end
+            end
+        end
         if not f then return end
+        SETTINGS_LOADED_FROM = from
         for line in f:lines() do
             -- [%w_] not %w: the show_* keys carry an underscore, so the old pattern returned nil for
             -- them and the k:match below threw. Wrapped in pcall, that aborted the WHOLE load on the
@@ -2283,7 +2388,8 @@ local function rez_order_path()
     local who = ''
     pcall(function() who = tostring(mq.TLO.Me.Name() or '') end)
     local base = (cfg ~= '') and (cfg .. '\\') or ''
-    REZ_ORDER_FILE = base .. 'adventuretime_rezorder_' .. ((who ~= '') and who or 'unknown') .. '.txt'
+    -- Per character for real: this is THIS toon's place in the chain, not a group setting.
+    REZ_ORDER_FILE = at_read('adventuretime_rezorder_' .. ((who ~= '') and who or 'unknown') .. '.txt')
     return REZ_ORDER_FILE
 end
 function default_rez_order()
@@ -2588,8 +2694,30 @@ local function coth_tick()
             end
         end
         table.sort(ready, function(a, b) return a:lower() < b:lower() end)
-        if #ready > 0 and ready[1]:lower() ~= myName:lower() then
-            COTH.dbg = 'summoner is ' .. ready[1]
+        -- EVERY READY HOLDER SUMMONS, EACH A DIFFERENT TARGET. This let only ready[1] act, so a gather
+        -- was one summon at a time however many emblems were standing there - and the cascade never
+        -- happened. coth_targets already puts emblem-holders at the FRONT of the list, so the first
+        -- people brought in are the ones who can then help: one summons one, two summon two, four
+        -- summon four.
+        -- Split by POSITION, not by a claim. Every toon computes the same ready list and the same target
+        -- list from the same shared state, so summoner N takes target N with nothing sent and nothing to
+        -- arrive in time. That is what the single-summoner rule was protecting against - three emblems
+        -- landing on one target because no broadcast had propagated yet - and slicing by index gives the
+        -- same guarantee without serialising the whole gather.
+        local myTurn = nil
+        for i, nm in ipairs(ready) do
+            if nm:lower() == myName:lower() then myTurn = i; break end
+        end
+        if not myTurn then
+            COTH.dbg = (#ready > 0) and ('summoners: ' .. table.concat(ready, ', ')) or 'nobody ready'
+            return
+        end
+        -- My slice of the queue: targets myTurn, myTurn+#ready, myTurn+2*#ready ...
+        local mine = {}
+        for i = myTurn, #left, #ready do mine[#mine + 1] = left[i] end
+        left = mine
+        if #left == 0 then
+            COTH.dbg = string.format('summoner %d of %d - nothing in my slice', myTurn, #ready)
             return
         end
     end
@@ -5077,7 +5205,7 @@ pcall(function()
             if saved then
                 epSaved = saved
                 epStripAt = mq.gettime()
-                rezlog('[placate] recovering from %s', ep_recovery_path())
+                rezlog('[placate] recovering from %s', path_show(ep_recovery_path()))
             end
         end
         ep_restore('asked by hand')
@@ -7190,7 +7318,7 @@ end
 local function load_combos()
     local cfg = ''
     pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    COMBO_FILE = (cfg ~= '' and (cfg .. '\\adventuretime_combos.txt')) or 'adventuretime_combos.txt'
+    COMBO_FILE = at_read('adventuretime_combos.txt')
     COMBOS = {}
     local fh = io.open(COMBO_FILE, 'r')
     if not fh then return end
@@ -7265,6 +7393,14 @@ MAGIC_CLICKS = {
       name = 'Imbued Glyph: Echoes of the Ancient' },
     { key = 'echoancient',  label = 'Echoes of the Ancient', group = 'Echoes', short = 'ancient',
       spell = 'Echoes of the Ancient' },
+    -- CIRCLE OF ALENDAR, two ways at it. The bracelet clicks the same spell the enchanter casts, so they
+    -- share a group and read as one row - same pattern as the Boots and the Echoes lines above.
+    -- spell = for the cast (ownership means memmed in a gem), name = for the clicky (ownership means it
+    -- is in a bag), so a character with only one of them gets only that button.
+    { key = 'alendar',     label = 'Circle of Alendar', group = 'Alendar', short = 'spell',
+      spell = 'Circle of Alendar' },
+    { key = 'alendarband', label = 'Circle of Alendar', group = 'Alendar', short = 'bracelet',
+      name = "Forsaken Illusionist's Bracelet" },
 }
 magicState = {}   -- driver: magicState[char][key] = { have, secs, up, dsecs, updated }
 magicLast  = {}   -- worker: last-pushed key per item
@@ -8930,7 +9066,8 @@ function ep_recovery_path()
     pcall(function() dir = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
     local who = ''
     pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
-    return (dir ~= '' and (dir .. '\\') or '') .. 'adventuretime_stripped_' .. who .. '.txt'
+    -- Per character for real: it records THIS toon's weapons, mid-run.
+    return at_read('adventuretime_stripped_' .. who .. '.txt')
 end
 function ep_recovery_write()
     local fh = io.open(ep_recovery_path(), 'w')
@@ -12531,7 +12668,14 @@ end
 -- despite the same gap being in logs from before that code existed.
 -- So: time each step and print anything slow. One number ends the argument.
 -- Only slow steps are logged, so a healthy startup stays quiet.
-boot_step('load settings', load_settings)   -- restore persisted toggles before we talk to anyone
+boot_step('load settings', load_settings)
+-- Say where they came from. On an upgrade this reads the old flat file once and then never again, and
+-- "which file am I actually using" is the first question when something does not persist.
+if SHOW_UI then
+    log('[settings] %s', SETTINGS_LOADED_FROM and ('loaded from ' .. path_show(SETTINGS_LOADED_FROM))
+        or 'no settings file found - starting from defaults')
+    log('[settings] saving to %s', path_show(at_write(SETTINGS_NAME)))
+end   -- restore persisted toggles before we talk to anyone
 -- Announce what this character can pacify, once. Not on the heartbeat: the spell and its ceiling do not
 -- change during a session unless something is re-memmed, and /atpac covers that.
 -- Deferred slightly - the spellbook and gems are not reliably readable the instant a script starts.
