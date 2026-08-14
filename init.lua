@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.10'
-local BUILD_TAG = '1.10'  -- bump on every change; prints on startup
+VERSION = '1.11'
+local BUILD_TAG = '1.11'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -3148,6 +3148,44 @@ function di_raw_staff()
     return best
 end
 
+-- REMEMBER THE FIRE ACROSS A RESTART.
+-- Every character reads TimerReady=0 and ItemReady=true at load - the 'staff reads at load' line says so
+-- on all of them, including staffs that are certainly on cooldown. So a restarted AdventureTime believes
+-- every staff in the group is ready, offers one, and the cast goes nowhere.
+-- The client cannot be asked about this, so remember it ourselves: one line per character holding when
+-- the staff was last fired. os.time() rather than gettime(), because gettime restarts with the script.
+function di_staff_stamp_path()
+    local cfg = ''
+    pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    local who = (myName ~= '') and myName or 'unknown'
+    return ((cfg ~= '') and (cfg .. '\\') or '') .. 'adventuretime_distaff_' .. who .. '.txt'
+end
+
+function di_staff_stamp_write()
+    pcall(function()
+        local f = io.open(di_staff_stamp_path(), 'w')
+        if f then f:write(tostring(os.time())); f:close() end
+    end)
+end
+
+-- Called once at load. If the staff was fired recently enough to still be in reuse, put the assume-spent
+-- brake back where it would have been - which is the same brake a running instance would have had.
+function di_staff_stamp_read()
+    local when = 0
+    pcall(function()
+        local f = io.open(di_staff_stamp_path(), 'r')
+        if f then when = tonumber(f:read('*a') or '0') or 0; f:close() end
+    end)
+    if when <= 0 then return end
+    local ago = os.time() - when
+    local reuse = DI.ASSUME_SPENT / 1000
+    if ago >= 0 and ago < reuse then
+        DI.assumeSpentUntil = mq.gettime() + ((reuse - ago) * 1000)
+        rezlog('\\ay[di] my staff was fired %ds ago (before this restart) - treating it as spent for %ds\\ax',
+               ago, reuse - ago)
+    end
+end
+
 function di_read_self()
     local staff = di_raw_staff()
     -- ONCE, ON EVERY TOON. This used to sit inside the cleric-only block, so the only staff we ever saw
@@ -3156,6 +3194,8 @@ function di_read_self()
     if not DI.saidStaffReads then
         DI.saidStaffReads = true
         rezlog('[di] staff reads at load: %s', di_staff_reads())
+        -- Every one of those reads says ready at load whether or not it is, so put back what we know.
+        di_staff_stamp_read()
     end
     -- I FIRED IT, SO IT IS SPENT UNTIL PROVEN OTHERWISE. TimerReady can keep reading 0 for tens of seconds
     -- after the staff has actually gone on reuse - see ASSUME_SPENT. Trusting that stale zero is what let
@@ -3242,6 +3282,34 @@ function di_read_self()
 end
 
 -- The group's tank (same rule the XTarget code uses).
+-- Runs on the CASTER after it fires. Answers "did my cast actually start" from local reads, and tells
+-- the tank at once if it did not - which is far faster than the tank timing out.
+function diq_self_check()
+    local s = DIQ.self
+    if not s then return end
+    -- Casting means it went out. Nothing more to watch here; the normal verify owns what happens next.
+    local casting = 0
+    pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+    if casting > 0 then DIQ.self = nil; return end
+    -- ItemReady flipping false is the other proof - a boolean, so it cannot lag the way a countdown does.
+    if DI.itemReadyWorks and not tlo_true(DI.itemReady) then DIQ.self = nil; return end
+    -- AND THE COOLDOWN ITSELF STARTING, which is the most direct proof of all: if the thing went off, its
+    -- reuse is now counting. Better than watching Me.Casting for a spell or an AA, where the cast can be
+    -- over before we next look - the cooldown stays visible for minutes afterwards.
+    local secs = di_raw_staff()
+    if secs > 0 then DIQ.self = nil; return end
+    -- Give it a moment: a cast does not register in the same instant the command is sent.
+    if (mq.gettime() - s.at) < DIQ_SELF_MS then return end
+    -- Neither signal ever appeared. The cast did not happen.
+    rezlog('\\ay[diq] my cast never started - telling %s to ask somebody else\\ax', s.tank)
+    pcall(function() peer_cmdf(s.tank, '/at_diack %s no cast-never-started', myName) end)
+    DIQ.self = nil
+    DI.watch = nil                 -- nothing to verify; do not hold the slot for 45s
+    DI.assumeSpentUntil = nil      -- and it was not spent, so do not pretend it was
+    DI.pushNow = true              -- correct the record as promptly as we spoiled it
+    pcall(function() os.remove(di_staff_stamp_path()) end)   -- nor across a restart
+end
+
 -- Runs on the TANK, every tick. This is the whole fast path.
 function diq_tick()
     local tank = di_tank()
@@ -3271,6 +3339,7 @@ function diq_tick()
                    haveSave and '' or ' (out of combat)', (mq.gettime() - DIQ.startedAt) / 1000)
             pcall(function() peer_bcast('/at_disaved %d', DI.SAVED_HOLD) end)
             DIQ.active, DIQ.asked, DIQ.tried, DIQ.casting = false, nil, {}, nil
+            DIQ.saidLong = nil
             DIQ.exhaustedUntil = nil
         end
         return
@@ -3286,15 +3355,18 @@ function diq_tick()
         rezlog('[diq] my save is down - asking the group')
     end
 
-    -- CEILING. If this has not produced a save in DIQ_GIVEUP_MS, stop and let the old ladder try. It is
-    -- the backup for exactly this case, and it stays until this path has earned the right to be alone.
+    -- NOTHING TO HAND OVER TO. This used to stop after DIQ_GIVEUP_MS and let the old ladder try - but the
+    -- ladder is gone, so stopping meant the tank simply gave up while still uncovered. On 2026-08-14
+    -- 06:04:54 it announced "handing over to the old ladder" and then nothing happened at all.
+    -- Keep asking instead. An emergency does not stop being an emergency because it has lasted a while,
+    -- and the backoff below already stops this from spinning when nobody can help.
     if (mq.gettime() - DIQ.startedAt) > DIQ_GIVEUP_MS then
-        if DIQ.active then
-            rezlog('\\ay[diq] no save after %.0fs - handing over to the old ladder\\ax',
-                   DIQ_GIVEUP_MS / 1000)
+        if not DIQ.saidLong then
+            DIQ.saidLong = true
+            rezlog('\\ay[diq] still no save after %.0fs - still asking\\ax', DIQ_GIVEUP_MS / 1000)
         end
-        DIQ.active, DIQ.asked = false, nil
-        return
+        -- A fresh round: anyone who declined a while ago may have come off cooldown since.
+        DIQ.tried, DIQ.startedAt = {}, mq.gettime()
     end
 
     -- A CLAIM OUTRANKS EVERYTHING. Somebody is mid-cast; asking a second character or falling through to
@@ -3525,6 +3597,9 @@ DIQ_CAST_MS = 15000
 -- How long to stay quiet after finding that nobody has anything. Long enough that the staff chain gets a
 -- clear run, short enough that a save coming off cooldown is picked up quickly.
 DIQ_EXHAUST_MS = 4000
+-- How long to give a cast to show ANY sign of starting. Casting state and ItemReady both move within a
+-- few hundred milliseconds of a real cast; this is generous against that.
+DIQ_SELF_MS = 1500
 DIQ_GIVEUP_MS = 8000    -- whole-emergency ceiling; past this, let the old ladder have it
 
 -- What to ask for, best first. Ordering only - the asked character has the final word.
@@ -3535,13 +3610,17 @@ function diq_candidates()
             local age = (mq.gettime() - (s.updated or 0)) / 1000
             -- A report older than a minute is not evidence of anything; ask anyway, but last.
             local stale = (age > 60) and 1 or 0
-            -- Prefer a cleric save, then the staff. dgReady is the Divine Guardian flag.
+            -- ORDER, NEVER EXCLUDE. This used to drop anyone whose last report showed nothing ready, so
+            -- they were never asked at all - and on 2026-08-14 13:17 the tank went straight past Ejtou to
+            -- Shela's staff without ever finding out whether Ejtou's gem save had come back.
+            -- That is the polled state DECIDING, which is the one thing it must not do: it is up to 20
+            -- seconds old, and the whole design rests on the asked character checking locally and having
+            -- the final word. A poor report should put somebody last, not remove them.
+            -- dgReady covers all three cleric rungs, not just the AA - it is computed from di_rung_list.
             local rank = 0
             if (s.dgReady or 0) == 1 then rank = rank + 2 end
             if (s.staff or -1) == 0 then rank = rank + 1 end
-            if rank > 0 or stale == 1 then
-                out[#out + 1] = { nm = nm, rank = rank - stale * 3, age = age }
-            end
+            out[#out + 1] = { nm = nm, rank = rank - stale * 3, age = age }
         end
     end
     table.sort(out, function(a, b)
@@ -3604,6 +3683,29 @@ function di_announce(r, tank)
     pcall(function() peer_cmdf(tank or '', '/at_diclaim %s %s', myName, (r.name or '?'):gsub(' ', '_')) end)
 end
 
+-- DID I JUST FIRE THIS? The stamp was written for every rung but only ever READ for the cleric spell,
+-- so the AA and the boots had no guard at all - and TimerReady reads 0 for a while after a real fire,
+-- exactly as it does for the staff. Ejtou claimed the boots twice 26 seconds apart on 2026-08-14 12:47
+-- for that reason.
+-- The reuse comes from whichever read applies to the thing: an item carries it on its clicky, an AA on
+-- the ability, a spell on the spell. If none of them answers, fall back to a flat minute - long enough
+-- to cover the lag, short enough that a genuinely ready rung is not held back for long.
+function di_rung_spent(name, kind)
+    local fired = DI.rungFiredAt and DI.rungFiredAt[name]
+    if not fired then return false end
+    local rc = 0
+    if kind == 'Item' then
+        pcall(function() rc = tonumber(mq.TLO.FindItem('=' .. name).Clicky.TimerID()) or 0 end)
+    elseif kind == 'Alt' then
+        pcall(function() rc = tonumber(mq.TLO.Me.AltAbility(name).MyReuseTime()) or 0 end)
+        if rc <= 0 then pcall(function() rc = tonumber(mq.TLO.Me.AltAbility(name).ReuseTime()) or 0 end) end
+    else
+        pcall(function() rc = tonumber(mq.TLO.Spell(name).RecastTime()) or 0 end)
+    end
+    if rc <= 0 then rc = 60 end
+    return (mq.gettime() - fired) < (rc * 1000)
+end
+
 function di_rung_list()
     local out = {}
     -- RUNG 1 - the cleric's save spell: whichever of Divine Redemption / Divine Intervention is IN A GEM.
@@ -3635,13 +3737,7 @@ function di_rung_list()
             -- I FIRED IT, SO IT IS SPENT UNTIL PROVEN OTHERWISE. Same rule the staff already uses, for
             -- the same reason: a state read taken right after an action can lag or lie, and the cost of
             -- believing "ready" wrongly here is casting a death save on a loop forever.
-            local spent = false
-            local fired = DI.rungFiredAt and DI.rungFiredAt[nm]
-            if fired then
-                local rc = 0
-                pcall(function() rc = tonumber(mq.TLO.Spell(nm).RecastTime()) or 0 end)
-                if rc > 0 and (mq.gettime() - fired) < (rc * 1000) then spent = true end
-            end
+            local spent = di_rung_spent(nm, 'Spell')
             local ready = rdy and not spent
             -- SAY THE INPUTS when the verdict changes. Three rounds were lost on the placate ceiling
             -- guessing at reads instead of printing them; this one prints them.
@@ -3666,7 +3762,8 @@ function di_rung_list()
         if rank > 0 then
             local s = -1
             pcall(function() s = tonumber(mq.TLO.Me.AltAbilityTimer(DI.DG_AA).TotalSeconds()) or -1 end)
-            out[#out + 1] = { name = DI.DG_AA, kind = 'Alt', ready = (s == 0) }
+            out[#out + 1] = { name = DI.DG_AA, kind = 'Alt',
+                              ready = (s == 0) and not di_rung_spent(DI.DG_AA, 'Alt') }
         end
     end
     -- RUNG 3 - the boots, if we carry them. ID proves ownership, TimerReady is the cooldown.
@@ -3675,7 +3772,8 @@ function di_rung_list()
         if id > 0 then
             local t = -1
             pcall(function() t = tonumber(mq.TLO.FindItem('=' .. DI.DG_BOOT).TimerReady()) or -1 end)
-            out[#out + 1] = { name = DI.DG_BOOT, kind = 'Item', ready = (t == 0) }
+            out[#out + 1] = { name = DI.DG_BOOT, kind = 'Item',
+                              ready = (t == 0) and not di_rung_spent(DI.DG_BOOT, 'Item') }
         end
     end
     return out
@@ -6259,14 +6357,26 @@ end
         -- Offered only when no cleric rung is left, which preserves the ladder's order - the staff is the
         -- expensive one and stays last.
         if not best then
+            -- THREE OPINIONS, NOT ONE. Accepting on TimerReady alone is how Ehaba said yes on 2026-08-14
+            -- 06:04:46 with its staff on cooldown - it fired, nothing landed, and the tank spent thirty
+            -- seconds discovering that. TimerReady returns NULL for transient reasons and `or 0` turns
+            -- that into "ready", which is the single read that cannot be trusted on its own.
+            -- All three were in the old commit and I carried only the first across when the ask replaced
+            -- it. The old comment put the asymmetry exactly right: being wrongly told we are busy costs a
+            -- turn that passes anyway, being wrongly told we are ready costs a charge.
             local secs = di_raw_staff()
             local em = 0
             pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
-            -- assumeSpentUntil is the honest brake: TimerReady reads 0 for tens of seconds after a real
-            -- fire, and trusting that zero is what let one toon commit twice for a single charge.
             local assumed = DI.assumeSpentUntil and mq.gettime() < DI.assumeSpentUntil
+            -- ItemReady is a boolean rather than a countdown, so it cannot go stale the way a ticking
+            -- timer can. Only consulted once it has been seen working on this client.
+            local itemSaysNo = DI.itemReadyWorks and not tlo_true(DI.itemReady)
+            -- My own last PUSHED reading is an independent sample from an earlier poll. Requiring it to
+            -- agree costs nothing and cannot be fooled by one bad read.
+            local mine = DI.state[myName]
+            local reportSaysNo = mine and (mine.staff or 0) > 0
             -- Two emeralds are spent per cast, so anything less cannot fire.
-            if secs == 0 and not assumed and em >= 2 then
+            if secs == 0 and not assumed and not itemSaysNo and not reportSaysNo and em >= 2 then
                 best = { name = DI.STAFF, kind = 'Item', staff = true }
             end
         end
@@ -6276,13 +6386,20 @@ end
             -- Each of these is a local read that already happened above, so naming it costs nothing.
             local why = {}
             for _, r in ipairs(di_rung_list()) do
-                if not r.ready then why[#why + 1] = (r.name):gsub(' ', '-') .. '-cd' end
+                if not r.ready then
+                    local tag = di_rung_spent(r.name, r.kind) and '-just-fired' or '-cd'
+                    why[#why + 1] = (r.name):gsub(' ', '-') .. tag
+                end
             end
             local secs = di_raw_staff()
             if secs > 0 then why[#why + 1] = 'staff-' .. secs .. 's'
             elseif secs < 0 then why[#why + 1] = 'no-staff'
             elseif DI.assumeSpentUntil and mq.gettime() < DI.assumeSpentUntil then
                 why[#why + 1] = 'staff-just-fired'
+            elseif DI.itemReadyWorks and not tlo_true(DI.itemReady) then
+                why[#why + 1] = 'staff-ItemReady-no'
+            elseif DI.state[myName] and (DI.state[myName].staff or 0) > 0 then
+                why[#why + 1] = 'staff-report-' .. DI.state[myName].staff .. 's'
             else
                 local em = 0
                 pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
@@ -6323,10 +6440,20 @@ end
             DI.watch = { at = mq.gettime(), em = em, tank = tank, tries = 1,
                          saveWas = (DI.state[tank] or {}).saveName }
             DI.assumeSpentUntil = mq.gettime() + DI.ASSUME_SPENT
+            di_staff_stamp_write()   -- so a restart still knows this happened
+            DI.pushNow = true        -- and say so at once; the client's timers will not
+            -- DID IT ACTUALLY GO OUT? Two local reads answer that in about a second, and neither of them
+            -- has anything to do with whether the save eventually lands on the tank - which is the slow
+            -- question the 45s watch is for.
+            -- Without this the tank has to infer a dud by waiting out its whole ceiling: on 2026-08-14
+            -- 13:23 Ejtou claimed the staff, nothing went out, and fifteen seconds passed before anybody
+            -- tried Azyue. The character that fired knew immediately.
+            DIQ.self = { at = mq.gettime(), tank = tank, saw = false }
             DI.trigAt, DI.turnAt = 0, nil
         else
             DI.rungFiredAt = DI.rungFiredAt or {}
             DI.rungFiredAt[best.name] = mq.gettime()
+            DI.pushNow = true          -- say so at once; the timers will not
             local spec = string.format(DI.RUNG_OPTS, best.name, best.kind, tank)
             pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
         end
@@ -6339,6 +6466,40 @@ end
     -- SOMEBODY IS CASTING A SAVE ON ME. Hold everything until it has had time to land: no asking anyone
     -- else, and no handing over to the old ladder. The claim is the only reason to wait, and it expires
     -- on its own if the cast comes to nothing.
+    -- WHAT DOES THE STAFF ACTUALLY READ, RIGHT NOW?
+    --   /atstaff        this character
+    --   /atstaff all    every character in the group answers into its own log
+    -- Every raw read side by side with what AdventureTime concludes from them, so a disagreement between
+    -- "the client says ready" and "we decided ready" is visible rather than inferred.
+    -- Worth having as a command rather than only at load: the load-time reading is the SUSPECT one -
+    -- every character reports TimerReady=0 ItemReady=true there, including ones whose staff is certainly
+    -- on cooldown - and the question is whether that ever corrects itself.
+    mq.bind('/atstaff', function(scope)
+        if scope and tostring(scope):lower() == 'all' then
+            pcall(function() peer_bcast('/atstaff') end)
+        end
+        log('[staff] raw: %s', di_staff_reads())
+        -- AT's own view, which is what actually decides
+        local secs   = di_raw_staff()
+        local assume = DI.assumeSpentUntil and math.max(0, DI.assumeSpentUntil - mq.gettime()) or 0
+        local mine   = DI.state[myName]
+        local em = 0
+        pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
+        log('[staff] AT sees: di_raw_staff=%ss | assumeSpent=%.0fs | myReport=%s | emeralds=%d | itemReadyWorks=%s',
+            tostring(secs), assume / 1000,
+            mine and tostring(mine.staff) or 'none', em, tostring(DI.itemReadyWorks))
+        -- And the verdict the ask would give, with the reason.
+        local itemSaysNo   = DI.itemReadyWorks and not tlo_true(DI.itemReady)
+        local reportSaysNo = mine and (mine.staff or 0) > 0
+        local ok = (secs == 0) and assume == 0 and not itemSaysNo and not reportSaysNo and em >= 2
+        log('[staff] would I accept an ask? %s%s', ok and 'YES' or 'NO',
+            ok and '' or string.format('  (%s%s%s%s%s)',
+                (secs ~= 0) and ('timer=' .. tostring(secs) .. ' ') or '',
+                (assume > 0) and 'just-fired ' or '',
+                itemSaysNo and 'ItemReady-false ' or '',
+                reportSaysNo and 'my-report-says-busy ' or '',
+                (em < 2) and 'no-emeralds' or ''))
+    end)
     mq.bind('/at_diclaim', function(who, what)
         if not who then return end
         -- IT IS HANDLED. No per-cast-type window, because there is nothing to time: a character that
@@ -6360,6 +6521,13 @@ end
                 DIQ.tried[who:lower()] = true
                 DIQ.asked = nil
             end
+        elseif DIQ.casting and who:lower() == DIQ.casting:lower() and verdict ~= 'yes' then
+            -- A character that CLAIMED and then found its cast never started. Releasing the claim here is
+            -- the whole saving: without it the tank waits out DIQ_CAST_MS for something already known to
+            -- have failed.
+            rezlog('[diq] %s could not cast after all (%s) - moving on now', who, tostring(what or '?'))
+            DIQ.tried[who:lower()] = true
+            DIQ.casting, DIQ.asked = nil, nil
         end
     end)
     mq.bind('/at_disaved', function(ms)
@@ -7997,9 +8165,45 @@ function draw_di_save_line()
     if not ds then
         ImGui.TextDisabled(tank .. ': no report')
     elseif ds.saveUp == 1 then
-        ImGui.TextColored(0.35, 0.90, 1.00, 1.0, tank .. ' has a save')
+        -- NAME IT. 'has a save' does not tell you whether that is the thirty-second Guardian or a real
+        -- Divine Intervention, and those are very different amounts of comfort - the tank already reports
+        -- saveName, it simply was not being shown.
+        -- Shortened the way the announce does, because the panel is narrow and 'Divine Intervention'
+        -- pushes everything else off the row.
+        local nm = tostring(ds.saveName or '')
+        local short = (nm == 'Divine Intervention') and 'DI'
+                   or (nm == 'Divine Redemption') and 'DR'
+                   or (nm == 'Divine Guardian') and 'Guardian'
+                   or (nm ~= '' and nm) or 'a save'
+        ImGui.TextColored(0.35, 0.90, 1.00, 1.0, string.format('%s: %s', tank, short))
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() and nm ~= '' then
+            pcall(function() ImGui.SetTooltip(tank .. ' is carrying ' .. nm) end)
+        end
     else
         ImGui.TextDisabled(tank .. ': no save')
+    end
+    -- OFF SWITCH, ON THE ROW YOU ALREADY WATCH. Worth having anywhere, and worth having HERE once DI runs
+    -- outside combat: the moment you want it off is the moment something is behaving oddly, and hunting
+    -- through Settings for it is the wrong experience at that moment.
+    -- PLAIN SameLine, NOT one positioned from the window width. Placing at GetWindowWidth() - 46 extends
+    -- the content width to that point, which grows the window, which moves the position further right on
+    -- the next frame - and the window creeps wider every frame it is drawn.
+    -- Exactly the drift the CoTH status text caused in 1.07.8, fixed the same way: stop deriving a
+    -- position from the size the position affects.
+    ImGui.SameLine()
+    if DI.auto then
+        ImGui.PushStyleColor(ImGuiCol.Text, 0.45, 0.82, 0.50, 1.0)
+        if ImGui.SmallButton('DI on##ditoggle') then DI.auto = false; save_settings() end
+        ImGui.PopStyleColor()
+    else
+        ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.55, 0.45, 1.0)
+        if ImGui.SmallButton('DI OFF##ditoggle') then DI.auto = true; save_settings() end
+        ImGui.PopStyleColor()
+    end
+    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+        pcall(function() ImGui.SetTooltip(DI.auto
+            and 'DI is running - click to stop it asking for saves'
+            or  'DI is OFF - nothing will be asked for or cast') end)
     end
 end
 
@@ -15023,9 +15227,22 @@ while running do
         -- without a gap leaves saveUp at 1 the whole time, and that swap is exactly the event the
         -- verdict needs to see.
         local key = string.format('%d/%d/%d/%d/%s', (a == 0) and 0 or 1, b, c, d, tostring(e or '-'))
-        if key ~= DI.key or (mq.gettime() - DI.lastPush) > (ic and 4000 or 20000) then
+        -- PUSH AFTER AN ACTION, WHATEVER THE READS SAY.
+        -- The key is built from the client's own timers, and those are exactly what does not move when we
+        -- fire something - TimerReady and Timer both sit at 0 for a while, and at load both read 0 even on
+        -- a staff that is minutes into reuse. So firing changes nothing the key can see, no push goes out,
+        -- and the tank keeps ranking this character on a picture taken before the cast.
+        -- We do not need the client to tell us what we just did. DI.pushNow is set by every fire, and it
+        -- forces one push through - which is the moment the information is most worth having and least
+        -- likely to be in the reads.
+        if DI.pushNow or key ~= DI.key or (mq.gettime() - DI.lastPush) > (ic and 4000 or 20000) then
+            DI.pushNow = nil
             DI.key, DI.lastPush = key, mq.gettime()
-            DI.state[myName] = { staff = a, emeralds = b, dgReady = c, saveUp = d, updated = mq.gettime() }
+            -- saveName TOO. The peer path has always carried it and this one never did, so every
+            -- character had a name for everybody else's save and none for its own - and the tank reads
+            -- its OWN entry, which is why the panel said 'a save' instead of 'DI'.
+            DI.state[myName] = { staff = a, emeralds = b, dgReady = c, saveUp = d,
+                                 saveName = (e and e ~= '') and e or nil, updated = mq.gettime() }
             -- The save NAME goes last, so a peer on an older build simply reads nil and behaves as before.
             peer_bcast('/at_di %s %d %d %d %d %s', myName, a, b, c, d, (e and e ~= '') and e:gsub(' ', '_') or '-')
             -- Say it ONCE. Peers keep reporting they have never heard from the tank; I have twice now
@@ -15065,6 +15282,8 @@ while running do
         -- It runs BEFORE di_tick so that when it is working, the old ladder sees a covered tank and never
         -- reaches for anything - the stand-down it broadcasts is the same one the ladder already honours.
         atphase('diq')
+        local oks, errs = pcall(diq_self_check)
+        if not oks then log('\\ar[diq] self-check error: %s\\ax', tostring(errs)) end
         local okq, errq = pcall(diq_tick)
         if not okq then log('\\ar[diq] error: %s\\ax', tostring(errq)) end
         local ok, err = pcall(di_tick)
@@ -15242,6 +15461,7 @@ pcall(function() mq.unbind('/at_distaffprobe') end)
 pcall(function() mq.unbind('/at_distaffreport') end)
 pcall(function() mq.unbind('/at_diack') end)
 pcall(function() mq.unbind('/at_diclaim') end)
+pcall(function() mq.unbind('/atstaff') end)
 pcall(function() mq.unbind('/at_disaved') end)
 pcall(function() mq.unbind('/at_dineed') end)
 pcall(function() mq.unbind('/at_didone') end)
