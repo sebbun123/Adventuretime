@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.09'
-local BUILD_TAG = '1.09'  -- bump on every change; prints on startup
+VERSION = '1.10'
+local BUILD_TAG = '1.10'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -1044,6 +1044,30 @@ end
 -- NOTE: this REPLACES the counts table, it does not merge into it. Anything not in `items` is gone
 -- afterwards - so this is a full-refresh call and a partial list will blank every other row on the
 -- board. Pass all_items() unless you genuinely want everything else discarded.
+-- ===== PUSHED COUNTS =====
+-- A worker counting its OWN bags is a local read: instant, and it already knows when the number changed.
+-- The dquery pass below asks the driver to pull the same information 90 queries at a time, which measured
+-- 5.5 seconds every startup - and the comment on dannet_query explains why it was built that way: it
+-- works on a peer that is NOT running AdventureTime.
+-- That fallback is worth keeping, but it is not the usual case: the driver launches a worker on every
+-- group member. So push when we can and pull only for whoever did not report - the same split the burn
+-- poll has used all along, and what makes the aug table fill instantly.
+-- INDEXES, NOT NAMES, on the wire: the item list is fixed and ordered, and 'Draught of Shimmering
+-- Reflection II' would otherwise be split across arguments the moment it hit a bind.
+countsPush = {}      -- [peerlower] = { [item] = n, at = gettime }
+countsPushAt, countsPushLast = 0, ''   -- worker side: when we last pushed, and what we sent
+COUNTS_FRESH = 90000 -- a push older than this is not trusted; the pass re-pulls that peer
+
+function counts_push_blob()
+    local parts = {}
+    for i, it in ipairs(ITEMS) do
+        local n = my_count(it)
+        if n > 0 then parts[#parts + 1] = i .. ':' .. n end
+    end
+    -- Only non-zero entries travel. Everything absent is zero, which is most of the list on most toons.
+    return (#parts > 0) and table.concat(parts, ',') or '-'
+end
+
 local function query_all_counts(peers, items)
     counts = { [myName:lower()] = { __got = true, __class = mq.TLO.Me.Class.ShortName() or '?' } }
     for _, it in ipairs(items) do counts[myName:lower()][it] = my_count(it) end
@@ -1052,6 +1076,32 @@ local function query_all_counts(peers, items)
         for _, p in ipairs(peers) do counts[p:lower()].__got = true end
         return
     end
+
+    -- TAKE THE PUSHES FIRST, QUERY ONLY WHAT IS LEFT.
+    -- A worker that reported recently has already done this work locally, and its answer is better than
+    -- ours would be - it counted its own bags rather than us asking across the network 18 times.
+    -- Only peers with no recent push get queried, which on a normal group is none of them: the pass goes
+    -- from 90 queries to zero without losing the ability to read a peer that is not running the script.
+    local need, fromPush = {}, 0
+    for _, p in ipairs(peers) do
+        local pu = countsPush[p:lower()]
+        if pu and (mq.gettime() - (pu.at or 0)) < COUNTS_FRESH then
+            for _, it in ipairs(items) do counts[p:lower()][it] = pu[it] or 0 end
+            counts[p:lower()].__got = true
+            fromPush = fromPush + 1
+        else
+            need[#need + 1] = p
+        end
+    end
+    if #need == 0 then
+        log('[counts] %d peer(s) from their own reports - no queries needed', fromPush)
+        return
+    end
+    if fromPush > 0 then
+        log('[counts] %d peer(s) reported; querying the other %d', fromPush, #need)
+    end
+    peers = need
+
     local t0all = mq.gettime()
     -- Ask the group to hold its chatter. Generous window, refreshed below if the pass runs long.
     pcall(function() peer_bcast('/at_quiet %d', 15000) end)
@@ -2970,7 +3020,13 @@ DI = {
     -- (21:48:49 and again at 21:48:55, the first landing at 21:48:56). The cost of erring long is small,
     -- because the tank-save gate runs BEFORE the ladder - once a save lands the ladder is not reached at
     -- all, so this only delays the case where the rung genuinely did nothing.
-    RUNG_GAP = 12000,
+    -- 6s, NOT 12. This gap only ever costs time when a rung FAILS: the tank-save gate runs before the
+    -- ladder and exits the moment a save appears, so a rung that works never waits this out.
+    -- The number to cover is therefore the DETECTION lag, not the worst case ever observed - and the
+    -- comment below records that measured lag as under four seconds.
+    -- What it was really protecting against was firing again at a tank that was already covered, and
+    -- 1.09.13 now re-checks that immediately before spending a rung. The gap no longer has to do that job.
+    RUNG_GAP = 6000,
     -- How long SpellReady must stay false before it is believed. A real cooldown holds it false for
     -- minutes; a global cooldown or an in-flight cast blinks it for well under a second.
     -- A gem within this many seconds of ready counts as ready. Above it, something genuinely cast it -
@@ -2981,7 +3037,13 @@ DI = {
     -- lagged 29s in an earlier session. At a flat 12s the boots were re-cast one second before the first
     -- one registered. One gap cannot serve both, and erring long is cheap: the tank-save gate runs before
     -- the ladder, so a landed save means the ladder is never reached and this delay never applies.
-    RUNG_GAP_ITEM = 25000,
+    -- 10s, NOT 25. Same reasoning, with more room because the boots' own cooldown read is the slow one.
+    -- The 25 came from two outlier observations - 13s once, 29s another time - but both were measured in
+    -- sessions where the ladder was firing at an ALREADY-COVERED tank, so no new save could ever appear
+    -- and the wait was always going to run out in full. That case is fixed; the outliers were the bug.
+    -- The cost of being wrong here is one duplicate save. The cost of being wrong the other way is the
+    -- tank standing uncovered for 25 seconds, which is a wipe.
+    RUNG_GAP_ITEM = 10000,
     -- How long to treat MY staff as spent after I fire it, regardless of what TimerReady says - and that
     -- read has to be treated as untrustworthy, not merely laggy. On 2026-07-30 Nityrc reported staff=0 for
     -- 88 consecutive seconds while genuinely 1408s into reuse, on both the live read AND the pushed sample,
@@ -3180,6 +3242,83 @@ function di_read_self()
 end
 
 -- The group's tank (same rule the XTarget code uses).
+-- Runs on the TANK, every tick. This is the whole fast path.
+function diq_tick()
+    local tank = di_tank()
+    if not tank or tank:lower() ~= myName:lower() then return end   -- only the tank drives this
+    -- DI.auto, NOT diOn. There is no such variable as diOn anywhere in this file - it was nil, so this
+    -- returned on every single call and the whole fast path never ran once on 1.09.16. Nothing errored,
+    -- nothing logged; it simply did nothing, which is the hardest kind of wrong to notice.
+    if not DI.auto then return end
+
+    local inCombat = false
+    pcall(function() inCombat = (tostring(mq.TLO.Me.CombatState() or ''):upper() == 'COMBAT') end)
+
+    -- MY OWN SAVE, READ LOCALLY. No report, no lag - this is the fact the whole system turns on and the
+    -- tank is the only character that has it immediately.
+    local haveSave = false
+    for _, b in ipairs(DI.SAVES) do
+        local up = false
+        pcall(function() up = (tonumber(mq.TLO.Me.Buff(b).ID()) or 0) > 0 end)
+        if up then haveSave = true; break end
+    end
+
+    if haveSave or not inCombat then
+        if DIQ.active then
+            -- Covered, or the fight is over. Tell everyone to stand down so nobody spends a second save
+            -- on the strength of a report that has not caught up yet.
+            rezlog('[diq] covered%s - standing the group down after %.1fs',
+                   haveSave and '' or ' (out of combat)', (mq.gettime() - DIQ.startedAt) / 1000)
+            pcall(function() peer_bcast('/at_disaved %d', DI.SAVED_HOLD) end)
+            DIQ.active, DIQ.asked, DIQ.tried, DIQ.casting = false, nil, {}, nil
+            DIQ.exhaustedUntil = nil
+        end
+        return
+    end
+
+    -- Still standing back from an exhausted round.
+    if DIQ.exhaustedUntil and mq.gettime() < DIQ.exhaustedUntil then return end
+
+    -- No save, in combat. Start asking.
+    if not DIQ.active then
+        DIQ.active, DIQ.tried, DIQ.startedAt = true, {}, mq.gettime()
+        DIQ.asked = nil
+        rezlog('[diq] my save is down - asking the group')
+    end
+
+    -- CEILING. If this has not produced a save in DIQ_GIVEUP_MS, stop and let the old ladder try. It is
+    -- the backup for exactly this case, and it stays until this path has earned the right to be alone.
+    if (mq.gettime() - DIQ.startedAt) > DIQ_GIVEUP_MS then
+        if DIQ.active then
+            rezlog('\\ay[diq] no save after %.0fs - handing over to the old ladder\\ax',
+                   DIQ_GIVEUP_MS / 1000)
+        end
+        DIQ.active, DIQ.asked = false, nil
+        return
+    end
+
+    -- A CLAIM OUTRANKS EVERYTHING. Somebody is mid-cast; asking a second character or falling through to
+    -- the ladder now is how one emergency costs two saves.
+    if DIQ.casting then
+        if (mq.gettime() - DIQ.castAt) < DIQ_CAST_MS then return end
+        -- Reaching here means a cast that was claimed never produced a save in fifteen seconds. That is
+        -- a failure worth seeing rather than a routine step.
+        rezlog('\\ay[diq] %s claimed a cast %.0fs ago and no save ever appeared - trying somebody else\\ax',
+               DIQ.casting, (mq.gettime() - DIQ.castAt) / 1000)
+        DIQ.tried[DIQ.casting:lower()] = true
+        DIQ.casting, DIQ.asked = nil, nil
+    end
+
+    -- Waiting on an answer? A 'no' clears DIQ.asked immediately; this only catches silence.
+    if DIQ.asked then
+        if (mq.gettime() - DIQ.at) < DIQ_ANSWER_MS then return end
+        rezlog('[diq] %s did not answer in %dms - next', DIQ.asked, DIQ_ANSWER_MS)
+        DIQ.tried[DIQ.asked:lower()] = true
+        DIQ.asked = nil
+    end
+    diq_ask_next(tank)
+end
+
 function di_tank()
     for _, nm in ipairs(rezPriority) do
         if rez_rank(member_class(nm)) == 1 then return nm end
@@ -3205,85 +3344,13 @@ function di_target_desc(tid, want)
     return string.format('id=%d -> %s [%s] @%dm (%s, wanted %s)', tid, nm, ty, dist, ok, want or '?')
 end
 
--- ===== BATON STATE =====
--- Who currently owns the DI staff turn. Everyone defaults to the front of the ring, so six toons that have
--- never spoken to each other still agree without a negotiation. It moves only when the holder proves it
--- cannot fire - which for a ~30 minute reuse means a handful of times an hour.
-function di_baton_valid(order)
-    if not DI.baton or DI.baton == '' then return false end
-    for _, nm in ipairs(order) do if nm:lower() == DI.baton:lower() then return true end end
-    return false                                    -- holder left the group / is no longer a rezzer
-end
 
-function di_baton_set(who, why)
-    if not who or who == '' then return end
-    if DI.baton and DI.baton:lower() == who:lower() then return end
-    DI.baton = who
-    rezlog('[di] baton -> %s (%s)', who, why or 'passed')
-    peer_bcast('/at_dibaton %s', who)
-end
 
 -- A staff came back up. Pull the baton forward to that toon if they sit earlier in the ring than whoever
 -- holds it now - the ring belongs at the front, and a returning staff is the only thing that should move it
 -- backwards. Same rule locally and remotely so every client reaches the same answer from the same fact.
-function di_baton_back(who)
-    if not who or who == '' then return end
-    local order, wi, bi = di_order(), nil, nil
-    for i, nm in ipairs(order) do
-        if nm:lower() == who:lower() then wi = i end
-        if nm:lower() == (DI.baton or ''):lower() then bi = i end
-    end
-    if wi and (not bi or wi < bi) then
-        DI.baton = who
-        rezlog('[di] baton -> %s (its staff is back up)', who)
-    end
-end
 
--- Hand it to the next toon in the ring who could ACTUALLY FIRE. Passing blindly to the next name is what
--- put the baton in an infinite loop on 2026-07-30: with all six staves on cooldown, every toon received it,
--- saw its own staff was down, passed it on, and got it back one circuit later - a permanent storm of passes
--- and broadcasts that never settled. A pass to somebody who also cannot act achieves nothing.
--- Peer staff timers are read here ONLY to choose where to send it, never to decide whether to fire - that
--- stays a purely local decision by the holder, which is the whole point of the baton. A wrong guess here is
--- harmless: the receiver simply passes it on when asked to act.
-function di_baton_pass(order, why)
-    local at
-    for i, nm in ipairs(order) do if nm:lower() == (DI.baton or ''):lower() then at = i; break end end
-    at = at or 0
-    local now = mq.gettime()
-    -- TWO PASSES, and the order matters. This used to accept a peer with NO fresh report as a candidate,
-    -- on the reasoning that handing it to someone we cannot see beats parking it. That is backwards: a
-    -- silent peer is the one toon we have positive evidence ISN'T answering. On 2026-07-31 Khulian's
-    -- worker died at 14:28:28 - the sync layer had already logged "silent 18s and failed 2 pings" - and
-    -- the baton was handed to it anyway, with reports 15-28s stale, and the chain stopped there.
-    -- So: look for someone we can actually see and who can actually fire. Only if nobody qualifies do we
-    -- consider the ones we cannot see, because a silent peer is still better than nobody.
-    for _, wantFresh in ipairs({ true, false }) do
-        for step = 1, #order do
-            local cand = order[((at - 1 + step) % #order) + 1]
-            if cand:lower() ~= (DI.baton or ''):lower() then
-                local st = DI.state[cand]
-                local age = st and (now - (st.updated or 0)) or math.huge
-                if wantFresh then
-                    if age < 15000 and di_peer_staff(st) == 0 and (st.emeralds or 0) >= DI.MIN_EMERALDS then
-                        di_baton_set(cand, why); return true
-                    end
-                elseif age >= 15000 then
-                    rezlog('[di] handing the baton to %s despite a %s report - nobody fresher can fire',
-                           cand, (age == math.huge) and 'missing' or string.format('%.0fs old', age / 1000))
-                    di_baton_set(cand, why); return true
-                end
-            end
-        end
-    end
-    -- Nobody in the ring can fire. Keep it rather than spinning; whoever's staff comes back first will
-    -- pull it forward with /at_dibatonback.
-    if (now - (DI.lastParkLog or 0)) > 30000 then
-        DI.lastParkLog = now
-        rezlog('[di] nobody in the ring can fire - parking the baton with %s (%s)', DI.baton or '?', why or '')
-    end
-    return false
-end
+
 
 -- EVERY WAY OF ASKING ABOUT THE STAFF'S COOLDOWN, SIDE BY SIDE. FindItem().TimerReady is one accessor, not
 -- the only one, and it is the one that has lied in four distinct ways in a single night - 0 for 88s while
@@ -3411,6 +3478,132 @@ end
 --   AA    - rank, never the timer (AltAbilityTimer returns 1 for an AA you do not own)
 --   spell - SpellReady, which is false forever for something that is actually an AA
 --   item  - ID first, because TimerReady on an item you lack reads NULL -> 0 -> "ready"
+-- ===== TANK-DRIVEN SAVES =====
+-- THE TANK ASKS; NOBODY INFERS.
+-- The old path has every cleric watching a pushed report of the tank's save, deciding for itself, and
+-- coordinating by baton. That is five deciders working from data that is a second or two stale, and
+-- nearly every bug tonight came from two of them acting on the same emergency - a duplicate staff, the
+-- boots spent on a tank that was already covered.
+-- This has ONE decider, and it is the character that knows first: the tank sees its own save drop with a
+-- local read and no lag at all.
+-- The polled state stops needing to be right. It only orders the candidates; the character actually
+-- ASKED checks locally, which is instant and authoritative, and answers yes or no. A stale guess costs
+-- one round trip instead of a wasted Donal's Boots.
+-- And the waits change character entirely: the old ones sat 12 to 25 seconds waiting for a BUFF TO
+-- BECOME OBSERVABLE, which is slow and ambiguous. This waits for an ANSWER, which is fast and definite -
+-- so the timeout is about a second, and it means "that client is not responding" rather than "I still
+-- cannot tell".
+-- The old ladder stays as a fallback while this is proven, and comes out once it is.
+DIQ = {
+    active   = false,   -- an ask is in flight
+    asked    = nil,     -- who we asked
+    what     = nil,     -- which save we asked for
+    at       = 0,       -- when
+    tried    = {},      -- who has already answered no this emergency
+    startedAt= 0,
+}
+DIQ_ANSWER_MS = 1200    -- how long to wait for a yes/no before treating it as silence
+-- A CLAIM MEANS IT IS HANDLED. FULL STOP.
+-- This was 5000, chosen from how long a cleric's Divine Intervention took to become visible - and it was
+-- immediately wrong for the staff, which takes about 4.4s to land plus detection lag. On 2026-08-14
+-- 05:49 the claim expired at 5.08s and the tank asked the next character, so two staffs went out five
+-- seconds apart for one emergency.
+-- Tuning it per cast type is the wrong shape. A character that said yes is casting; there is nothing to
+-- wait a measured interval for and nothing to second-guess. So this is no longer a window - it is a
+-- CEILING on a cast that has clearly failed, and it is deliberately generous. Reaching it is an
+-- exception, not part of the normal path.
+-- The asking itself stays instant, because a DECLINE is instant: the fast loop is only ever slowed by
+-- somebody who can actually help.
+DIQ_CAST_MS = 15000
+-- THE STAFF GETS LONGER. Measured: it lands 4.2-4.4s after firing, and the save then has to be seen -
+-- so a 5s claim expires a fraction before the tank knows it worked. On 2026-08-14 that gap was 80
+-- milliseconds wide and cost a second staff: Ejtou fired at 05:48:59.28, the claim lapsed at 05:49:04.28,
+-- Shela fired at 05:49:04.37, and the first one landed at 05:49:08.5.
+-- Twelve seconds is comfortably past the observed landing plus the detection lag. The cost of being
+-- generous here is a slower retry if a staff genuinely fails; the cost of being tight is a second staff,
+-- and the staff is the most expensive thing in the group.
+-- How long to stay quiet after finding that nobody has anything. Long enough that the staff chain gets a
+-- clear run, short enough that a save coming off cooldown is picked up quickly.
+DIQ_EXHAUST_MS = 4000
+DIQ_GIVEUP_MS = 8000    -- whole-emergency ceiling; past this, let the old ladder have it
+
+-- What to ask for, best first. Ordering only - the asked character has the final word.
+function diq_candidates()
+    local out = {}
+    for nm, s in pairs(DI.state or {}) do
+        if nm:lower() ~= myName:lower() and not DIQ.tried[nm:lower()] then
+            local age = (mq.gettime() - (s.updated or 0)) / 1000
+            -- A report older than a minute is not evidence of anything; ask anyway, but last.
+            local stale = (age > 60) and 1 or 0
+            -- Prefer a cleric save, then the staff. dgReady is the Divine Guardian flag.
+            local rank = 0
+            if (s.dgReady or 0) == 1 then rank = rank + 2 end
+            if (s.staff or -1) == 0 then rank = rank + 1 end
+            if rank > 0 or stale == 1 then
+                out[#out + 1] = { nm = nm, rank = rank - stale * 3, age = age }
+            end
+        end
+    end
+    table.sort(out, function(a, b)
+        if a.rank ~= b.rank then return a.rank > b.rank end
+        return a.nm < b.nm
+    end)
+    return out
+end
+
+function diq_ask_next(tank)
+    local list = diq_candidates()
+    if #list == 0 then
+        -- BACK OFF, DO NOT SPIN. Clearing active here let the next tick see no save, reset the tried
+        -- list, and ask all five again - twice in two seconds on 2026-08-14 05:31:37.
+        -- If nobody had a save 300ms ago, nobody has one now: cooldowns do not turn over that fast. The
+        -- pause also gives the old ladder and the staff chain room to do their work without this talking
+        -- over them.
+        DIQ.exhaustedUntil = mq.gettime() + DIQ_EXHAUST_MS
+        rezlog('[diq] nobody has a save - standing back %.0fs and letting the staff chain work',
+               DIQ_EXHAUST_MS / 1000)
+        DIQ.active = false
+        return false
+    end
+    local pick = list[1]
+    DIQ.asked, DIQ.what, DIQ.at = pick.nm, 'save', mq.gettime()
+    rezlog('[diq] asking %s for a save on %s (rank %d, report %.0fs old)',
+           pick.nm, tank, pick.rank, pick.age)
+    pcall(function() peer_cmdf(pick.nm, '/at_dineed %s', tank) end)
+    return true
+end
+
+-- WHAT IS ABOUT TO BE CAST, in the group's chat, in the short form you actually track by.
+--   Divine Intervention -> "Casting DI in Gem 1"
+--   Divine Redemption   -> "Casting DR in Gem 1"
+--   the AA              -> "Casting Guardian AA"
+--   the boots           -> "Casting Guardian boots"
+-- Said by the CASTER, because it is the only character that knows which gem its own spell sits in.
+function di_announce(r, tank)
+    -- BY NAME FIRST, kind second. The staff is also kind 'Item', so deciding on kind alone announced it
+    -- as "Guardian boots" - which read like a necro and a wizard casting a cleric item they do not own.
+    -- They were firing their own staffs perfectly correctly; only the label was wrong.
+    local what
+    if r.name == DI.STAFF or r.staff then what = 'DI staff'
+    elseif r.name == 'Divine Intervention' then what = 'DI in Gem ' .. tostring(r.gem or '?')
+    elseif r.name == 'Divine Redemption' then what = 'DR in Gem ' .. tostring(r.gem or '?')
+    elseif r.name == DI.DG_BOOT then what = 'Guardian boots'
+    elseif r.name == DI.DG_AA then what = 'Guardian AA'
+    elseif r.kind == 'Alt'  then what = 'Guardian AA'
+    elseif r.kind == 'Item' then what = 'Guardian boots'
+    else what = r.name end
+    pcall(function() mq.cmdf('/gsay Casting %s on %s', what, tank or '?') end)
+    rezlog('[di] announce: Casting %s on %s', what, tank or '?')
+    -- CLAIM IT WITH THE TANK. A save takes seconds to become visible - the cleric's DI on 2026-08-14
+    -- was cast at 05:26:08.6 and had still not shown at 05:26:11.5 - and during that gap the tank sees no
+    -- save, asks everyone, finds nothing left, and falls through to the staff. Then the DI lands and the
+    -- staff has been spent for nothing.
+    -- Announcing is exactly the right moment to say so, and this function is called by BOTH the old
+    -- ladder and the tank-driven path, so one claim covers both without them having to know about each
+    -- other. That is the part that was missing: two systems, no shared "something is already in flight".
+    pcall(function() peer_cmdf(tank or '', '/at_diclaim %s %s', myName, (r.name or '?'):gsub(' ', '_')) end)
+end
+
 function di_rung_list()
     local out = {}
     -- RUNG 1 - the cleric's save spell: whichever of Divine Redemption / Divine Intervention is IN A GEM.
@@ -3461,7 +3654,9 @@ function di_rung_list()
                        nm, gem, tostring(s), DI.RUNG_READY_SLACK, tostring(spent),
                        ready and 'READY' or 'not ready')
             end
-            out[#out + 1] = { name = nm, kind = 'Spell', ready = ready }
+            -- Carry the gem number: the announce says which gem it came from, which is the one detail
+            -- that lets you follow along on the caster's own bar rather than taking the log's word.
+            out[#out + 1] = { name = nm, kind = 'Spell', ready = ready, gem = gem }
             break                                   -- one or the other is memmed, never both
         end
     end
@@ -3486,327 +3681,35 @@ function di_rung_list()
     return out
 end
 
--- Returns true if the ladder is handling it and the staff chain should stand down this tick.
--- A SELECTOR, NOT A TRANSACTION. Read the cooldowns, cast the first one that is up, done. Everything that
--- used to live here - watches, settles, per-rung verdicts, a skip list, a post-cast hold, strike counters -
--- was machinery I invented to work around state reads that lie right after an action, and every regression
--- on 2026-07-30 came out of that machinery rather than out of the ladder itself. The cooldown read is the
--- state: once a rung is cast its timer starts, so the next tick naturally moves down the list.
-function di_try_rung(tank, tid, now)
-    if DI.ladderOff then return false end          -- testing: force everything through the staff chain
-    if (member_class(myName) or ''):upper() ~= 'CLR' then return false end
 
-    -- LET THE TANK'S FLAG BE THE ANSWER, and give it a moment to catch up. Asking the rung "has your
-    -- cooldown started" worked for the spell and AA rungs (Divine Redemption reported in ~2s, Divine
-    -- Guardian in ~3.5s) but is useless for the BOOTS, because FindItem().TimerReady() lags - the boots sat
-    -- at "cooldown not started yet" for 29 seconds on 2026-07-30, the same lag already documented on the
-    -- staff. And clearing on the cooldown fired a second rung 1.6s before the save became visible, so two
-    -- saves went out for one emergency.
-    -- So: after issuing, sit still for RUNG_GAP. The tank-save gate in di_tick runs BEFORE this function, so
-    -- if the save landed the ladder is never reached at all; if it did not, we move down. Measured lag from
-    -- cast to the flag reading 1 is under four seconds.
-    local gapFor = (DI.rungKind == 'Item') and DI.RUNG_GAP_ITEM or DI.RUNG_GAP
-    if DI.rungAt and (now - DI.rungAt) < gapFor then
-        gate(string.format('%s issued %.0fs ago of %.0fs - waiting for %s to show a save',
-                           DI.rungName or 'a rung', (now - DI.rungAt) / 1000, gapFor / 1000, tank))
-        return true
-    end
-    DI.rungName, DI.rungAt = nil, nil
-
-    for i, r in ipairs(di_rung_list()) do
-        if r.ready then
-            DI.rungName, DI.rungAt, DI.rungKind = r.name, now, r.kind
-            -- RECORD THE FIRE PER RUNG, so di_rung_list can hold it down for its own reuse rather than
-            -- asking a timer that comes straight back as ready. Divine Redemption cannot be observed at
-            -- all - the 2026-07-30 probe read buff=0 song=0 for it - so "did the save land" has no
-            -- answer, and the only honest signal left is "I cast it, so it is spent".
-            DI.rungFiredAt = DI.rungFiredAt or {}
-            DI.rungFiredAt[r.name] = mq.gettime()
-            rezlog('[di] LADDER rung %d: %s on %s | %s', i, r.name, tank, di_target_desc(tid, tank))
-            local spec = string.format(DI.RUNG_OPTS, r.name, r.kind, tank)
-            pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
-            return true
-        end
-    end
-
-    gate('all three cleric saves are down - staff chain')
-    return false                                    -- rungs 1-3 all on cooldown: the staff chain is next
-end
-
+-- di_tick - RETIRED AS A DECIDER.
+-- It used to run the whole show: a save ladder with 12 and 25 second waits per rung, and a baton walked
+-- around the group a hop at a time to decide whose staff went out. Both are gone.
+-- They were removed because two systems deciding the same thing is not a system - it is a race, and
+-- every bug in DI over the last week came out of it: the boots spent on a tank that was already covered,
+-- two staffs for one emergency, and on 2026-08-14 05:39 three characters each believing they held the
+-- baton while the one the tank had actually chosen sat blocked by its own hold.
+-- The tank asks now. It is the only character that knows instantly that it needs a save, the character
+-- it asks checks its own gems and cooldowns locally - which is authoritative and takes about 25ms - and
+-- answers yes or no. See diq_tick.
+-- What is left here is the feign and invis guards, which belong to the character rather than to either
+-- system. The cast VERIFY is untouched and lives in the main loop, so what happens after a staff goes
+-- out is exactly as it was.
 local function di_tick()
     if not DI.auto then return end
-    -- Feigning: same reasoning as the rez chain. Casting DI stands the character up and undoes the feign,
-    -- and the whole point of a DI is to keep somebody alive - spending one at the cost of the caster's
-    -- own life is not a trade worth making. The election passes on.
+    -- Feigning: casting DI stands the character up and undoes the feign, and the whole point of a DI is
+    -- to keep somebody alive - spending one at the cost of the caster's own life is not a trade worth
+    -- making.
     if am_feigning() then
-        gate('feigning - not spending a DI, the chain moves on')
+        gate('feigning - not spending a DI')
         return
     end
-    -- Invis: the same trade as feigning. Casting drops it, and a DI caster who becomes visible standing
-    -- over a dying group is usually about to join them. Mirrors the rez chain gate.
+    -- Invis: the same trade. Casting drops it, and a DI caster who becomes visible standing over a dying
+    -- group is usually about to join them.
     if am_invis() then
-        gate('invis - not spending a DI, the chain moves on')
+        gate('invis - not spending a DI')
         return
     end
-    local now = mq.gettime()
-
-    -- A CAST IN FLIGHT BLOCKS EVERYTHING. My own watch being open means I have a command out that has not
-    -- declared itself yet; re-committing into that is what queued two casts in E3 on 2026-07-30 (00:54:59
-    -- then 00:55:16, one landing at ~00:55:31). Peers park on DI.firedAt until the ceiling, but the
-    -- verdict broadcast releases them the moment there is an answer, so the chain is not actually slower.
-    if DI.watch then return end
-    if (now - DI.firedAt) < DI.WATCH_MAX then return end
-    -- Somebody's cast was refused very recently, which means the tank was covered. Expires on its own.
-    if DI.savedUntil and now < DI.savedUntil then
-        gate(string.format('a refusal says the tank is covered (%.0fs left)', (DI.savedUntil - now) / 1000))
-        DI.trigAt, DI.turnAt = 0, nil
-        return
-    end
-    local tank = di_tank()
-    if not tank then gate('no tank in group'); DI.trigAt, DI.turnAt = 0, nil; return end
-
-    local inCombat = false
-    pcall(function() inCombat = (tostring(mq.TLO.Me.CombatState() or ''):upper() == 'COMBAT') end)
-    if not inCombat then gate('not in combat'); DI.trigAt, DI.turnAt = 0, nil; return end
-
-    local ts = DI.state[tank]
-    if ts and ts.saveUp == 1 then gate(tank .. ' already has a save up'); DI.trigAt, DI.turnAt = 0, nil; return end
-    -- No report from the tank at all? Then this gate did nothing, and we are about to fire blind into a
-    -- tank that may well already be saved. Worth saying out loud - it is the difference between the
-    -- check failing and the check never running.
-    if not ts then
-        if (now - (DI.noTankWarn or 0)) > 15000 then
-            DI.noTankWarn = now
-            rezlog('\\ay[di] no DI report from %s - cannot tell if it already has a save\\ax', tank)
-        end
-    elseif (now - (ts.updated or 0)) > 10000 then
-        if (now - (DI.noTankWarn or 0)) > 15000 then
-            DI.noTankWarn = now
-            rezlog('\\ay[di] %s report is %ds old - save state may be stale\\ax', tank,
-                   math.floor((now - (ts.updated or 0)) / 1000))
-        end
-    end
-    -- EVERY guard below is a reason to HOLD, so an empty DI.state makes them all pass vacuously and the
-    -- staff fires blind. That is what happened one second after load: no tank report yet, so "does he
-    -- already have a save" could not be asked, nobody was known to be ahead, and nothing said wait.
-    -- Refuse to commit without a fresh word from the tank - firing when he is already saved is exactly
-    -- the waste this whole baton exists to prevent.
-    if not ts or (now - (ts.updated or 0)) >= 8000 then
-        gate('no fresh report from ' .. tank .. ' - holding')
-        DI.trigAt, DI.turnAt = 0, nil
-        return
-    end
-    if (now - DI.startedAt) < 12000 then
-        gate('settling after load')   -- peers report on their own schedule; do not act on a half-built table
-        DI.trigAt, DI.turnAt = 0, nil
-        return
-    end
-
-    -- THE LADDER GOES FIRST. If I am the cleric and I still have a rung, I apply the save myself - the
-    -- staff chain is the LAST rung, not a parallel system. This is the actor that rungs 1-3 never had.
-    do
-        local tid = 0
-        pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end)
-        if tid > 0 and di_try_rung(tank, tid, now) then
-            DI.trigAt, DI.turnAt = 0, nil
-            return
-        end
-    end
-
-    -- ALWAYS CHECK THE CLERIC, and treat "cannot check" as a reason to hold. The loop below only holds
-    -- when it FINDS a fresh dgReady=1 - so a cleric with no entry yet, or one whose report has aged out,
-    -- fell through it and the staff fired on the assumption the ladder was spent. That assumption is the
-    -- wrong way round: this chain is the rare last resort, so silence from the cleric means wait, not go.
-    -- Same rule the tank already gets a few lines up.
-    for _, nm in ipairs(group_members()) do
-        if (member_class(nm) or ''):upper() == 'CLR' then
-            local cs = DI.state[nm]
-            if not cs or (now - (cs.updated or 0)) >= 30000 then
-                gate('no fresh save-ladder report from ' .. nm .. ' - holding')
-                if (now - (DI.noClrWarn or 0)) > 15000 then
-                    DI.noClrWarn = now
-                    rezlog('\\ay[di] no fresh report from %s (CLR) - holding the staff rather than assuming its ladder is spent\\ax', nm)
-                end
-                DI.trigAt, DI.turnAt = 0, nil
-                return
-            end
-        end
-    end
-
-    -- Which cleric, if any, currently claims a save source. Found first, judged second - the old form
-    -- returned from inside the loop, which left nowhere to reset the timer below.
-    local clrHold = nil
-    for nm, st in pairs(DI.state) do
-        -- 30s, matching the other DI freshness window. This was left at 8000 when the beat went to a
-        -- 20s idle keepalive: in combat the cadence tightens to 4s so it is fine, but at the START of a
-        -- fight the last report can be far older than 8s - the gate would read a perfectly good cleric
-        -- as stale and fire the staff while Divine Guardian was still up.
-        if st.dgReady == 1 and (now - (st.updated or 0)) < 30000 then clrHold = nm; break end
-    end
-    if clrHold then
-        -- NO GRACE VALVE ANY MORE. It used to release the staff after 15s of a cleric "claiming" a source
-        -- while the tank stayed uncovered - a workaround for rungs 1-3 having no actor, where a claim
-        -- genuinely never turned into a save. The cleric now casts its own rungs, so a claim becomes a
-        -- save or the ladder logs why it did not, and jumping the cleric would just stack a second save.
-        gate('cleric ladder still has a rung (' .. clrHold .. ')')
-        if (now - (DI.lastHoldLog or 0)) > 5000 then
-            DI.lastHoldLog = now
-            local cst = DI.state[clrHold]
-            rezlog('[di] holding: %s still has a save source (report %.1fs old)', clrHold,
-                   (now - ((cst and cst.updated) or now)) / 1000)
-        end
-        DI.trigAt, DI.turnAt = 0, nil; return
-    end
-
-    -- ===== THE BATON =====
-    -- ONE HOLDER, PASSED ON THE STAFF'S OWN COOLDOWN. Every toon used to evaluate every other toon's staff
-    -- timer over the network to work out whose turn it was - six reads of a signal that, on 2026-07-30,
-    -- reported Nityrc's staff ready for 88 straight seconds while it sat 1408s into reuse, on both the live
-    -- read and the pushed sample. Deciding turn order from six copies of an unreliable number is what made
-    -- the ring "get rough" while the cleric ladder stayed solid.
-    -- The baton needs ONE toon to know ONE thing about ITSELF: I just fired, so I am out. That we can
-    -- establish - we watch our own cast and hold the full reuse on a confirmed landing. A ~30 minute reuse
-    -- makes it a natural token: it moves a handful of times an hour, not per fight.
-    -- It is also race-free by construction. Only the holder may commit, so two toons cannot fire at once -
-    -- which is what the stagger, the distance checks and the hold windows all existed to prevent.
-    if DI.trigAt == 0 then DI.trigAt = now end
-    local order = di_order()
-    if #order == 0 then gate('nobody in the DI order'); return end
-    if not di_baton_valid(order) then di_baton_set(order[1], 'holder is gone - resetting to the front') end
-    if DI.baton:lower() ~= myName:lower() then
-        gate(string.format('%s has the baton', DI.baton)); return
-    end
-
-    local staff, em = di_read_self()                       -- authoritative self-check before committing
-    -- HOLDING THE BATON WHILE UNABLE IS THE ONE WAY THIS DESIGN STALLS. Every branch that means "not me"
-    -- has to hand it on, or the ring stops at whoever happens to be holding it.
-    if staff ~= 0 or em < DI.MIN_EMERALDS then
-        di_baton_pass(order, string.format('%s cannot fire (staff %ds, %d emerald(s))', myName, staff, em))
-        gate('I have the baton but cannot fire - passed it on'); return
-    end
-    if DI.cannotFire and mq.gettime() < DI.cannotFire then
-        di_baton_pass(order, myName .. ' is stood down')
-        gate(string.format('I am stood down for another %.0fs - passed the baton',
-                           (DI.cannotFire - mq.gettime()) / 1000)); return
-    elseif DI.cannotFire then
-        DI.cannotFire, DI.noCastStrikes = nil, 0    -- window elapsed: back in the chain, clean slate
-        rezlog('[di] stand-down elapsed - I am back in the DI chain')
-    end
-    -- THIRD OPINION, AND A DIRECT ONE. Me.ItemReady is a boolean rather than a countdown, so it cannot go
-    -- stale the way a ticking timer can. The probe on 2026-07-30 had it unanimous across all six toons -
-    -- true on the four with ready staves, NULL on the two genuinely on cooldown - agreeing with both
-    -- timers every time. If it disagrees with them here, believe it and hand the baton on: being wrongly
-    -- told we are busy costs a turn that passes anyway, being wrongly told we are ready costs a charge.
-    if DI.itemReadyWorks and not tlo_true(DI.itemReady) then
-        di_baton_pass(order, string.format('%s ItemReady says the staff is not ready', myName))
-        gate('timers read ready but ItemReady disagrees - passed the baton'); return
-    end
-    -- SECOND OPINION. TimerReady() returns NULL for a transient reason and `or 0` turns that into "ready",
-    -- which is how Stylin committed on 2026-07-30 with its staff 300s into reuse. DI.state[myName] holds
-    -- the last PUSHED reading - an independent sample taken on an earlier poll - so requiring both to
-    -- agree costs nothing and cannot be fooled by a single bad read.
-    do
-        local mine = DI.state[myName]
-        if mine and (mine.staff or 0) > 0 then
-            di_baton_pass(order, string.format('%s staff is really %ds into reuse', myName, mine.staff))
-            gate(string.format('staff read ready but my last report said %ds - not trusting it', mine.staff))
-            return
-        end
-    end
-    -- THE GROUP MEMBER'S SPAWN, not a name search. Spawn['pc =Name'] matches a player CORPSE too - a body
-    -- keeps the character's name - so after a death and rez it can hand back the corpse while the live
-    -- character is a different spawn entirely. That is what happened at 01:52:52: the staff fired at
-    -- id 427 and nothing landed, the retry burned the full 12/24/45s and took a strike, and the very
-    -- next commit used id 564 for the same character and landed in 4.5 seconds.
-    -- Group.Member[name].Spawn is the living group member by definition. The name search stays as a
-    -- fallback for the case where the tank is in the raid but not the group.
-    local tid = 0
-    pcall(function() tid = tonumber(mq.TLO.Group.Member(tank).Spawn.ID()) or 0 end)
-    if tid == 0 then pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end) end
-    if tid <= 0 then gate('tank not in zone'); return end
-    -- ALIVE, not merely present. A death save cannot land on someone who is already dead, and a
-    -- freshly-dead PC spawn lingers three to four seconds - exactly the window where the tank dies and
-    -- this fires into it. Seen 2026-07-28: "FIRING ... 105" where 105 was Sebbun's CORPSE id, twice,
-    -- followed both times by "the staff did NOT go off" - and the emerald count still fell 1976 -> 1974
-    -- between the two attempts, so the misfires were not free.
-    -- Same check the rez path uses: Spawn.Dead plus a HOVER/DEAD state, because Type()=='PC' stays true
-    -- on a corpse. If the tank is gone, the rez chain is the right answer, not a save.
-    local tSeen, tAlive = owner_seen(tank)
-    if not (tSeen and tAlive) then
-        gate('tank is not alive - a save cannot land on a corpse')
-        rezlog('[di] holding: %s is down (a death save cannot land on a corpse) - the rez chain has it', tank)
-        DI.trigAt, DI.turnAt = 0, nil
-        return
-    end
-
-    DI.firedAt = now
-    DI.trigAt, DI.turnAt = 0, nil
-    peer_bcast('/at_difired')   -- everyone else stands down immediately
-    -- No position any more - holding the baton IS the turn. myPos was declared by the peer-scan block that
-    -- the baton replaced, and this line kept referencing it: string.format('%d', nil) threw, and DI shut
-    -- itself off on whichever toon the baton had just been passed to. Sunetoo, 21:30:44, one second after
-    -- receiving it.
-    rezlog('[di] committing with the baton (%d emerald(s)) - told the group to stand down', em)
-    -- WHAT I BELIEVED WHEN I COMMITTED. The decision reads every peer's staff/emerald/dgReady/saveUp
-    -- and then throws that away, which left "why did it fire while a cleric had a save ready" as an
-    -- argument about freshness windows rather than a line in the log. Every other thing fixed in this
-    -- system became easy the moment it recorded what it thought it knew.
-    do
-        local parts = {}
-        for nm, st in pairs(DI.state) do
-            parts[#parts + 1] = string.format('%s[staff=%s em=%s dg=%s save=%s age=%.1fs]',
-                nm, tostring(st.staff), tostring(st.emeralds), tostring(st.dgReady),
-                tostring(st.saveUp), (now - (st.updated or now)) / 1000)
-        end
-        table.sort(parts)
-        rezlog('[di] state at commit: %s', table.concat(parts, ' '))
-    end
-    -- OPTS is empty now, so this is just the item name - but keep the concat so restoring the old string
-    -- is a one-line change. :format on a string with no %s is a no-op, so an empty OPTS is safe.
-    local spec = DI.STAFF .. ((DI.OPTS ~= '') and DI.OPTS:format(tank) or '')
-    rezlog('[di] target check: %s', di_target_desc(tid, tank))
-    -- A DEAD TANK CANNOT CARRY A SAVE. The line above only DESCRIBES the target - its MATCH is a name
-    -- substring, and a corpse is named after the character it belonged to, so a corpse has always
-    -- matched. Nothing then checked whether the thing was alive.
-    -- Cost when it happens: the staff fires at a corpse, nothing lands, and the no-sign-of-that-cast
-    -- retry runs the full 12/24/45s before giving up and taking a strike - three quarters of a minute
-    -- of the tank's last-ditch save doing nothing, at exactly the moment the group is in trouble.
-    -- The next commit used a different spawn id for the same character and landed in 4.5s, which is the
-    -- corpse-then-rezzed pair showing up in the log.
-    -- Two reads because either can answer on its own: the spawn type says Corpse outright, and PctHPs
-    -- at or below zero catches a body the client is still calling a PC.
-    do
-        local ty, hp = '', 1
-        pcall(function() ty = tostring(mq.TLO.Spawn(tid).Type() or '') end)
-        pcall(function() hp = tonumber(mq.TLO.Spawn(tid).PctHPs()) or 1 end)
-        local dead = (ty:lower() == 'corpse') or (hp <= 0)
-        if dead then
-            rezlog('\\ay[di] NOT firing - %s is dead (%s). Holding the staff for the rez.\\ax',
-                   tank, 'spawn ' .. tid .. ' reads ' .. ((ty ~= '') and ty or ('hp ' .. hp)))
-            return
-        end
-    end
-    -- Same cursor rule. The staff is the tank's last-ditch save, so a click that goes astray here costs
-    -- more than most - and skipping only means the chain tries again on the next pass.
-    -- Best effort. The staff is the tank's last-ditch save - not firing it is the worse failure.
-    if not cursor_stow('di') then
-        rezlog('\\ay[di] cursor will not clear - firing the staff anyway\\ax')
-    end
-    rezlog('[di] FIRING /nowcast me "%s" %d', spec, tid)
-    pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
-    -- NOT ANNOUNCED HERE. Saying "DI staff on X" at fire time claims something we do not know yet: the
-    -- cast may be interrupted, dropped or refused. Announcing it anyway is how a log ends up disagreeing
-    -- with what actually happened, which is exactly the thing that makes an issue report useless.
-    -- The /gsay now happens at the verdict - see di_check_landed.
-    -- Remember what we had, so the next tick can tell whether the cast actually happened. E3 declines
-    -- silently when CheckFor|Divine Guardian,Divine Intervention finds the tank already has a save -
-    -- so from here it looks identical to a successful cast, and the trigger simply fires again.
-    DI.watch = { at = now, em = em, tank = tank, tries = 1,
-                 cmd = string.format('/nowcast me "%s" %d', spec, tid),
-                 saveWas = (DI.state[tank] or {}).saveName }   -- so a NEW one is attributable to this cast
-    -- From this moment my staff counts as spent, whatever TimerReady claims. Set alongside the watch so
-    -- that even a verdict which goes wrong cannot hand me back a staff I have already fired.
-    DI.assumeSpentUntil = now + DI.ASSUME_SPENT
 end
 
 -- Did the last DI staff cast actually go off? THREE outcomes, not two - lumping the last two together
@@ -3890,10 +3793,24 @@ function di_check_landed()
             if (w.tries or 1) > 1 then mq.cmdf('/gsay DI staff on %s (took %d tries)', w.tank, w.tries)
             else                       mq.cmdf('/gsay DI staff on %s', w.tank) end
         end)
+        -- TELL THE GROUP THE EMERGENCY IS OVER, not just that my staff is gone.
+        -- A landed staff proves the tank is covered exactly as conclusively as a blocked one does, and
+        -- the blocked path already broadcasts this - the success path did not, which left the next toon
+        -- in the chain to work it out from the tank's own report. That report lags: on 2026-08-14 the
+        -- staff landed at 03:43:37.9, the baton moved the same millisecond, and Sunetoo committed at
+        -- 03:43:38.4 with Sebbun still reporting save=0 from 0.2s earlier. Two staffs and four emeralds
+        -- for one emergency.
+        -- Only when the tank is CONFIRMED carrying it: a staff that came off cooldown without the save
+        -- appearing has not covered anybody, and holding the chain on that would be worse than the
+        -- duplicate.
+        if tankHasOurs then
+            DI.savedUntil = mq.gettime() + DI.SAVED_HOLD
+            DI.trigAt, DI.turnAt = 0, nil
+            pcall(function() peer_bcast('/at_disaved %d', DI.SAVED_HOLD) end)
+        end
         -- THE POINT OF THE WHOLE THING. My staff is now spent for its full reuse, which is the one fact
         -- about myself I can establish reliably - so hand the turn on rather than making five other toons
         -- work it out from a timer that lies.
-        di_baton_pass(di_order(), string.format('%s spent its staff', myName))
         rezlog('[di] LANDED after %.1fs - %s%s (staff timer reads %ds, %d emerald(s) spent)', age / 1000,
                tankHasOurs and ((w.tank or 'the tank') .. ' is carrying ' .. DI.STAFF_SPELL) or 'staff on reuse',
                tankHasOurs and '' or '', st, spent)
@@ -3903,7 +3820,6 @@ function di_check_landed()
         -- would let us re-commit on the very next tick (Nityrc did precisely that, twice, at 21:18:31).
         rezlog('[di] staff reads at the misread: %s', di_staff_reads())
         DI.assumeSpentUntil = mq.gettime() + (st * 1000)
-        di_baton_pass(di_order(), string.format('%s staff was already %ds into reuse', myName, st))
         rezlog('\\ay[di] NOT A CAST - staff read ready but is %ds into reuse %0.1fs later. The readiness check misread it; nothing was spent. Holding myself out %ds.\\ax',
                st, age / 1000, st)
     elseif verdict == 'blocked' then
@@ -3955,7 +3871,6 @@ function di_check_landed()
             -- know a toon that failed twice can land the very next cast (Khulian failed on corpse 258 at
             -- 01:12:06, Lunafeet landed on the same target 45s later).
             DI.cannotFire = mq.gettime() + 600000
-            di_baton_pass(di_order(), myName .. ' cannot get the staff to fire')
             rezlog('\\ar[di] failed to fire the staff %d times with no cooldown and no block - standing myself down for 10 minutes. /at_distaff to see why.\\ax',
                    DI.noCastStrikes)
         end
@@ -5834,9 +5749,17 @@ pcall(function()
         pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
         pcall(function() sweep(function(i) return mq.TLO.Me.Buff(i).Name() end, nb) end)
         pcall(function() sweep(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
+        -- ALWAYS, WHATEVER WE THINK. /makemevis is the client's own answer to "stop being invisible" and
+        -- it does not care whether our buff-name matching recognised the source. That matching only knows
+        -- the four entries in MAGIC_CLICKS, so anything else - a potion, another player's cast, a clicky
+        -- we have never heard of - left the character invis while the log cheerfully said 'nothing to
+        -- drop', which is exactly the miss being reported.
+        -- Cheap and harmless on a character that is not invis, so there is no reason to gate it on our
+        -- own opinion of the state.
+        pcall(function() mq.cmd('/makemevis') end)
         invisLast = ''   -- force a fresh report so the coverage row updates at once
-        if #gone > 0 then log('[invis] dropped: %s', table.concat(gone, ', '))
-        else log('[invis] nothing to drop - not invis') end
+        if #gone > 0 then log('[invis] dropped: %s (+ /makemevis)', table.concat(gone, ', '))
+        else log('[invis] no known invis buff to remove - sent /makemevis anyway') end
     end)
     -- Ports are reported ON REQUEST, not on a heartbeat. A spell book changes when somebody scribes
     -- something, which is not often enough to be worth a periodic broadcast - so the driver asks when
@@ -6138,6 +6061,44 @@ end
         portProbeWant = math.max(1, math.min(720, tonumber(n) or 30))
         log('[portprobe] queued - will read the first %d book slot(s) on the next tick', portProbeWant)
     end)
+    mq.bind('/at_inviscast', function(key, ms) invis_arm(key, tonumber(ms) or INVIS_LEAD) end)
+    -- WHAT IS THE CAST TIME, REALLY? invis_cast_ms reported 0s for both rows, which cannot be right when
+    -- one of them visibly takes a moment - so this tries every route to the number and prints all of
+    -- them rather than trusting the one I picked. Same approach as /atportlist, which settled a question
+    -- three guesses had failed to.
+    mq.bind('/atinviscast', function()
+        for _, e in ipairs(MAGIC_CLICKS) do
+            if e.group == 'ITU' or e.group == 'Invis' then
+                local nm = e.aa or e.spell or e.name or '?'
+                local a, b, c, d, id = 'x', 'x', 'x', 'x', 0
+                pcall(function() id = tonumber(mq.TLO.Me.AltAbility(nm).Spell.ID()) or 0 end)
+                pcall(function() a = tostring(mq.TLO.Me.AltAbility(nm).Spell.CastTime()) end)
+                pcall(function() b = tostring(mq.TLO.Me.AltAbility(nm).Spell.MyCastTime()) end)
+                if id > 0 then
+                    pcall(function() c = tostring(mq.TLO.Spell(id).CastTime()) end)
+                    pcall(function() d = tostring(mq.TLO.Spell(id).MyCastTime()) end)
+                end
+                local have = have_thing(nm) and 'MINE' or '-'
+                log('[inviscast] %-38s %s spellID=%d', nm, have, id)
+                log('[inviscast]    AA.Spell.CastTime=%s  AA.Spell.MyCastTime=%s', a, b)
+                log('[inviscast]    Spell(id).CastTime=%s  Spell(id).MyCastTime=%s', c, d)
+            end
+        end
+    end)
+    -- A worker reporting its own bag counts. Indexes into ITEMS, so nothing here contains a space.
+    mq.bind('/at_counts', function(char, blob)
+        if not char then return end
+        local t = { at = mq.gettime() }
+        for chunk in tostring(blob or ''):gmatch('[^,]+') do
+            local i, n = chunk:match('^(%d+):(%d+)$')
+            if i then
+                local item = ITEMS[tonumber(i)]
+                if item then t[item] = tonumber(n) or 0 end
+            end
+        end
+        countsPush[char:lower()] = t
+    end)
+    mq.bind('/at_countsask', function() countsPushAt = 0 end)
     mq.bind('/at_invis', function(char, n, u)
         if not char then return end
         invisState[char] = { norm = tonumber(n) or 0, und = tonumber(u) or 0, updated = mq.gettime() }
@@ -6199,8 +6160,6 @@ end
     -- The attempt has a verdict, whatever it was - stop parking on the ceiling and let the next slot act.
     mq.bind('/at_didone', function() DI.firedAt = 0 end)
     -- The holder tells everyone at once, so nobody has to work out whose turn it is from staff timers.
-    mq.bind('/at_dibaton', function(who) if who and who ~= '' then DI.baton = who end end)
-    mq.bind('/at_dibatonback', function(who) di_baton_back(who) end)
     mq.bind('/at_diladder', function(mode)
         DI.ladderOff = (mode == 'off')
         pcall(save_settings)
@@ -6273,6 +6232,136 @@ end
     end)
     -- A peer's cast was refused: the tank is covered, so stand down too rather than each of us paying an
     -- emerald to learn it. Duration comes from the sender so one config value governs the whole group.
+    -- THE TANK IS ASKING ME FOR A SAVE. Everything that decides this is a LOCAL read - di_rung_list
+    -- already answers "what can I actually cast right now" from my own gems and cooldowns, which is the
+    -- authoritative answer the tank cannot have.
+    -- Answer either way and answer fast: a 'no' moves the tank to the next candidate immediately, which
+    -- is the whole point. Silence costs it a second.
+    mq.bind('/at_dineed', function(tank)
+        if not tank or tank == '' then return end
+        -- CLERIC RUNGS ARE FOR CLERICS. di_rung_list proves ownership per rung - AA rank, item id, gem -
+        -- but ownership is not the same as being the right character to use it: a necro carrying a pair
+        -- of Donal's Boots in a bag passes the id check and offered them, which is how Azyue and Ehaba
+        -- both announced 'Casting Guardian boots' on 2026-08-14.
+        -- The old ladder never had to think about this because it only ever ran on clerics. This bind
+        -- runs on everybody, so the gate has to be here - the same one di_read_self uses.
+        local best
+        local amCleric = (member_class(myName) or ''):upper() == 'CLR'
+        if amCleric and not DI.ladderOff then
+            for _, r in ipairs(di_rung_list()) do
+                if r.ready then best = r; break end
+            end
+        end
+        -- THE STAFF IS A CANDIDATE TOO, and it is checked here for the same reason everything else is:
+        -- the holder's own TimerReady is the authoritative read, and it is local and instant. The baton
+        -- chain existed to work this out by passing a turn around and waiting seconds at each hop; asking
+        -- gets the same answer in one round trip.
+        -- Offered only when no cleric rung is left, which preserves the ladder's order - the staff is the
+        -- expensive one and stays last.
+        if not best then
+            local secs = di_raw_staff()
+            local em = 0
+            pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
+            -- assumeSpentUntil is the honest brake: TimerReady reads 0 for tens of seconds after a real
+            -- fire, and trusting that zero is what let one toon commit twice for a single charge.
+            local assumed = DI.assumeSpentUntil and mq.gettime() < DI.assumeSpentUntil
+            -- Two emeralds are spent per cast, so anything less cannot fire.
+            if secs == 0 and not assumed and em >= 2 then
+                best = { name = DI.STAFF, kind = 'Item', staff = true }
+            end
+        end
+        if not best then
+            -- SAY WHY, not just no. With no fallback path to paper over a bad answer, the decline IS the
+            -- diagnostic - and "nothing-ready" is the one thing that cannot be troubleshot from.
+            -- Each of these is a local read that already happened above, so naming it costs nothing.
+            local why = {}
+            for _, r in ipairs(di_rung_list()) do
+                if not r.ready then why[#why + 1] = (r.name):gsub(' ', '-') .. '-cd' end
+            end
+            local secs = di_raw_staff()
+            if secs > 0 then why[#why + 1] = 'staff-' .. secs .. 's'
+            elseif secs < 0 then why[#why + 1] = 'no-staff'
+            elseif DI.assumeSpentUntil and mq.gettime() < DI.assumeSpentUntil then
+                why[#why + 1] = 'staff-just-fired'
+            else
+                local em = 0
+                pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
+                if em < 2 then why[#why + 1] = 'emeralds-' .. em end
+            end
+            local reason = (#why > 0) and table.concat(why, ',') or 'nothing-owned'
+            pcall(function() peer_cmdf(tank, '/at_diack %s no %s', myName, reason) end)
+            rezlog('[diq] %s asked for a save - declining: %s', tank, reason)
+            return
+        end
+        rezlog('[diq] %s asked for a save - casting %s', tank, best.name)
+        di_announce(best, tank)
+        pcall(function() peer_cmdf(tank, '/at_diack %s yes %s', myName, (best.name):gsub(' ', '_')) end)
+        -- Fired exactly the way the ladder fires it, including the spent-stamp that stops di_rung_list
+        -- offering the same rung again on a timer that reads ready too soon.
+        local tid = 0
+        pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end)
+        if best.staff then
+            -- FIRE IT HERE. Handing the baton over and letting di_tick commit does not work: the baton is
+            -- soft state that every character recomputes for itself, and a character can also be sitting
+            -- under its own savedUntil hold from an earlier refusal.
+            -- 2026-08-14 05:39 has all of it at once - the baton was reset to Ejtou at 01.8, handed to
+            -- Azyue by an ask at 02.3, Azyue was then held by a refusal and never committed, and Ejtou
+            -- fired at 07.4 believing it still held the turn. Three characters, three views of the baton.
+            -- THE ASK IS THE COORDINATION. The tank picked this character deliberately, a moment ago,
+            -- from a local check - there is nothing left to negotiate and nothing else worth consulting.
+            -- Everything the commit sets up is set up here, so the verify and retry in di_tick still
+            -- own what happens after the cast.
+            local em = 0
+            pcall(function() em = tonumber(mq.TLO.FindItemCount('=' .. DI.REAGENT)()) or 0 end)
+            peer_bcast('/at_difired')          -- everyone else stands down immediately
+            if not cursor_stow('di') then
+                rezlog('\\ay[di] cursor will not clear - firing the staff anyway\\ax')
+            end
+            local spec = DI.STAFF .. ((DI.OPTS ~= '') and DI.OPTS:format(tank) or '')
+            rezlog('[diq] FIRING the staff for %s (%d emerald(s))', tank, em)
+            pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
+            DI.watch = { at = mq.gettime(), em = em, tank = tank, tries = 1,
+                         saveWas = (DI.state[tank] or {}).saveName }
+            DI.assumeSpentUntil = mq.gettime() + DI.ASSUME_SPENT
+            DI.trigAt, DI.turnAt = 0, nil
+        else
+            DI.rungFiredAt = DI.rungFiredAt or {}
+            DI.rungFiredAt[best.name] = mq.gettime()
+            local spec = string.format(DI.RUNG_OPTS, best.name, best.kind, tank)
+            pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
+        end
+    end)
+    -- The answer. 'yes' means it has gone out and the tank should watch for the save rather than ask
+    -- somebody else; 'no' means move on now.
+    -- NAMED /at_diack, NOT /at_didone: that one already exists and clears DI.firedAt. Binding the same
+    -- command twice silently replaces the first, which is how the pre-existing win_open got shadowed
+    -- earlier - a name already in use is not a free name.
+    -- SOMEBODY IS CASTING A SAVE ON ME. Hold everything until it has had time to land: no asking anyone
+    -- else, and no handing over to the old ladder. The claim is the only reason to wait, and it expires
+    -- on its own if the cast comes to nothing.
+    mq.bind('/at_diclaim', function(who, what)
+        if not who then return end
+        -- IT IS HANDLED. No per-cast-type window, because there is nothing to time: a character that
+        -- said yes is casting, and the tank's job is now to wait for its own save to appear - which it
+        -- reads locally and instantly. Tuning a hold per spell was a guess that had to be right for every
+        -- ability; this has nothing to be wrong about.
+        local nm = tostring(what or ''):gsub('_', ' ')
+        DIQ.casting, DIQ.castAt = who, mq.gettime()
+        rezlog('[diq] %s has it - %s is on the way', who, nm)
+    end)
+    mq.bind('/at_diack', function(who, verdict, what)
+        if not who then return end
+        if DIQ.asked and who:lower() == DIQ.asked:lower() then
+            if verdict == 'yes' then
+                rezlog('[diq] %s is casting %s', who, tostring(what):gsub('_', ' '))
+                DIQ.at = mq.gettime()      -- restart the clock: a cast is in flight now
+            else
+                rezlog('[diq] %s cannot (%s) - next', who, tostring(what or '?'))
+                DIQ.tried[who:lower()] = true
+                DIQ.asked = nil
+            end
+        end
+    end)
     mq.bind('/at_disaved', function(ms)
         DI.savedUntil = mq.gettime() + (tonumber(ms) or DI.SAVED_HOLD)
         DI.trigAt, DI.turnAt = 0, nil
@@ -12534,13 +12623,157 @@ function invis_holders(grp)
     return out
 end
 
-function invis_cast(grp)
+-- HOW LONG THE CASTERS GET TO PREPARE before the coordinated fire. It has to cover the relay hop plus
+-- pausing E3 and stopping any cast in flight, and every millisecond of it is a millisecond the group is
+-- standing still - so it is as short as those two things allow.
+INVIS_LEAD = 1500
+-- CLERIC FIRST, DRUID A QUARTER SECOND BEHIND.
+-- The measured rule is simple: CASTING STRIPS THE INVIS YOU ALREADY HAVE. So whoever goes second has
+-- already received the first caster's buff, and their own cast removes it. The logs show it exactly:
+--   23:04:08.058 ITU fires,  before invis=0 itu=0
+--   23:04:08.818 camo fires, 760ms later
+--   +4700ms  ITU caster  invis=1 itu=1   both
+--   +4700ms  camo caster invis=1 itu=0   lost the ITU it had just been given
+-- An earlier run with a 544ms gap scraped through, which is what makes this look intermittent - it is
+-- not, it is a race, and any gap at all is enough to lose it.
+-- ITU has a short cast time; invisibility is instant. So the window to aim for is: the cleric's ITU is
+-- STILL IN FLIGHT when the druid's instant camo goes out. Neither has received anything yet, so neither
+-- cast strips anything, and both land afterwards.
+-- 250ms, not the 700 this started at. 700 was long enough for the ITU to arrive first, which is the
+-- thing being avoided - the offset has to be shorter than the cast, not longer.
+-- The measured rule underneath all of this: CASTING STRIPS THE INVIS YOU ALREADY HAVE.
+--   23:04:08.058 ITU fires
+--   23:04:08.818 camo fires 760ms later
+--   +4700ms  ITU caster  invis=1 itu=1   both
+--   +4700ms  camo caster invis=1 itu=0   lost the ITU it had just been given
+-- An earlier run at 544ms scraped through, which is what made this look intermittent. It is a race, and
+-- the fix is to land inside the cast rather than after it.
+-- THE DRUID FIRES WHILE THE CLERIC IS MID-CAST.
+-- Measured gaps against outcome, with the offset set to 250:
+--   101ms  both covered
+--   451ms  camo caster lost the ITU it had just been given
+-- Neither is 250, because each caster fires on the first tick AFTER its deadline and the tick is 250ms.
+-- That quantisation is larger than the offset it was supposed to be honouring, so tuning the offset was
+-- tuning the smaller of the two numbers.
+-- Casting ANYTHING breaks the invis you are holding, and it breaks it when the cast STARTS. So the
+-- instant camo has to land after the cleric has begun casting - land before that and the cleric's own
+-- cast start strips it a moment later.
+-- Zero does not work for this: with no offset the two fire within a few milliseconds and the ORDER is a
+-- coin flip. The 8ms run lost it for exactly that reason - the druid went first by 8 thousandths of a
+-- second, so the camo was already on the cleric when the cleric started casting:
+--   785645927 FIRING inviscamo   <- druid first
+--   785645935 FIRING itu
+--   result: cleric invis=0 itu=1, druid invis=1 itu=1
+-- THE WINDOW IS THE CAST ITSELF, and it is about half a second wide - not the two seconds first assumed.
+-- Every run we have fits this: the druid must cast after the cleric's ITU has STARTED and before it
+-- LANDS.
+--     8ms  druid fired first - camo was on the cleric before its cast start, so the start stripped it
+--   101ms  inside the window - both covered
+--   451ms  after the cast landed - the druid's own cast start stripped the ITU it had just received
+--   609ms  same again: cleric invis=1 itu=1, druid invis=1 itu=0
+-- The tell for the width is `casting` in the after-log: 16229 at +1200ms on the 8ms run, 0 at +1200ms on
+-- the 609ms run - so the cast completes somewhere under a second, and the earlier reading was a longer
+-- cast being caught mid-flight rather than the normal case.
+-- 50, AND THE ORDER NO LONGER MATTERS. Once BOTH casters use a spell with a cast time, the requirement
+-- is only that each one has STARTED before the other's lands - and the cast duration is the window, so
+-- there is well over a second of room rather than a precise moment to hit.
+-- That is why the coin-flip worry behind the old 150 no longer applies. It mattered when one side was an
+-- instant cast: whoever went first had their invis stripped by the other's cast start. Two cast times and
+-- both breaks happen before either buff arrives, whichever order they go in.
+-- What forced this down: the A-team runs the shaman group invis and its gaps came out at 311ms against a
+-- configured 150 - the offset is right, the extra is relay and fire jitter - and 311 was past the ITU
+-- landing, so the shaman received it and then stripped it. Halving the configured value keeps the
+-- observed gap inside the cast on a jittery box.
+-- Effectively simultaneous is the target; 50 exists only so they are not fighting for the same instant.
+INVIS_ROW_OFFSET = { ITU = 0, Invis = 50 }
+invisFireKey, invisFireAt = nil, nil
+
+-- What does this thing take to cast? Logged so the offset above can be set from evidence.
+-- AAs carry their cast time on the spell behind them; a plain spell has it directly.
+function invis_cast_ms(key)
+    local e
+    for _, x in ipairs(MAGIC_CLICKS) do if x.key == key then e = x; break end end
+    if not e then return -1 end
+    local secs = -1
+    if e.aa then
+        pcall(function() secs = tonumber(mq.TLO.Me.AltAbility(e.aa).Spell.CastTime.TotalSeconds()) or -1 end)
+    elseif e.spell then
+        pcall(function() secs = tonumber(mq.TLO.Spell(e.spell).MyCastTime.TotalSeconds()) or -1 end)
+    end
+    return secs
+end
+
+-- Arm the countdown and get ready during it. Called on the caster, whether that is this character or a
+-- peer that was sent /at_inviscast.
+function invis_arm(key, ms)
+    if not key or key == '' then return end
+    invisFireKey = key
+    invisFireAt  = mq.gettime() + (tonumber(ms) or INVIS_LEAD)
+    -- PREPARE NOW, CAST LATER. Holding E3 and clearing a cast in flight are the two things that would
+    -- otherwise happen at the deadline and make this caster late - which is the whole problem.
+    e3_hold('invis')
+    local casting = false
+    pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+    if casting then
+        pcall(function() mq.cmd('/stopcast') end)
+        mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+    end
+    -- The cast time is the number the offset has to be set against, so it goes in the log every time.
+    log('[invis] armed %s - firing in %dms (this spell casts in %ss)',
+        key, tonumber(ms) or INVIS_LEAD, tostring(invis_cast_ms(key)))
+end
+
+-- Called from the tick. Fires when the countdown expires, then hands E3 back.
+function invis_fire_tick()
+    if not invisFireAt then return end
+    -- FIRE AT THE DEADLINE, NOT ON THE NEXT TICK. The main loop runs every 250ms, so waiting for a tick
+    -- to notice the deadline has passed adds up to a quarter second of error - and the two casters draw
+    -- that error independently, which is where a 250ms offset turned into gaps of 101 and 451.
+    -- Once the deadline is within one tick, wait out the remainder precisely and go. The whole point of
+    -- the countdown is that both casters know exactly when to act; this is what lets them act on it.
+    local left = invisFireAt - mq.gettime()
+    if left > 300 then return end
+    if left > 0 then mq.delay(left) end
+    local key = invisFireKey
+    invisFireKey, invisFireAt = nil, nil
+    if key then
+        -- Timestamped on both casters so the two logs can be laid side by side and the real gap read off
+        -- rather than inferred from whether the buff stuck.
+        local n0, u0 = invis_self()
+        log('[invis] FIRING %s at %d (before: invis=%d itu=%d)', key, mq.gettime(), n0, u0)
+        pcall(function() magic_click(key) end)
+        -- And what it actually achieved, a moment later. If invis reads 0 here after firing an invis,
+        -- something stripped it between the cast and now - which is the failure being chased.
+        -- SAMPLED, NOT A SINGLE LOOK. One read at 1.2s cannot tell a cast still in flight from one that
+        -- landed and was stripped - and those want opposite fixes. Three looks show which.
+        for _, wait in ipairs({ 1200, 1500, 2000 }) do
+            mq.delay(wait)
+            local n1, u1 = invis_self()
+            local casting = 0
+            pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+            log('[invis] after %s +%dms: invis=%d itu=%d casting=%d', key,
+                (wait == 1200) and 1200 or ((wait == 1500) and 2700 or 4700), n1, u1, casting)
+        end
+    end
+    e3_release('invis')
+end
+
+-- A COUNTDOWN, NOT A COMMAND. Two casters told to go separately go separately: the relay delivers at
+-- slightly different times, each starts whenever it next ticks, and the second one to cast BREAKS ITS
+-- OWN INVIS from the first - which is the staggering you are seeing.
+-- Sending "cast this, N milliseconds from now" instead means both count down locally and fire together,
+-- with no negotiation round-trip and no dependence on the two clients agreeing what time it is: each one
+-- measures N from the moment it receives, and the relay hop is the only variance left.
+-- The lead time is also prep time - each caster holds E3 and stops any cast in flight while it waits, so
+-- when the deadline arrives there is nothing left to do but cast.
+function invis_cast(grp, lead)
     local pick = invisPick[grp]
     if not pick then return false end
+    lead = lead or INVIS_LEAD
     for _, h in ipairs(invis_holders(grp)) do
         if h.nm == pick then
-            if h.nm:lower() == myName:lower() then magic_click(h.e.key)
-            else peer_cmdf(h.nm, '/at_magic %s', h.e.key) end
+            if h.nm:lower() == myName:lower() then invis_arm(h.e.key, lead)
+            else peer_cmdf(h.nm, '/at_inviscast %s %d', h.e.key, lead) end
             return true
         end
     end
@@ -12626,7 +12859,15 @@ function draw_invis()
         for _, grp in ipairs(INVIS_ROWS) do if invisPick[grp] then n = n + 1 end end
         if n > 0 then
             if ImGui.SmallButton(string.format('Invis combo (%d)##invcombo', n)) then
-                for _, grp in ipairs(INVIS_ROWS) do invis_cast(grp) end
+                -- ONE lead for both, so the two countdowns expire together. Passing the same number
+                -- rather than letting each default is the entire point: two defaults started a few
+                -- milliseconds apart are two different deadlines.
+                -- Same base for both, plus the per-row offset that keeps the slow cast ahead of the
+                -- instant one. INVIS_ROWS is { 'ITU', 'Invis' } so ITU is dispatched first as well.
+                local lead = INVIS_LEAD
+                for _, grp in ipairs(INVIS_ROWS) do
+                    invis_cast(grp, lead + (INVIS_ROW_OFFSET[grp] or 0))
+                end
             end
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 local who = {}
@@ -13900,7 +14141,13 @@ mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale 
 -- already reported - so nothing would ever arrive and the buttons would stay blank forever. Restarting
 -- the driver is not a roster change, so resync_group() never fired for it. Ask everyone to speak up.
 -- NOT local: this chunk is at Lua's 200-local ceiling and one more tips it over.
-driverResyncAt = SHOW_UI and (mq.gettime() + 4000) or 0
+-- 1200, NOT 4000. This is the driver telling the group "I am listening now, report everything" - and it
+-- is only reached AFTER the driver's own binds are registered, which is the thing the delay was guarding
+-- against. Four seconds of caution on top of that is four seconds of an empty Burns tab.
+-- The workers' own startup settle exists for the same reason and is cut short by this message, so the
+-- two were racing: whichever finished last decided when burns appeared. Asking sooner ends the race in
+-- the useful direction.
+driverResyncAt = SHOW_UI and (mq.gettime() + 1200) or 0
 
 local peerCheckAt = mq.gettime() + 12000
 if SHOW_UI then
@@ -14354,6 +14601,20 @@ while running do
             atAliveAt = mq.gettime()
             pcall(at_alive_touch)
         end
+        atphase('invis'); pcall(invis_fire_tick)
+        -- Bag counts, pushed. Change-gated so a stable inventory costs nothing, with a slow keepalive so
+        -- a driver that restarted still gets a picture without asking.
+        if not SHOW_UI and driverName then
+            if (mq.gettime() - (countsPushAt or 0)) > 20000 then
+                atphase('counts_push')
+                local blob = counts_push_blob()
+                if blob ~= countsPushLast or (mq.gettime() - (countsPushAt or 0)) > 120000 then
+                    countsPushLast = blob
+                    pcall(function() peer_cmdf(driverName, '/at_counts %s %s', myName, blob) end)
+                end
+                countsPushAt = mq.gettime()
+            end
+        end
         atphase('e3hold'); pcall(e3_assert_held)
         atphase('pacify'); pcall(pac_dispatch); pcall(pac_rebalance); pcall(pac_autoclear)
         atphase('placate'); pcall(ep_tick)
@@ -14732,8 +14993,6 @@ while running do
         if a == 0 and DI.staffWasSpent then
             DI.staffWasSpent = false
             DI.saidStaffDown = false                -- re-arm the one-shot pass for the next cooldown
-            peer_bcast('/at_dibatonback %s', myName)
-            di_baton_back(myName)                   -- and apply it locally, same rule
         elseif a > 0 then
             DI.staffWasSpent = true
             -- GIVE IT UP THE MOMENT MY STAFF IS DOWN, not when a save is finally needed. The commit path
@@ -14750,12 +15009,9 @@ while running do
             -- into the same emergency. Lunafeet's landed; Sebbun's was refused.
             -- Holding until the verdict costs nothing now: it resolves in 3-5s since the tank started
             -- naming its own save, and every verdict path already passes the baton on its way out.
-            if DI.watch then
-                -- undecided; the verdict will pass it
-            elseif DI.baton and DI.baton:lower() == myName:lower() and not DI.saidStaffDown then
-                DI.saidStaffDown = true
-                di_baton_pass(di_order(), string.format('%s staff is down (%ds)', myName, a))
-            end
+            -- Nothing to pass any more: the tank asks, so a staff going down is simply a fact this
+            -- character reports rather than a turn it has to hand on.
+            if not DI.watch then DI.saidStaffDown = true end
         end
         -- ON CHANGE, plus a keepalive. Peers count the staff timer down themselves now (di_peer_staff),
         -- so the only things worth sending are the discontinuities - the staff came up or went down, an
@@ -14805,6 +15061,12 @@ while running do
     end
     if DI.auto and not distributing and (mq.gettime() - DI.lastPoll) > (DI.pollGap or 1000) then
         DI.lastPoll = mq.gettime()
+        -- THE FAST PATH FIRST. On the tank this decides and asks; on everyone else it returns at once.
+        -- It runs BEFORE di_tick so that when it is working, the old ladder sees a covered tank and never
+        -- reaches for anything - the stand-down it broadcasts is the same one the ladder already honours.
+        atphase('diq')
+        local okq, errq = pcall(diq_tick)
+        if not okq then log('\\ar[diq] error: %s\\ax', tostring(errq)) end
         local ok, err = pcall(di_tick)
         if not ok then
             DI.auto = false                     -- stop rather than error every second
@@ -14975,13 +15237,14 @@ pcall(function() mq.unbind('/atladder') end)
 pcall(function() mq.unbind('/at_diladder') end)
 pcall(function() mq.unbind('/at_dirungs') end)
 pcall(function() mq.unbind('/at_distafftimer') end)
-pcall(function() mq.unbind('/at_dibaton') end)
-pcall(function() mq.unbind('/at_dibatonback') end)
 pcall(function() mq.unbind('/at_distaff') end)
 pcall(function() mq.unbind('/at_distaffprobe') end)
 pcall(function() mq.unbind('/at_distaffreport') end)
-pcall(function() mq.unbind('/at_didone') end)
+pcall(function() mq.unbind('/at_diack') end)
+pcall(function() mq.unbind('/at_diclaim') end)
 pcall(function() mq.unbind('/at_disaved') end)
+pcall(function() mq.unbind('/at_dineed') end)
+pcall(function() mq.unbind('/at_didone') end)
 pcall(function() mq.unbind('/at_disavedump') end)
 pcall(function() mq.unbind('/at_disavereport') end)
 pcall(function() mq.unbind('/at_xtank') end)
@@ -15068,6 +15331,7 @@ pcall(function() mq.unbind('/at_healstate') end)
 pcall(function() mq.unbind('/at_magic') end)
 pcall(function() mq.unbind('/at_invis') end)
 pcall(function() mq.unbind('/atportlist') end)
+pcall(function() mq.unbind('/atinviscast') end)
 pcall(function() mq.unbind('/at_ports?') end)
 pcall(function() mq.unbind('/at_ports!') end)
 pcall(function() mq.unbind('/at_portsclr') end)
