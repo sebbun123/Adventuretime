@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.11'
-local BUILD_TAG = '1.11'  -- bump on every change; prints on startup
+VERSION = '1.12'
+local BUILD_TAG = '1.12'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -3319,8 +3319,11 @@ function diq_tick()
     -- nothing logged; it simply did nothing, which is the hardest kind of wrong to notice.
     if not DI.auto then return end
 
-    local inCombat = false
-    pcall(function() inCombat = (tostring(mq.TLO.Me.CombatState() or ''):upper() == 'COMBAT') end)
+    -- ZONE, NOT COMBAT. Asking only in combat means the save arrives after the thing that needed it -
+    -- a save is worth holding from the moment you are somewhere that can kill you.
+    -- The safe list is short and explicit; anywhere not on it counts as dangerous, which is the safe
+    -- direction to be wrong in.
+    local safe = diq_safe_zone()
 
     -- MY OWN SAVE, READ LOCALLY. No report, no lag - this is the fact the whole system turns on and the
     -- tank is the only character that has it immediately.
@@ -3331,12 +3334,12 @@ function diq_tick()
         if up then haveSave = true; break end
     end
 
-    if haveSave or not inCombat then
+    if haveSave or safe then
         if DIQ.active then
-            -- Covered, or the fight is over. Tell everyone to stand down so nobody spends a second save
-            -- on the strength of a report that has not caught up yet.
+            -- Covered, or somewhere nothing can hurt us. Tell everyone to stand down so nobody spends a
+            -- second save on the strength of a report that has not caught up yet.
             rezlog('[diq] covered%s - standing the group down after %.1fs',
-                   haveSave and '' or ' (out of combat)', (mq.gettime() - DIQ.startedAt) / 1000)
+                   haveSave and '' or ' (safe zone)', (mq.gettime() - DIQ.startedAt) / 1000)
             pcall(function() peer_bcast('/at_disaved %d', DI.SAVED_HOLD) end)
             DIQ.active, DIQ.asked, DIQ.tried, DIQ.casting = false, nil, {}, nil
             DIQ.saidLong = nil
@@ -3348,7 +3351,7 @@ function diq_tick()
     -- Still standing back from an exhausted round.
     if DIQ.exhaustedUntil and mq.gettime() < DIQ.exhaustedUntil then return end
 
-    -- No save, in combat. Start asking.
+    -- No save, somewhere that matters. Start asking.
     if not DIQ.active then
         DIQ.active, DIQ.tried, DIQ.startedAt = true, {}, mq.gettime()
         DIQ.asked = nil
@@ -3600,6 +3603,34 @@ DIQ_EXHAUST_MS = 4000
 -- How long to give a cast to show ANY sign of starting. Casting state and ItemReady both move within a
 -- few hundred milliseconds of a real cast; this is generous against that.
 DIQ_SELF_MS = 1500
+
+-- ZONES WHERE NOTHING CAN KILL YOU. In everywhere else a save is worth having whether or not swords are
+-- currently swinging: the moment you actually need one is rarely the moment combat formally started.
+-- SHORT NAMES, not display names - they are the stable identifier and they do not change with a patch's
+-- wording. Add to this rather than adding a combat test back.
+DIQ_SAFE_ZONES = {
+    poknowledge  = true,   -- Plane of Knowledge
+    nexus        = true,   -- The Nexus
+    potranquility= true,   -- Plane of Tranquility
+    bazaar       = true,   -- The Bazaar
+    poinnovation = true,   -- often used as a hub
+    guildhall    = true,
+    guildlobby   = true,
+}
+-- Marr's temple is an instanced AFK hub and its short name varies by server; matched loosely for that
+-- reason rather than listed above.
+DIQ_SAFE_MATCH = { 'marr' }
+
+function diq_safe_zone()
+    local z = ''
+    pcall(function() z = tostring(mq.TLO.Zone.ShortName() or ''):lower() end)
+    if z == '' then return false end          -- cannot tell: assume it matters
+    if DIQ_SAFE_ZONES[z] then return true end
+    for _, frag in ipairs(DIQ_SAFE_MATCH) do
+        if z:find(frag, 1, true) then return true end
+    end
+    return false
+end
 DIQ_GIVEUP_MS = 8000    -- whole-emergency ceiling; past this, let the old ladder have it
 
 -- What to ask for, best first. Ordering only - the asked character has the final word.
@@ -3793,22 +3824,9 @@ end
 -- What is left here is the feign and invis guards, which belong to the character rather than to either
 -- system. The cast VERIFY is untouched and lives in the main loop, so what happens after a staff goes
 -- out is exactly as it was.
-local function di_tick()
-    if not DI.auto then return end
-    -- Feigning: casting DI stands the character up and undoes the feign, and the whole point of a DI is
-    -- to keep somebody alive - spending one at the cost of the caster's own life is not a trade worth
-    -- making.
-    if am_feigning() then
-        gate('feigning - not spending a DI')
-        return
-    end
-    -- Invis: the same trade. Casting drops it, and a DI caster who becomes visible standing over a dying
-    -- group is usually about to join them.
-    if am_invis() then
-        gate('invis - not spending a DI')
-        return
-    end
-end
+-- Nothing left. The feign and invis guards moved to /at_dineed, which is where the cast actually
+-- happens now - guarding this function protected nothing.
+local function di_tick() end
 
 -- Did the last DI staff cast actually go off? THREE outcomes, not two - lumping the last two together
 -- is what made Sunetoo fire the same save three times on 2026-07-30.
@@ -6337,6 +6355,23 @@ end
     -- is the whole point. Silence costs it a second.
     mq.bind('/at_dineed', function(tank)
         if not tank or tank == '' then return end
+        -- FEIGNING OR INVIS: DECLINE, DO NOT CAST.
+        -- These guards used to sit in di_tick, which decided things back when the ladder lived there.
+        -- di_tick no longer casts anything - THIS is where the cast happens now - so they had been left
+        -- guarding a function with nothing left to guard.
+        -- Casting stands a feigned character up and drops invis, and a DI caster who becomes visible over
+        -- a dying group is usually about to join them. Spending a save at the cost of the caster is not a
+        -- trade worth making, and declining is free: the tank simply asks the next candidate.
+        if am_feigning() then
+            pcall(function() peer_cmdf(tank, '/at_diack %s no feigning', myName) end)
+            rezlog('[diq] %s asked for a save - feigning, not standing up for it', tank)
+            return
+        end
+        if am_invis() then
+            pcall(function() peer_cmdf(tank, '/at_diack %s no invis', myName) end)
+            rezlog('[diq] %s asked for a save - invis, not dropping it', tank)
+            return
+        end
         -- CLERIC RUNGS ARE FOR CLERICS. di_rung_list proves ownership per rung - AA rank, item id, gem -
         -- but ownership is not the same as being the right character to use it: a necro carrying a pair
         -- of Donal's Boots in a bag passes the id check and offered them, which is how Azyue and Ehaba
@@ -6750,6 +6785,70 @@ pcall(function()
                 pcall(function() mq.cmdf('/target id %d', pwCast.prevTarget) end)
             end
             pwLast, pwCast = mq.gettime(), nil
+        end
+    end)
+    -- E3 INTERRUPTED OUR CAST FOR AN EMERGENCY HEAL.
+    -- Its cast-wait loop checks for a heal on every iteration and interrupts, and the check sits - by its
+    -- own comment - OUTSIDE the no-interrupt guard, so /NoInterrupt does not cover it and neither does
+    -- pausing: a /nowcast runs through E3's own casting code, so this is E3 cancelling its own cast.
+    -- Nothing can prevent it from outside, but it announces itself, and a cast we know was cancelled is
+    -- worth far more than one we discover by timeout - the placate simply goes again.
+    -- 'for #*#' NOT 'for Emergency'. E3 interrupts for healing in three places and they do not word it
+    -- the same: two say 'for Emergency Heal' / 'for Emergency Group Heal' and BROADCAST, while the third
+    -- says 'for Healing.' and only writes to the local MQ window. That third one was the common case and
+    -- this pattern missed every instance of it - one interrupt caught in a run where they were constant.
+    -- CAPTURE WHAT WAS INTERRUPTED. '#*#Interrupting #*#for #*#' matched every interrupt of every spell
+    -- on every character, including other people's broadcasts - '<Sunetoo> Interrupting [Talisman of the
+    -- Cougar]' set this character waiting for a cast it had no part in.
+    -- On 2026-08-14 20:28 that left the cleric holding for ninety seconds over interrupts of Sacred
+    -- Remedy, Chromablast and Mark of the Blameless, none of which were ours.
+    mq.event('at_e3_healcut', '#*#Interrupting [#1#] for #*#', function(line, spell)
+        -- LOG THE RAW LINE. The pattern was wrong for weeks because it only matched the broadcast wording
+        -- and the common case says something else - and nothing recorded what was actually being said, so
+        -- the log showed one interrupt in a run full of them. If E3 words a fourth one differently, this
+        -- is how we find out rather than inferring from failures.
+        -- LOG ONLY. This used to drive the retry and the waiting, which meant getting E3's wording right
+        -- and then telling our cast from everyone else's - and both went wrong: too narrow a pattern
+        -- caught one interrupt in a hundred, too wide a one made the cleric wait ninety seconds over
+        -- somebody else's spell.
+        -- The verification already knows: sawCast false means our cast never went out, whatever cut it.
+        -- This line stays because seeing the interrupts is genuinely useful; it just decides nothing.
+        rezlog('[e3cut] %s', tostring(line or '?'))
+        do return end
+        -- DO NOT CLEAR epLast. Zeroing it removed the recast gap, so the next tick fired straight back
+        -- into the heal that was still going and got cut again - five interrupts in two seconds on
+        -- 2026-08-14 16:19, burning the retry budget on a cast that never had a chance.
+        -- Leaving epLast alone means the normal gap applies, and the casting gate in ep_tick holds it
+        -- until the heal is actually finished.
+        if epCast then
+            -- GIVE THE TRY BACK. The cast never went out, so counting it against the budget means three
+            -- interrupts retire a mob that was never actually attempted - and in a zone with an AE DoT
+            -- the healer is interrupted constantly, so that is most of them.
+            -- The mob is still queued and unassigned, so the normal dispatch picks it up again.
+            if (epCast.tries or 1) > 1 then epCast.tries = epCast.tries - 1 end
+            rezlog('[placate] E3 cut the cast for a heal - %s keeps its try (%d used), waiting for the heal',
+                   epCast.name or '?', epCast.tries or 1)
+            epCast = nil
+            -- WAIT FOR THE HEAL TO FINISH. Casting again while it is still going is a guaranteed second
+            -- interrupt - the log shows exactly that: cut at 20:22:50.5, recast at 20:22:52.3, cut again
+            -- at 20:22:54.8, over and over with sawCast=false every time because the cast never really
+            -- started.
+            -- No time bound on this one. The three second cap was there to stop placate starving on a
+            -- character that heals constantly, but casting into a heal cannot succeed, so waiting is not
+            -- costing an attempt that would otherwise have worked - it is skipping one that would fail.
+        elseif pwCast then
+            rezlog('[pw] E3 cut the cast for a heal - will recast when it is done')
+            pwCast = nil
+        end
+        -- A DI cast that was cut never produced a save. Saying so releases the tank's claim at once
+        -- instead of it waiting out the fifteen second ceiling.
+        if DIQ and DIQ.self then
+            local s = DIQ.self
+            DIQ.self = nil
+            rezlog('\\ay[diq] E3 cut my save cast for an emergency heal - telling %s\\ax', s.tank)
+            pcall(function() peer_cmdf(s.tank, '/at_diack %s no cut-for-heal', myName) end)
+            DI.watch, DI.assumeSpentUntil = nil, nil
+            DI.pushNow = true
         end
     end)
     mq.event('at_di_blocked', 'Your #1# did not take hold on #2#.#*#', function(line, spell, who)
@@ -10103,6 +10202,13 @@ EP_CHECK_AFTER = 1000    -- pause after the cast completes before looking at the
 -- counts re-CASTS: failing to look is not the same as failing to cast, and spending a cast because the
 -- target slipped is the bug this exists to avoid.
 EP_CHECK_TRIES = 8
+-- Longest a single placate cast may stay in flight before it is abandoned. Generous: the cast plus its
+-- verification retries is a few seconds, and an emergency heal chain on top is a few more.
+EP_CAST_HARD_MAX = 30000
+-- How long to wait for the caster to be free before casting anyway. The placate caster is usually the
+-- healer too, so an unbounded wait starves placate entirely in a zone that keeps it healing.
+EP_BUSY_MAX = 3000
+epBusySince = nil
 EP_RETRY   = 3
 EP_LINGER  = 8000
 
@@ -10221,6 +10327,24 @@ function e3_hold(owner)
         -- This is a ceiling, not a wait - it returns the moment E3 reports paused.
         mq.delay(2500, function() return e3_is_paused() == true end)
         local st = e3_is_paused()
+        if st == false then
+            -- STILL CASTING? THEN IT IS NOT IGNORING US, IT IS BUSY.
+            -- E3's cast loop processes network commands but never drains the /e3p queue - the only call
+            -- that would is E3.IsPaused(), and it is commented out in Casting.cs. So while a cast is in
+            -- flight the pause we sent sits unapplied, and the probe honestly reports "not paused".
+            -- An emergency heal is the usual culprit: it starts on E3's own initiative and can run for
+            -- seconds. Re-sending /e3p on achieves nothing - the first one is already queued - so wait
+            -- for the cast to end instead, at which point E3's loop drains the queue and the pause lands.
+            local casting = 0
+            pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+            if casting > 0 then
+                rezlog('[e3] pause is queued behind a cast in flight - waiting for it to finish')
+                mq.delay(6000, function()
+                    return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 and e3_is_paused() == true
+                end)
+                st = e3_is_paused()
+            end
+        end
         if st == false then
             -- It took the command and is still running. Say it plainly rather than carrying on and
             -- wondering later why E3 healed through a placate or stepped on a /nowcast.
@@ -11707,6 +11831,29 @@ end
 
 function ep_tick()
     if not ep_is_enchanter() then return end
+    -- NOT WHILE SOMETHING ELSE IS CASTING - but only briefly. Firing straight back into a heal that is
+    -- still going just gets cut again, so a short wait helps.
+    -- It cannot be an unconditional wait, though: the character casting placate is usually also the
+    -- healer, and in a zone with an AE DoT it heals almost continuously. Waiting for it to be idle would
+    -- mean placate never fires at all.
+    -- So: hold off while a cast is in flight, but give up waiting after EP_BUSY_MAX and try anyway. An
+    -- attempt that gets interrupted costs nothing now that the try is refunded above.
+    do
+        local casting = 0
+        pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+        -- ALREADY CASTING? WAIT A MOMENT. Firing into a cast in progress gets cut, so a short pause is
+        -- worth taking - but only a short one. On a character that heals continuously there may never be
+        -- a silent moment, and never casting is worse than being interrupted: a cut costs a gem cycle,
+        -- a mob left unplacated costs the pull.
+        -- Bounded at EP_BUSY_MAX, then go regardless. The try is refunded when the cast does not go out,
+        -- so an attempt that gets cut costs nothing that matters.
+        if casting > 0 then
+            epBusySince = epBusySince or mq.gettime()
+            if (mq.gettime() - epBusySince) < EP_BUSY_MAX then return end
+        else
+            epBusySince = nil
+        end
+    end
     -- ANYTHING ON THE CURSOR STOPS THE WHOLE TICK. The per-cast checks below catch it at the moment of
     -- casting, but by then the run may already have stripped gear or targeted a mob - and an item held
     -- while any of that happens is how it gets put somewhere nobody expects.
@@ -11799,6 +11946,19 @@ function ep_tick()
     -- standing down left a character stripped with E3 paused for three minutes.
     -- Everything in epQueue is now, by construction, work addressed to this character.
 
+    -- HARD BACKSTOP ON A CAST THAT NEVER RESOLVED.
+    -- epCast blocks everything while it is set: this function returns just below and /at_epclear refuses.
+    -- So if it is ever left set, placate stops entirely and stays stopped - which is the reported symptom
+    -- after an emergency heal cuts a cast.
+    -- Every verification branch has an exit and I could not find the one that misses, so this does not
+    -- claim to know the cause. It bounds the damage: nothing legitimate holds a cast for thirty seconds,
+    -- and losing one placate is far better than losing the subsystem for the rest of the session.
+    -- Loud on purpose - if it ever fires there IS a missing exit and it is worth finding.
+    if epCast and (mq.gettime() - (epCast.at or 0)) > EP_CAST_HARD_MAX then
+        rezlog('\\ar[placate] cast on %s never resolved after %ds - clearing so placate can carry on\\ax',
+               epCast.name or '?', EP_CAST_HARD_MAX / 1000)
+        epCast = nil
+    end
     if epCast then
         -- PLACATE HAS A CAST TIME, so nothing can be concluded while it is still going out. This used to
         -- read the gem timer immediately and call the job done the moment it moved, which reported a
@@ -11910,10 +12070,13 @@ function ep_tick()
             return
         end
         if epCast.tries < EP_RETRY then
-            -- An interrupted cast does not spend a retry. EP_RETRY exists to stop us re-casting forever
-            -- at a mob that keeps resisting; a cast we cancelled ourselves because an item appeared on
-            -- the cursor tells us nothing about the mob and should not count against it.
-            if epCast.freeRetry then epCast.freeRetry = false
+            -- A CAST THAT NEVER WENT OUT DOES NOT SPEND A RETRY, and sawCast is how we know: it is set
+            -- when we watch ourselves casting, so false means the spell never started. E3 cutting it for
+            -- a heal looks exactly like that, and so does our own cursor cancel.
+            -- No message parsing needed for any of it. Reading E3's interrupt text meant guessing at its
+            -- wording, and then telling our own cast apart from every other character's - two problems
+            -- that do not exist if we simply notice our spell did not go out.
+            if epCast.freeRetry or not epCast.sawCast then epCast.freeRetry = false
             else epCast.tries = epCast.tries + 1 end
             epCast.at, epCast.sawCast, epCast.checkTries = mq.gettime(), false, 0
             -- NOTHING ON THE CURSOR, on a retry as much as on a first cast. Casting while holding an item
@@ -11926,7 +12089,17 @@ function ep_tick()
                        epCast.name, epCast.id or 0, tostring(mq.TLO.Cursor.Name() or '?'))
                 return
             end
-            rezlog('[placate] did not land on %s#%d - retry %d of %d', epCast.name, epCast.id or 0, epCast.tries, EP_RETRY)
+            -- THE INPUTS, NOT JUST THE VERDICT. 'did not land' is the same line whether the cast was cut,
+            -- resisted, out of range or aimed at something above the ceiling - and telling those apart by
+            -- guessing is what produced three wrong theories in a row.
+            local casting, tlvl, tdist = 0, 0, 0
+            pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+            pcall(function() tlvl = tonumber(mq.TLO.Spawn(epCast.id).Level()) or 0 end)
+            pcall(function() tdist = math.floor(tonumber(mq.TLO.Spawn(epCast.id).Distance()) or 0) end)
+            rezlog('[placate] did not land on %s#%d - retry %d of %d (sawCast=%s casting=%s lvl=%d cap=%d dist=%d)',
+                   epCast.name, epCast.id or 0, epCast.tries, EP_RETRY,
+                   tostring(epCast.sawCast), (casting > 0) and 'yes' or 'no',
+                   tlvl, (pacCap[myName] or {}).cap or 0, tdist)
             if (tonumber(mq.TLO.Target.ID()) or 0) ~= epCast.id then
                 pcall(function() mq.cmdf('/target id %d', epCast.id) end)
                 mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == epCast.id end)
@@ -12153,8 +12326,10 @@ function ep_tick()
     rezlog('[placate] %s on %s#%d%s', sp, next_e.name, next_e.id or 0,
            hadBuff and string.format(' (refresh - %ds left)', preDur) or '')
     pcall(function() mq.cmdf('/nowcast me "%s" %d', sp, next_e.id) end)
+    -- spell = WHAT we are casting, so an interrupt message can be matched against it. Without this the
+    -- interrupt handler had no way to tell our cast from anyone else's and reacted to all of them.
     epCast = { id = next_e.id, name = next_e.name, at = mq.gettime(), tries = 1, sawCast = false,
-               checkTries = 0, hadBuff = hadBuff, preDur = preDur }
+               checkTries = 0, hadBuff = hadBuff, preDur = preDur, spell = ep_spell() }
 end
 
 -- ===== PHANTOM LINE (placate) =====
@@ -12446,7 +12621,8 @@ function pw_tick()
     mq.delay(250)
     rezlog('[pw] %s on %s @%dm', disc.name, e.name, dist)
     pcall(function() mq.cmdf('/disc %s', disc.name) end)
-    pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev }
+    pwCast = { id = e.id, name = e.name, at = mq.gettime(), tries = 1, prevTarget = prev,
+               spell = pwDisc }
 end
 
 -- NIGHTVEIL EMBLEMS, grouped by role. One button per character plus an All per row, because the two
