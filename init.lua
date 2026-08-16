@@ -50,8 +50,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.12'
-local BUILD_TAG = '1.12'  -- bump on every change; prints on startup
+VERSION = '1.14'
+local BUILD_TAG = '1.14'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -163,7 +163,30 @@ AT_PHASE_RING = {}
 AT_PHASE_N    = 0
 AT_PHASE_AT   = 0
 AT_PHASE_KEEP = 10
+-- WHICH PHASE ATE THE TICK.
+-- The loop is shared: whatever one subsystem does, everything else waits for. That is fine until
+-- something time-critical is waiting - two invis casters counting to the same deadline had one of them
+-- pick the message up 3928ms late on 2026-08-16 13:08, and nothing in the log said what it was doing.
+-- Every phase change closes the previous phase and records how long it took. A pass that runs long says
+-- so, once, with the worst offender named - which turns 'something blocked' into 'THIS blocked'.
+AT_SLOW_MS   = 700      -- a phase slower than this is worth a line
+AT_slowSaid  = 0
 function atphase(name)
+    -- Close the previous phase first: this is the only place we know it has ended.
+    if AT_phaseAt and AT_phaseName then
+        local took = mq.gettime() - AT_phaseAt
+        if took >= AT_SLOW_MS and (mq.gettime() - AT_slowSaid) > 3000 then
+            AT_slowSaid = mq.gettime()
+            -- RECORD IT, DO NOT LOG IT HERE. atphase sits near the top of the file and `log` is a LOCAL
+            -- declared a hundred lines further down - so it is not in scope at this point and never will
+            -- be, because a local cannot be resolved later the way a global can. Calling it threw
+            -- 'attempt to call global log (a nil value)' and took the script down on load.
+            -- The main loop drains this once it is running, where log certainly exists.
+            AT_slowPending = string.format('%s held the loop for %dms - everything else waited',
+                                           AT_phaseName, took)
+        end
+    end
+    AT_phaseName, AT_phaseAt = name, mq.gettime()
     -- Collapse repeats: idle every tick would otherwise push everything interesting out of the ring.
     local last = AT_PHASE_RING[((AT_PHASE_N - 1) % AT_PHASE_KEEP) + 1]
     if last and last.name == name then last.n = (last.n or 1) + 1; last.t = mq.gettime(); return end
@@ -1059,10 +1082,40 @@ countsPushAt, countsPushLast = 0, ''   -- worker side: when we last pushed, and 
 COUNTS_FRESH = 90000 -- a push older than this is not trusted; the pass re-pulls that peer
 
 function counts_push_blob()
+    -- ONE PASS OVER THE BAGS, counting every item as we go.
+    -- This used to call my_count once per item, and my_count walks all twelve bags from scratch - so
+    -- eighteen items meant eighteen full inventory walks, thousands of TLO reads, and the loop stopped
+    -- dead for THREE TO FOUR SECONDS every time it ran. The slow-phase timer caught it holding the tick
+    -- for 4001ms, which is where the invis stagger came from: a caster mid-push picks its cast message up
+    -- four seconds late.
+    -- Walking once and tallying is the same information for a fraction of the reads.
+    local want = {}
+    for i, it in ipairs(ITEMS) do want[(it or ''):lower()] = i end
+    local tally = {}
+    pcall(function()
+        for pk = 1, 12 do
+            local slot = mq.TLO.Me.Inventory('pack' .. pk)
+            if (tonumber(slot.ID()) or 0) > 0 then
+                local cap = tonumber(slot.Container()) or 0
+                if cap > 0 then
+                    for s = 1, cap do
+                        local it = slot.Item(s)
+                        local nm = tostring(it.Name() or ''):lower()
+                        local idx = want[nm]
+                        if idx then tally[idx] = (tally[idx] or 0) + (tonumber(it.Stack()) or 1) end
+                    end
+                else
+                    -- Not a bag: the pack slot holds the item itself.
+                    local nm = tostring(slot.Name() or ''):lower()
+                    local idx = want[nm]
+                    if idx then tally[idx] = (tally[idx] or 0) + (tonumber(slot.Stack()) or 1) end
+                end
+            end
+        end
+    end)
     local parts = {}
-    for i, it in ipairs(ITEMS) do
-        local n = my_count(it)
-        if n > 0 then parts[#parts + 1] = i .. ':' .. n end
+    for i = 1, #ITEMS do
+        if (tally[i] or 0) > 0 then parts[#parts + 1] = i .. ':' .. tally[i] end
     end
     -- Only non-zero entries travel. Everything absent is zero, which is most of the list on most toons.
     return (#parts > 0) and table.concat(parts, ',') or '-'
@@ -2613,333 +2666,577 @@ end
 -- summoner. Pulling emblem-holders FIRST therefore doubles the number of summoners each round:
 -- 1 -> 2 -> 4 -> 6, instead of one toon casting five times against a long reuse timer.
 -- Same-zone only: the summon needs a spawn ID, so someone at bind in another zone is unreachable.
+-- ===== CALL OF THE HERO =====
+-- REWRITTEN. The previous version accumulated three overlapping mechanisms - two ways to claim a target,
+-- two ways to decide a summon had failed, and an assignment layer bolted over a round robin that was
+-- already doing the same job. Every one of them worked alone; together they contradicted each other and
+-- the same target got summoned three times while nobody noticed it had already arrived.
+--
+-- The rules this time, and there are only four:
+--
+--   1. THE ANCHOR IS A PLACE, NOT A PERSON. Captured when the gather starts and broadcast as coordinates.
+--      A character can walk away from where it was standing; a point cannot. Everyone measures against
+--      the same fixed spot, so "am I there yet" has one answer that every client agrees on.
+--
+--   2. A SUMMONER MUST HOLD A USABLE EMBLEM. Checked when the gather starts, and said out loud if not -
+--      a gather that silently cannot summon anybody is the worst failure of the lot.
+--
+--   3. WORK IS SPLIT THE WAY PLACATE SPLITS IT. Emblem holders are pulled first, because each one lands
+--      and becomes another summoner. After that every summoner takes its own slice of the list, computed
+--      the same way on every client, so two of them cannot choose the same target.
+--
+--   4. ARRIVAL IS THE TARGET'S OWN POSITION CHANGING. A summon teleports you: your coordinates jump. The
+--      summoned character watches its OWN x,y,z - a local read, no lag, no report to go stale - and says
+--      when it moves. Nobody infers arrival from anything else, and nothing else is allowed an opinion.
 COTH = {
     ITEM   = 'Wayfarers Brotherhood Emblem',
     OPTS   = '/CastType|Item/NoInterrupt',   -- it has a cast time, so it can be interrupted
-    RANGE  = 50,           -- within this of the anchor AND in line of sight = 'gathered'
-    active = false,        -- gather in progress
-    state  = {},           -- name -> { emblem, dist, updated }
-    claims = {},           -- name -> expiry, so two summoners don't grab the same target
-    lastPush = 0, lastPoll = 0, castAt = 0, startedAt = 0, dbg = '',
-    pending = nil,         -- { name, at } : who I summoned, awaiting confirmation they arrived
-    anchor  = nil,         -- who everyone is gathering ON: whoever STARTED this gather
+    RANGE  = 50,           -- within this of the anchor POINT counts as gathered
+    JUMPED = 75,           -- moving further than this in one go is a summon, not walking
+    active = false,
+    state  = {},           -- name -> { emblem, dist, updated } : emblem timer + distance to the anchor
+    at     = nil,          -- { x, y, z, zone, who } : the anchor POINT, and who set it (for LOS)
+    skip   = {},           -- name -> when I may consider them again, after they told me no
+    grey   = {},           -- name -> when I cast at them: assumed arrived until they say otherwise
+    absent = {},           -- summoner -> when they first read as away, so a blip does not lose their job
+    startedAt = 0, lastPush = 0, lastPoll = 0, dbg = '',
+    pending = nil,         -- { name, at, cast } : who I am summoning and how it is going
 }
 
--- Who everyone is gathering ON: the driver.
--- Who everyone gathers ON. Whoever started the gather, not whoever runs the UI - so /atcoth from any
--- character pulls the group to THAT character. Falls back to the driver only if a gather is somehow
--- running without an anchor having been announced.
-function coth_anchor()
-    if COTH.anchor and COTH.anchor ~= '' then return COTH.anchor end
-    if SHOW_UI then return myName end
-    return driverName
+-- Am I standing at the anchor point AND able to see it? Distance alone is not 'with the group' - forty
+-- units through a wall is not gathered, and a summon is exactly what fixes that.
+-- The point answers distance, because a point does not wander. Line of sight needs something to test
+-- against, so the anchor also carries the name of whoever set it - the one thing a coordinate cannot do.
+-- If that character is not in the zone the LOS test is skipped rather than failed: no spawn is ignorance,
+-- not evidence, and refusing to gather on ignorance is how the old version stalled.
+function coth_here(nm)
+    -- HOLD THE TABLE, do not keep reading the global. coth_tick blocks for the whole emblem cast, and
+    -- /at_cothgo off can arrive during that yield and set COTH.at to nil - so a guard at the top of a
+    -- function is no guarantee the field is still there four lines later. It threw exactly that on
+    -- 2026-08-15 03:59:34, one hundred and fifty milliseconds after 'gather stopped'.
+    local anchor = COTH.at
+    if not anchor then return false end
+    if nm and nm:lower() ~= myName:lower() then
+        -- THEIR VERDICT, not our arithmetic on their numbers. They measured range and line of sight on
+        -- their own client, which is the only one that can see their surroundings - and an arrival report
+        -- sets this the instant they land, rather than waiting for the next push.
+        local st = COTH.state[nm]
+        if not st then return false end
+        if st.here ~= nil then return st.here == 1 end
+        return (st.dist or -1) >= 0 and st.dist <= COTH.RANGE and (st.los or 0) == 1
+    end
+    local z = 0
+    pcall(function() z = tonumber(mq.TLO.Zone.ID()) or 0 end)
+    if anchor.zone ~= 0 and z ~= anchor.zone then return false end
+    local d = coth_dist_to_anchor()
+    if d > COTH.RANGE then return false end
+    -- CLOSE ENOUGH IS CLOSE ENOUGH. LineOfSight came back FALSE at ZERO distance from the anchor on
+    -- 2026-08-15 04:35:39 - a character standing on the spot it was summoned to, told it could not see
+    -- the summoner. The read is unreliable for a moment after a teleport, before the client settles.
+    -- Inside this radius the answer cannot be anything but yes, so do not ask.
+    if d <= COTH_LOS_FREE then return true end
+    return coth_los() == 1
 end
 
--- WHERE IS THE EMBLEM SOCKETED? An aug is readable as a sub-item of whatever it sits in -
--- Me.Inventory[slot].Item[n] - so the equipped slots can be walked to find it.
--- Worth knowing because the click only works from a CHARM. FindItem finds the aug wherever it is, so
--- the current check says "you have it" for an emblem sitting in a primary, and then the summon quietly
--- does nothing. That note in the settings tooltip is the only thing that has been enforcing it.
--- Returns slot name and aug index, or nil.
-AUG_SLOTS = { 'charm', 'mainhand', 'offhand', 'ranged', 'head', 'chest', 'arms', 'wrist', 'hands',
-              'legs', 'feet', 'neck', 'back', 'waist', 'ear1', 'ear2', 'ring1', 'ring2',
-              'leftfinger', 'rightfinger', 'shoulder', 'face', 'powersource' }
--- Find a named aug in any equipped slot. Returns slot, aug index, and the item carrying it.
--- Generic because two things need it now: the CoTH emblem and the Nightveil emblem, both of which only
--- fire from a charm and both of which FindItem will happily report from a bag.
-function find_aug(name)
-    for _, slot in ipairs(AUG_SLOTS) do
-        local carrier = ''
-        pcall(function() carrier = tostring(mq.TLO.Me.Inventory(slot).Name() or '') end)
-        if carrier ~= '' then
-            for a = 1, 6 do
-                local aug = ''
-                pcall(function() aug = tostring(mq.TLO.Me.Inventory(slot).Item(a).Name() or '') end)
-                if aug ~= '' and aug:lower() == (name or ''):lower() then
-                    return slot, a, carrier
-                end
-            end
-        end
-    end
-    return nil
+-- 1 = I can see the anchor character, or there is nobody to check against. 0 = they are there and I
+-- cannot see them.
+function coth_los()
+    local anchor = COTH.at
+    local by = anchor and anchor.by
+    if not by or by == '' or by:lower() == myName:lower() then return 1 end
+    local id = 0
+    pcall(function() id = tonumber(mq.TLO.Spawn('pc =' .. by).ID()) or 0 end)
+    if id <= 0 then return 1 end                      -- not in zone: cannot tell, do not block on it
+    local los = false
+    pcall(function() los = tlo_true(mq.TLO.Spawn('pc =' .. by).LineOfSight()) end)
+    return los and 1 or 0
 end
-function coth_find_aug() return find_aug(COTH.ITEM) end
 
--- Say where it is and whether that will actually work. Called by /atcothaug and once at startup.
-function coth_aug_report(quiet)
-    local slot, idx, carrier = coth_find_aug()
-    if not slot then
-        local loose = 0
-        pcall(function() loose = tonumber(mq.TLO.FindItemCount('=' .. COTH.ITEM)()) or 0 end)
-        if loose > 0 then
-            log('[coth] %s is in your bags rather than socketed - that is fine, it clicks from there', COTH.ITEM)
-        elseif not quiet then
-            log('[coth] no %s found on this character', COTH.ITEM)
-        end
-        return false
-    end
-    if slot == 'charm' then
-        if not quiet then
-            log('\\ag[coth] %s is aug %d in %s (charm) - good\\ax', COTH.ITEM, idx, carrier)
-        end
-        return true
-    end
-    -- Socketed, but somewhere the click will not reach.
-    log('\\ar[coth] %s is aug %d in %s (%s) - it must be in a CHARM to work\\ax',
-        COTH.ITEM, idx, carrier, slot)
-    return false
+function coth_dist_to_anchor()
+    local anchor = COTH.at
+    if not anchor then return 99999 end
+    local x, y, z = 0, 0, 0
+    pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+    pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+    pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+    local dx, dy, dz = x - anchor.x, y - anchor.y, z - anchor.z
+    return math.floor(math.sqrt(dx*dx + dy*dy + dz*dz))
+end
+
+-- Can I actually click the emblem? Owning it is not the same as being able to use it: it has to be
+-- equipped or in a bag the client will click from, and its timer has to be ready.
+-- Returns seconds remaining: 0 ready, >0 cooling, -1 do not have one.
+function coth_emblem()
+    local id = 0
+    pcall(function() id = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0 end)
+    if id <= 0 then return -1 end
+    local t = -1
+    pcall(function() t = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
+    if t < 0 then t = 0 end
+    return t
 end
 
 function coth_read_self()
-    -- OWNING IT IS NOT THE SAME AS BEING ABLE TO CLICK IT. FindItem finds the emblem wherever it is -
-    -- bags, a primary, a charm - so this reported "have it, ready" for an emblem that could never fire,
-    -- and the gather then picked that character as a summoner and got nothing.
-    -- Only a charm counts. Checked once and cached: augs do not move mid-fight, and walking twenty-odd
-    -- equipment slots every read would be silly.
-    -- USABLE FROM A BAG. This used to require the aug to sit in an EQUIPPED charm, mirroring the rule
-    -- the Nightveil emblem really does have (EffectType 4, "Click Worn"). The Wayfarers emblem does not
-    -- share that rule - it fires perfectly well from a charm sitting in a bag, and the click at the
-    -- bottom of this file has always used FindItem by name, which reaches into bags.
-    -- So the gate was stricter than the click: find_aug walks equipped slots only, returned nil for a
-    -- bagged charm, and this character reported "no emblem" while being entirely capable of summoning.
-    -- The test now is simply whether the client can find the item at all.
-    -- NOT CACHED WHEN FALSE. The old cache latched on the first look and never re-checked, so moving the
-    -- charm into a bag disabled the character until a reload - and moving it back did not bring it back.
-    local em = -1
-    if cothAugOk ~= true then
-        local found = 0
-        pcall(function() found = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0 end)
-        cothAugOk = (found > 0)
-        if not cothAugOk then coth_aug_report(true) end
-    end
-    if cothAugOk then
-        pcall(function()
-            if (tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0) > 0 then
-                em = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or 0
-            end
-        end)
-    end
-    local d, los = -1, 0
-    local a = coth_anchor()
-    if a and a:lower() == myName:lower() then
-        d, los = 0, 1                           -- I am the anchor
-    elseif a then
-        pcall(function()
-            local sp = mq.TLO.Spawn('pc =' .. a)
-            if (tonumber(sp.ID()) or 0) > 0 then
-                d = math.floor(tonumber(sp.Distance()) or -1)
-                if sp.LineOfSight() == true then los = 1 end
-            end
-        end)
-    end
-    return em, d, los
+    local em = coth_emblem()
+    local d  = COTH.at and coth_dist_to_anchor() or -1
+    return em, d, coth_los()
 end
 
--- 'Gathered' means actually WITH the anchor: close enough AND in line of sight, so someone stuck the
--- other side of a wall at 40 units still counts as away and gets pulled.
-function coth_gathered(nm)
-    local st = COTH.state[nm]
-    if not st then return false end
-    return (st.dist or -1) >= 0 and st.dist <= COTH.RANGE and (st.los or 0) == 1
-end
-
--- Targets worth summoning, best first: emblem-HOLDERS lead, because each one we pull becomes a summoner.
+-- Everyone still away from the anchor point, emblem holders first: each one we pull becomes a summoner,
+-- so pulling them first is what turns one summoner into three.
 function coth_targets()
     local hold, rest, now = {}, {}, mq.gettime()
     for _, nm in ipairs(group_members()) do
-        local st = COTH.state[nm]
-        -- Require FRESH evidence that they're away. With no report yet, 'not gathered' is just
-        -- ignorance - and acting on it is what made all six toons summon each other at once.
-        local known = st and (now - (st.updated or 0)) < 6000
-        if known and not coth_gathered(nm) then
-            if (st.emblem or -1) >= 0 then hold[#hold + 1] = nm else rest[#rest + 1] = nm end
-        end
-    end
-    for _, nm in ipairs(rest) do hold[#hold + 1] = nm end
-    return hold
-end
-
--- Start or stop the gather, and tell the group. The Misc tab button, the mini button and /atcoth all
--- come through here so the three can never drift apart. Callable from ANY toon, not just the driver:
--- the binds are registered everywhere, so whoever runs /atcoth becomes the one who kicks it off.
-function coth_set(on, anchor)
-    COTH.active = on and true or false
-    anchor = (anchor and anchor ~= '' and anchor) or myName
-    if COTH.active then
-        COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime()
-        COTH.anchor = anchor
-        COTH.state  = {}   -- distances were measured against the OLD anchor; they mean nothing now
-    else
-        COTH.anchor = nil
-    end
-    for _, nm in ipairs(group_members()) do
         if nm:lower() ~= myName:lower() then
-            peer_cmdf(nm, '/at_cothgo %s %s', COTH.active and 'on' or 'off', anchor)
+            local st = COTH.state[nm]
+            -- Fresh evidence only. With no report yet, 'not here' is ignorance rather than fact, and
+            -- acting on it is what once had all six characters summoning each other at once.
+            -- Grey counts as here for queueing purposes: somebody has already cast at them and we are
+            -- waiting to hear. Re-summoning during that window is the duplicate this exists to stop.
+            local skipped = COTH.skip[nm] and now < COTH.skip[nm]
+            local grey    = COTH.grey[nm] and (now - COTH.grey[nm]) < COTH_GREY_MS
+            if st and (now - (st.updated or 0)) < 6000 and not coth_here(nm)
+               and not skipped and not grey then
+                if (st.emblem or -1) >= 0 then hold[#hold + 1] = nm else rest[#rest + 1] = nm end
+            end
         end
     end
-    log('[coth] gather %s%s', COTH.active and 'started' or 'stopped',
-        COTH.active and (' - gathering on ' .. anchor) or '')
+    table.sort(hold); table.sort(rest)
+    for _, nm in ipairs(rest) do hold[#hold + 1] = nm end
+    -- A BARD GOES TO THE BACK. Every other emblem holder we pull becomes a summoner we can rely on;
+    -- a bard becomes one we have to fire blind with. Fetch the dependable ones first and the bard last,
+    -- by which point the chain is running on its own and the blind cast is a tidy-up rather than a
+    -- link everything else depends on.
+    local ordered, bards = {}, {}
+    for _, nm in ipairs(hold) do
+        if (member_class(nm) or ''):upper() == 'BRD' then bards[#bards + 1] = nm
+        else ordered[#ordered + 1] = nm end
+    end
+    for _, nm in ipairs(bards) do ordered[#ordered + 1] = nm end
+    return ordered
 end
 
+-- NOBODY REASSIGNS. The queue is simply who still needs summoning; a summoner takes one and keeps it
+-- until it lands or fails, and a summoner that arrives later picks up whatever is left.
+-- An anchor that reshuffled the list every pass was the previous attempt, and it took work away from a
+-- character that had only just become able to do it - Khulian was given Lunafeet at 04:03:38 and had it
+-- taken back fourteen seconds later, so it summoned nobody at all.
+-- Two summoners can still reach for the same name. That is settled by ASKING FIRST: the target says
+-- 'busy' if somebody already has it, and a round trip is a few tens of milliseconds against a ten second
+-- cast, so the question is free and the emblem is never wasted on a duplicate.
+
+-- IS EVERYBODY ACTUALLY HERE? A different question from 'is the queue empty', and the one that decides
+-- whether a gather is finished.
+-- The queue leaves out anyone grey or briefly skipped, so it empties while people are still in transit -
+-- and a gather that concludes then declares success over characters that never moved. Waiting for every
+-- member to report being with the group catches a missed cast on its own: they stay away, their grey
+-- expires, they go back in the queue and somebody fetches them. No extra guard needed for it.
+-- Somebody who has never reported at all counts as away, not as fine.
+function coth_all_here()
+    for _, nm in ipairs(group_members()) do
+        if nm:lower() == myName:lower() then
+            if not coth_here() then return false, nm end
+        else
+            local st = COTH.state[nm]
+            if not st then return false, nm end
+            if not coth_here(nm) then return false, nm end
+        end
+    end
+    return true
+end
+
+-- Everyone at the anchor with a ready emblem, in one order every client computes identically.
+function coth_summoners()
+    local out, now = {}, mq.gettime()
+    for _, nm in ipairs(group_members()) do
+        local st = COTH.state[nm]
+        if nm:lower() == myName:lower() then
+            if coth_here() and coth_emblem() == 0 then out[#out + 1] = nm end
+        elseif st and (now - (st.updated or 0)) < 6000 and coth_here(nm) and (st.emblem or -1) == 0 then
+            out[#out + 1] = nm
+        end
+    end
+    table.sort(out)
+    return out
+end
+
+function coth_set(on, at)
+    if on then
+        -- CAPTURE THE POINT, not the person. Whoever starts it fixes the spot; if they wander off
+        -- afterwards the gather still means the same place.
+        if at then
+            COTH.at = at
+        else
+            local x, y, z, zn = 0, 0, 0, 0
+            pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+            pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+            pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+            pcall(function() zn = tonumber(mq.TLO.Zone.ID()) or 0 end)
+            COTH.at = { x = x, y = y, z = z, zone = zn, by = myName }
+            pcall(function() peer_bcast('/at_cothat %d %d %d %d %s', x, y, z, zn, myName) end)
+        end
+        COTH.active, COTH.startedAt, COTH.pending = true, mq.gettime(), nil
+        COTH.skip, COTH.grey, COTHW = {}, {}, nil
+        COTH.saidDone, COTH.quietAt, COTH.saidWait = nil, nil, nil
+        COTH.mine = 0
+        pcall(function() peer_bcast('/at_cothgo on') end)
+        rezlog('[coth] gather started - anchor point %d,%d,%d',
+               COTH.at and COTH.at.x or 0, COTH.at and COTH.at.y or 0, COTH.at and COTH.at.z or 0)
+        -- SAY SO IF I CANNOT HELP. A gather where nobody can summon looks identical to one that is simply
+        -- slow, and that is worth ten seconds of nobody understanding why nothing happened.
+        local em = coth_emblem()
+        if em < 0 then
+            log('\\ay[coth] I have no %s - I cannot summon anybody\\ax', COTH.ITEM)
+        elseif em > 0 then
+            log('[coth] my emblem is %ds into reuse - I will summon when it is ready', em)
+        end
+    else
+        COTH.active, COTH.pending, COTH.at, COTHW = false, nil, nil, nil
+        COTH.dbg = ''
+        pcall(function() peer_bcast('/at_cothgo off') end)
+        rezlog('[coth] gather stopped')
+    end
+end
+
+-- Runs on the SUMMONED character: has my own position jumped? That is the only test for arrival, and it
+-- needs nobody's cooperation - a summon teleports you, so your coordinates move further in one tick than
+-- any amount of running could.
+COTHW = nil
+function coth_watch_tick()
+    local w = COTHW
+    if not w then return end
+    local x, y, z = 0, 0, 0
+    pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+    pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+    pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+    local dx, dy, dz = x - w.x, y - w.y, z - w.z
+    local moved = math.floor(math.sqrt(dx*dx + dy*dy + dz*dz))
+    if moved >= COTH.JUMPED then
+        -- MY WHOLE PICTURE AT THE MOMENT I LAND. If I am about to decide I am NOT with the group, this
+        -- line says which half failed - too far from the point, or no line of sight to the anchor.
+        local a = COTH.at
+        rezlog('[coth] I was moved %d - telling %s I arrived (%d from the anchor, limit %d, los=%d to %s)',
+               moved, w.by, coth_dist_to_anchor(), COTH.RANGE, coth_los(), a and a.by or '?')
+        -- Arrival is the expected case and does not need announcing to five other people; the summoner
+        -- hears it directly and the log has it. Only the failures are worth the channel.
+        -- EVERYONE, not just the character that summoned me. On 2026-08-15 04:41 Stylin told Khulian it
+        -- had arrived and Nityrc summoned it six seconds later, working from a report that had gone stale
+        -- because Stylin - believing the gather finished - had stopped pushing.
+        -- One broadcast settles the whole group's view; a directed message settles one client's.
+        pcall(function() peer_bcast('/at_cotharrived %s', myName) end)
+        COTHW = nil
+        return
+    end
+    -- Not moved yet. The clock only starts once the summoner says its cast has finished - before that
+    -- there is nothing to have happened, and judging early is what made a summoner recast into its own
+    -- cast still in flight.
+    if not w.cast then return end
+    if (mq.gettime() - w.castAt) > COTH_SETTLE then
+        rezlog('[coth] %s finished casting and I did not move - telling them', w.by)
+        pcall(function() mq.cmdf('/gsay CoTH: %s cast but I did NOT move - still %d away',
+                                 w.by, coth_dist_to_anchor()) end)
+        pcall(function() peer_cmdf(w.by, '/at_cothhere %s no failed', myName) end)
+        COTHW = nil
+    end
+end
+
+cothSetWanted = nil    -- set by the CoTH buttons; the tick calls coth_set, because it broadcasts
+magicWanted   = nil    -- set by a Countermeasures button; the tick casts it
+pacDelWanted  = nil    -- set by the placate 'x' button; the tick tells the group
+-- How long to leave a target alone after it says no. 'Busy' means somebody else's summon is already on
+-- the way, so this covers the rest of that cast and the landing; a failure is worth retrying sooner.
+-- How long a summoner may read as 'not here' before its assignment is handed to somebody else. Long
+-- enough to ride out a client settling after a summon; short enough that a genuinely lost summoner does
+-- not hold a target hostage.
+COTH_SUMMONER_GRACE = 8000
+-- How long to wait for a 'busy' before committing the emblem. One relay hop, generously.
+-- GREY: how long a character stays assumed-arrived after we cast at them.
+-- The summon lands well before their next position push does, so between the cast finishing and their
+-- report catching up they look exactly like somebody who still needs fetching - which is how the same
+-- character got summoned twice in a row. Assuming it worked closes that window; the assumption is
+-- corrected either by their arrival report or by this expiring.
+-- Long enough for the client to move them and say so, short enough that a genuinely failed summon is
+-- back in the queue quickly.
+-- Within this of the anchor, line of sight is not consulted: at a few paces there is nothing to be
+-- blocked by, and the read is untrustworthy in the seconds after a summon lands.
+-- A bard has no cast bar for the emblem, so this is how long to allow for a blind cast before moving on.
+-- Generous against the ten second emblem; being early only means the next summon waits a moment.
+COTH_BARD_CAST = 11000
+-- How many summons a bard does before handing over, if anyone else can take it.
+COTH_BARD_MAX  = 2
+COTH_LOS_FREE  = 25
+-- How long to keep reporting after deciding the gather is over. Covers the gap where somebody else has
+-- not reached the same conclusion and is still deciding from my last report.
+COTH_LINGER    = 15000
+COTH_GREY_MS   = 8000
+COTH_ASK_MS    = 400
+COTH_SKIP_BUSY = 15000
+COTH_SKIP_FAIL = 4000
+COTH_SETTLE  = 3000    -- after the cast lands, how long to allow for the client to actually move me
+COTH_GIVE_UP = 25000   -- backstop for a target that never answers at all: crashed, zoned, gone
 
 local function coth_tick()
-    if not COTH.active then return end
+    -- Still reporting after the gather ends, briefly: see COTH.quietAt below.
     local now = mq.gettime()
-    -- Watch the cast rather than guessing at a duration. The catch is that Me.Casting doesn't register
-    -- the instant you fire, so checking immediately reads 'not casting' and we'd move on mid-cast -
-    -- hence the 1s settle before the check is trusted. After that, the moment casting ends we're free,
-    -- so a fast cast doesn't cost us a fixed wait. (Same pattern the rez cast machine uses.)
-    if COTH.castAt > 0 then
-        if (now - COTH.castAt) < 1000 then return end
-        -- (A rez claim-refresh block used to sit here. It was copied in with the cast-watch pattern
-        -- from the rez machine, but CoTH has no corpse and no claim - rezCast is nil in this path, so
-        -- every CoTH summon died on "attempt to index global 'rezCast'". Removed; the cast watch below
-        -- is the only part that belonged.)
-        local casting = false
-        pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
-        if casting then COTH.dbg = 'casting...'; return end
-        COTH.castAt = 0
+    if not COTH.active then
+        if COTH.quietAt and (now - COTH.quietAt) < COTH_LINGER then
+            local em, d, los = coth_read_self()
+            if (now - COTH.lastPush) > 1000 then
+                COTH.lastPush = now
+                pcall(function()
+                    peer_bcast('/at_coth %s %d %d %d %d', myName, em, d, los, coth_here() and 1 or 0)
+                end)
+            end
+        end
+        return
     end
-    -- Confirm the last summon landed before considering anyone else. Everyone pushes their distance
-    -- every 2s, so we wait for THEIR report rather than assuming. Without this, summoners re-fired the
-    -- moment the claim lapsed and the same toon got summoned two or three times.
+
+    -- Report my own emblem and distance so the others can plan. Change-gated with a slow keepalive.
+    -- Note this runs BEFORE the 'is everyone here' check below, so a character that thinks the gather is
+    -- finished still reports for a while - the others may not agree yet, and a silent character reads as
+    -- a stale one.
+    if (now - COTH.lastPush) > 1000 then
+        COTH.lastPush = now
+        -- Send the VERDICT alongside the parts. The parts stay for the panel and for diagnosing a
+        -- disagreement; the verdict is what everyone actually acts on.
+        local em, d, los = coth_read_self()
+        local here = coth_here() and 1 or 0
+        -- SAY WHEN MY OWN VERDICT CHANGES, with the numbers behind it. 'here' flipping back to 0 after a
+        -- summon is what puts a character back in the queue and stops them becoming a summoner, and from
+        -- the outside that is indistinguishable from the summon never having worked.
+        -- Change-gated, so a stable character costs nothing.
+        if here ~= COTH.saidHere then
+            COTH.saidHere = here
+            local a = COTH.at
+            rezlog('[coth] I am now %s: %d from the anchor (limit %d), los=%d to %s, zone %s',
+                   (here == 1) and 'WITH THE GROUP' or 'AWAY', d, COTH.RANGE, los,
+                   a and a.by or '?', a and tostring(a.zone) or '?')
+        end
+        COTH.state[myName] = { emblem = em, dist = d, los = los, here = here, updated = now }
+        pcall(function() peer_bcast('/at_coth %s %d %d %d %d', myName, em, d, los, here) end)
+    end
+
+    -- Am I waiting on somebody? Nothing else happens until that resolves.
     if COTH.pending then
-        local pn = COTH.pending.name
-        if coth_gathered(pn) then
-            rezlog('[coth] %s arrived', pn)
+        local p = COTH.pending
+        if (now - p.at) > COTH_GIVE_UP then
+            rezlog('\\ay[coth] %s never answered in %ds - giving up on them\\ax', p.name, COTH_GIVE_UP / 1000)
             COTH.pending = nil
-        elseif (now - COTH.pending.at) > 20000 then
-            -- REPORT WHAT WE ACTUALLY KNOW ABOUT THEM. "never arrived" on its own does not say whether
-            -- they moved at all, whether their report is stale, or whether they are simply out of range.
-            local st = COTH.state[pn]
-            if st then
-                rezlog('[coth] %s never arrived - releasing (their last report: %ds away, los=%d, %dms old)',
-                       pn, st.dist or -1, st.los or 0, now - (st.updated or now))
-            else
-                rezlog('[coth] %s never arrived - releasing (NO report from them at all)', pn)
-            end
-            COTH.claims[pn] = nil
-            peer_bcast('/at_cothfail %s', pn)
-            COTH.pending = nil
-        else
-            COTH.dbg = 'waiting for ' .. pn .. ' to arrive'
-            return
         end
-    end
-    -- Start as soon as everyone has reported a position, rather than sitting out a fixed delay.
-    -- Bounded, so one silent/crashed toon can't stall the gather - after that we go with who we have,
-    -- and since targets need fresh data anyway, the silent one simply won't be summoned.
-    local missing = {}
-    for _, nm in ipairs(group_members()) do
-        local st = COTH.state[nm]
-        if not (st and (now - (st.updated or 0)) < 6000) then missing[#missing + 1] = nm end
-    end
-    if #missing > 0 and (now - COTH.startedAt) < 10000 then
-        COTH.dbg = 'waiting on positions: ' .. table.concat(missing, ', ')
+        COTH.dbg = 'waiting on ' .. p.name
         return
     end
+
+    -- FINISHED ONLY WHEN EVERY MEMBER SAYS THEY ARE HERE, not when the queue happens to be empty.
     local left = coth_targets()
-    if #left == 0 then
-        COTH.active = false; COTH.dbg = 'group gathered'
-        rezlog('[coth] gather complete')
+    local allHere, waitingOn = coth_all_here()
+    if allHere then
+        COTH.active, COTH.dbg = false, 'group gathered'
+        -- KEEP REPORTING FOR A MOMENT. Going quiet the instant I think we are done leaves everyone else
+        -- holding my last position report, which ages - and a summoner reading a six second old 'away'
+        -- will summon somebody who has been standing next to it the whole time.
+        COTH.quietAt = now
+        -- ONCE. Every character reached this and logged it on its own pass, so one finished gather
+        -- produced six identical lines.
+        if not COTH.saidDone then
+            COTH.saidDone = true
+            -- HOW LONG IT TOOK, from the moment the gather started. Worth saying out loud: it is the one
+            -- number that tells you whether a gather went well, and it is the thing every fix tonight was
+            -- ultimately about.
+            local secs = (now - (COTH.startedAt or now)) / 1000
+            rezlog('[coth] gather complete in %.1fs - everyone is with the group', secs)
+            if (COTH.at and COTH.at.by or ''):lower() == myName:lower() then
+                pcall(function()
+                    mq.cmdf('/gsay CoTH: Everyone is here. Took %.0f seconds to summon the group.', secs)
+                end)
+            end
+        end
         return
     end
-    if not coth_gathered(myName) then COTH.dbg = 'not gathered yet myself'; return end
-    local em = select(1, coth_read_self())
-    if em ~= 0 then COTH.dbg = (em < 0) and 'no emblem' or 'emblem on cooldown'; return end
+    -- NOT finished. If there is nothing to act on this instant, say who we are still waiting for rather
+    -- than falling silent - somebody grey, briefly skipped, or whose summon quietly failed. Their grey
+    -- expires and they come back into the queue on their own, which is why this needs no separate guard.
+    if #left == 0 then
+        COTH.dbg = 'waiting on ' .. tostring(waitingOn)
+        if not COTH.saidWait or (now - COTH.saidWait) > 5000 then
+            COTH.saidWait = now
+            rezlog('[coth] nobody to summon right now - still waiting on %s', tostring(waitingOn))
+        end
+        return
+    end
 
-    -- ONE SUMMONER AT A TIME, DECIDED THE SAME WAY BY EVERYONE.
-    -- The claim below is set locally and THEN broadcast, which is a race: on 2026-08-06 Sebbun, Sunetoo
-    -- and Nityrc all fired at Lunafeet within 400ms, each seeing no claim because none of the broadcasts
-    -- had landed yet. Three emblems spent on one summon.
-    -- A claim cannot fix that on its own - whoever checks first still wins, and "first" is decided by
-    -- network timing. So the choice is COMPUTED instead: every toon sorts the ready holders the same way
-    -- and only the top one acts. Nothing has to arrive in time, because nothing is sent.
-    -- The cascade still works: as each summoner's emblem goes on cooldown it drops out of the list and
-    -- the next one takes over, which is the same order it would have happened in anyway.
-    do
-        local ready = {}
+    -- Can I summon at all?
+    if not coth_here() then COTH.dbg = 'not at the anchor myself'; return end
+    local em = coth_emblem()
+    if em ~= 0 then COTH.dbg = (em < 0) and 'no emblem' or ('emblem ' .. em .. 's'); return end
+
+    -- WHO COULD BE HELPING, AND WHO IS NOT. A gather where one character does all the work while three
+    -- stand there able-bodied is the symptom; this says which of the two tests each one failed.
+    if not COTH.saidWho or (now - COTH.saidWho) > 10000 then
+        COTH.saidWho = now
+        local parts = {}
         for _, nm in ipairs(group_members()) do
-            if coth_gathered(nm) then
+            if nm:lower() ~= myName:lower() then
                 local st = COTH.state[nm]
-                -- Fresh reports only. A stale one would keep electing a toon that has since spent its
-                -- emblem, and the gather would stall waiting on somebody who cannot act.
-                if st and (now - (st.updated or 0)) < 6000 and (st.emblem or -1) == 0 then
-                    ready[#ready + 1] = nm
-                end
+                parts[#parts + 1] = string.format('%s[%s/%s]', nm,
+                    st and tostring(st.here) or '?', st and tostring(st.emblem) or '?')
             end
         end
-        table.sort(ready, function(a, b) return a:lower() < b:lower() end)
-        -- EVERY READY HOLDER SUMMONS, EACH A DIFFERENT TARGET. This let only ready[1] act, so a gather
-        -- was one summon at a time however many emblems were standing there - and the cascade never
-        -- happened. coth_targets already puts emblem-holders at the FRONT of the list, so the first
-        -- people brought in are the ones who can then help: one summons one, two summon two, four
-        -- summon four.
-        -- Split by POSITION, not by a claim. Every toon computes the same ready list and the same target
-        -- list from the same shared state, so summoner N takes target N with nothing sent and nothing to
-        -- arrive in time. That is what the single-summoner rule was protecting against - three emblems
-        -- landing on one target because no broadcast had propagated yet - and slicing by index gives the
-        -- same guarantee without serialising the whole gather.
-        local myTurn = nil
-        for i, nm in ipairs(ready) do
-            if nm:lower() == myName:lower() then myTurn = i; break end
+        rezlog('[coth] group (here/emblem): %s', table.concat(parts, ' '))
+    end
+
+    -- Am I a bard? Needed twice below - for the always-casting exemption and for the blind cast - so it
+    -- is read once here rather than derived at each site.
+    local iAmBard = (member_class(myName) or ''):upper() == 'BRD'
+
+    -- A BARD THAT STARTED THIS STEPS BACK ONCE OTHERS CAN CARRY IT. Firing blind works, but every blind
+    -- cast is one we cannot verify - so a bard does the opening summons to get real summoners on their
+    -- feet, then leaves the rest to them.
+    if iAmBard and (COTH.mine or 0) >= COTH_BARD_MAX then
+        local others = 0
+        for _, nm in ipairs(coth_summoners()) do
+            if nm:lower() ~= myName:lower() then others = others + 1 end
         end
-        if not myTurn then
-            COTH.dbg = (#ready > 0) and ('summoners: ' .. table.concat(ready, ', ')) or 'nobody ready'
-            return
-        end
-        -- My slice of the queue: targets myTurn, myTurn+#ready, myTurn+2*#ready ...
-        local mine = {}
-        for i = myTurn, #left, #ready do mine[#mine + 1] = left[i] end
-        left = mine
-        if #left == 0 then
-            COTH.dbg = string.format('summoner %d of %d - nothing in my slice', myTurn, #ready)
+        if others > 0 then
+            COTH.dbg = string.format('bard: %d others can summon now, standing back', others)
             return
         end
     end
 
-    for _, nm in ipairs(left) do
-        local c = COTH.claims[nm]
-        if not (c and now < c) then
-            local tid = 0
-            pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. nm).ID()) or 0 end)
-            if tid > 0 then
-                COTH.claims[nm] = now + 25000
-                COTH.castAt = now
-                COTH.pending = { name = nm, at = now }
-                peer_bcast('/at_cothclaim %s', nm)
-                -- SAY WHAT STATE WE FIRED FROM. "never arrived" covers two completely different failures -
-                -- the cast never went, or it went and the arrival was not seen - and the log could not
-                -- tell them apart. Observed 2026-08-05: every FIRST summon of a gather failed and every
-                -- retry worked, on the same character, which fits an interrupted cast far better than a
-                -- detection problem. The emblem has a cast time and NoInterrupt does not stop MOVEMENT
-                -- from breaking it, and the first summon fires while the group is still settling.
-                local emT, mv = -1, 0
-                pcall(function() emT = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
-                pcall(function() mv = tonumber(mq.TLO.Me.Speed()) or 0 end)
-                rezlog('[coth] summoning %s (%d) - my emblem timer %s, my speed %.1f', nm, tid,
-                       (emT == 0) and 'ready' or tostring(emT), mv)
-                -- Same cursor rule before the emblem click. Best effort only here: a CoTH that does not
-                -- go out strands somebody, which is worse than the risk of clicking while holding.
-                cursor_stow('coth')
-                pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, tid) end)
-                -- DID A CAST ACTUALLY START? One look shortly after. If nothing is being cast the click
-                -- never took, and no amount of waiting for an arrival will help.
-                mq.delay(600)
-                local castingNow, castName = 0, ''
-                pcall(function() castingNow = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
-                pcall(function() castName = tostring(mq.TLO.Me.Casting.Name() or '') end)
-                if castingNow > 0 then
-                    rezlog('[coth]   cast started: %s', (castName ~= '') and castName or tostring(castingNow))
-                else
-                    rezlog('\\ay[coth]   NO CAST STARTED - the click did not take (moving? interrupted? on cooldown?)\\ax')
-                end
-                pcall(function() mq.cmdf('/gsay Call of the Hero on %s', nm) end)
-                return
-            end
-        end
+    -- TAKE THE FIRST ONE NOBODY HAS. coth_targets is already ordered - emblem holders first - and skip
+    -- holds anyone who has told me no recently, whether that was 'busy' or a failed summon.
+    local mine
+    for _, tgt in ipairs(left) do
+        if not (COTH.skip[tgt] and now < COTH.skip[tgt]) then mine = tgt; break end
     end
-    COTH.dbg = 'no reachable target (out of zone?)'
+    if not mine then COTH.dbg = 'everyone left is spoken for'; return end
+
+    -- NOT WHILE ALREADY CASTING. 'Casting is non-zero' is how we detect our emblem going out, so if we
+    -- are mid-cast when we start, that check passes on somebody else's spell and we then wait for THAT to
+    -- finish and call it ours - 68ms from 'summoning Sunetoo' to 'cast finished' on 2026-08-15 04:21:54.
+    -- Waiting for a free moment costs nothing; the emblem is a ten second commitment either way.
+    -- NOT WHILE ALREADY CASTING - EXCEPT A BARD, WHO ALWAYS IS.
+    -- This guard stops us reading somebody else's spell as our emblem going out. A bard twists songs
+    -- continuously, so Me.Casting is never 0 for them and this blocked them from summoning at all - and
+    -- silently, which is why a bard that started a gather just sat there.
+    -- It costs a bard nothing to skip: they cannot be interrupted, and they get no cast bar from the
+    -- emblem anyway, so there was never a reading here worth protecting.
+    if not iAmBard then
+        local busy = 0
+        pcall(function() busy = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+        if busy > 0 then COTH.dbg = 'already casting'; return end
+    end
+
+    local tid = 0
+    pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. mine).ID()) or 0 end)
+    if tid <= 0 then COTH.dbg = mine .. ' is not in zone'; return end
+
+    -- ASK FIRST, THEN SPEND THE EMBLEM. The watch doubles as the question: if somebody already has this
+    -- target it answers 'busy' within a relay hop, and a few tens of milliseconds against a ten second
+    -- cast is nothing. Waiting for that answer is what stops two summoners burning two emblems on one
+    -- character - the old claim broadcast could not, because both had already committed by the time it
+    -- arrived.
+    pcall(function() peer_cmdf(mine, '/at_cothwatch %s', myName) end)
+    COTH.pending = { name = mine, at = now }
+    mq.delay(COTH_ASK_MS, function() return COTH.pending == nil end)
+    if COTH.pending == nil then
+        -- They said no while we waited. Nothing spent; the next pass picks somebody else.
+        return
+    end
+    -- AND LOOK AGAIN BEFORE SPENDING IT. The ask takes 400ms, and a summon already in flight can land in
+    -- that window - on 2026-08-15 04:35:47 we cast at Sunetoo whose own report said here=1 by the time we
+    -- logged it. Nothing had gone wrong; the picture simply moved while we were being polite.
+    if coth_here(mine) then
+        rezlog('[coth] %s got here while I was asking - not summoning them', mine)
+        COTH.pending = nil
+        return
+    end
+    -- TELL EVERYONE THEY ARE MINE, now that the target has agreed.
+    -- Without this each free summoner reaches for the same first name, gets refused, moves to the second
+    -- and repeats - five 'Sunetoo says no (busy)' in fourteen seconds on 2026-08-15 04:26. The target
+    -- arbitrated correctly every time; nobody else ever found out.
+    -- Broadcast AFTER the agreement, not before, so it is a statement of fact rather than a claim that
+    -- can race - which is what the old claim system got wrong.
+    pcall(function() peer_bcast('/at_cothmine %s', mine) end)
+    local ts = COTH.state[mine] or {}
+    rezlog('[coth] summoning %s (their report: dist=%s los=%s here=%s, %.1fs old)',
+           mine, tostring(ts.dist), tostring(ts.los), tostring(ts.here),
+           (mq.gettime() - (ts.updated or mq.gettime())) / 1000)
+    -- IN GROUP CHAT, not just the log. A gather goes wrong across six clients at once and reading six
+    -- logs afterwards is the slow way to see it; one channel with everyone announcing what they are
+    -- doing shows the whole thing as it happens.
+    pcall(function() mq.cmdf('/gsay CoTH: summoning %s', mine) end)
+    cursor_stow('coth')
+    pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, tid) end)
+    -- BARDS GET NO CAST BAR FROM THE EMBLEM. Me.Casting never moves for them, so every check below reads
+    -- 'it never started' and we release a summon that is actually on its way.
+    -- They also cannot be interrupted, which is what makes firing blind safe for them and not for anyone
+    -- else: there is nothing the wait was protecting against.
+    if iAmBard then
+        rezlog('[coth] bard: no cast bar to watch, firing blind and assuming it lands')
+        mq.delay(COTH_BARD_CAST)
+        pcall(function() peer_cmdf(mine, '/at_cothcast %s', myName) end)
+        COTH.grey[mine] = mq.gettime()
+        COTH.pending = nil
+        COTH.mine = (COTH.mine or 0) + 1
+        rezlog('[coth]   cast sent for %s - assuming they made it, moving on', mine)
+        return
+    end
+
+    -- WAIT FOR IT TO START BEFORE WAITING FOR IT TO END.
+    -- 'Casting is 0' is true the instant the command is issued - the cast has not begun yet - so waiting
+    -- on that alone returned in ONE MILLISECOND and we told the target our cast had landed before it had
+    -- even started. Their settle clock then ran ten seconds early and the whole exchange fell apart.
+    -- So: wait for casting to become non-zero, THEN wait for it to clear. If it never starts at all, that
+    -- is a failed click and worth knowing rather than pretending it went out.
+    -- DID IT GO OUT? TWO WAYS TO TELL, because one of them does not work on a bard.
+    -- Bards get no cast bar from the emblem - Me.Casting stays at zero throughout - so waiting for that
+    -- alone concluded 'never started casting' every time, on a character that was summoning perfectly
+    -- well. The emblem's own reuse timer starting is the other proof, and it is true for everybody.
+    local started, sawBar = false, false
+    mq.delay(3000, function()
+        sawBar = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0
+        local t = -1
+        pcall(function() t = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
+        started = sawBar or (t > 0)
+        return started
+    end)
+    if not started then
+        rezlog('\\ay[coth] the emblem never went out for %s (no cast bar, timer still ready) - releasing\\ax', mine)
+        COTH.pending = nil
+        COTH.skip[mine] = mq.gettime() + COTH_SKIP_FAIL
+        return
+    end
+    -- Now wait for it to LAND. Only meaningful if we actually saw a cast bar: with no bar there is
+    -- nothing to watch clear, and Me.Casting reads 0 from the first instant - so waiting on it would
+    -- return immediately and we would claim the summon had landed before it had.
+    -- Without a bar, give it the emblem's own cast time instead.
+    if sawBar then
+        -- Stop waiting if the gather is called off mid-cast; there is nothing to report to afterwards.
+        mq.delay(20000, function()
+            return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 or not COTH.active
+        end)
+    else
+        rezlog('[coth] no cast bar on this character - waiting out the emblem cast time instead')
+        local ms = 0
+        pcall(function()
+            ms = (tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).Clicky.CastTime.TotalSeconds()) or 0) * 1000
+        end)
+        if ms <= 0 then ms = 10000 end
+        mq.delay(ms, function() return not COTH.active end)
+    end
+    if not COTH.active then return end
+    if COTH.pending then
+        pcall(function() peer_cmdf(mine, '/at_cothcast %s', myName) end)
+    end
+    -- ASSUME IT LANDED AND CARRY ON. Waiting here for their arrival report wastes the seconds it takes to
+    -- reach us, and the next target could have been started already.
+    -- They are grey now: not in the queue, not confirmed either. Their report settles it - or the grey
+    -- expires and they go back in.
+    COTH.grey[mine] = mq.gettime()
+    COTH.pending = nil
+    COTH.mine = (COTH.mine or 0) + 1
+    rezlog('[coth]   cast finished for %s - assuming they made it, moving on', mine)
 end
 
 -- ===== DI staff: the tank's last-ditch death save, fired once the cleric's own options are spent =====
@@ -5227,24 +5524,145 @@ pcall(function()
         xtankAnnounce = (mode == 'on')
         rezlog('[xtank] raid announce %s (from the driver)', mode or '?')
     end)
-    mq.bind('/at_coth', function(name, em, dist, los)
-        if name then COTH.state[name] = { emblem = tonumber(em) or -1, dist = tonumber(dist) or -1,
-                                          los = tonumber(los) or 0, updated = mq.gettime() } end
+    mq.bind('/at_coth', function(name, em, dist, los, here)
+        if name then
+            COTH.state[name] = { emblem = tonumber(em) or -1, dist = tonumber(dist) or -1,
+                                 los = tonumber(los) or 0, here = tonumber(here),
+                                 updated = mq.gettime() }
+        end
     end)
-    mq.bind('/at_cothclaim', function(name) if name then COTH.claims[name] = mq.gettime() + 25000 end end)
-    mq.bind('/at_cothfail', function(name) if name then COTH.claims[name] = nil end end)
-    -- User-facing: /atcoth [on|off|stop]. No arg = start. Registered on every toon, so the gather can
-    -- be kicked off from whichever one you happen to be looking at rather than only from the driver.
-    mq.bind('/atsync', function() resync_group() end)
-    mq.bind('/atcoth', function(mode)
-        local m = tostring(mode or ''):lower()
-        if m == 'off' or m == 'stop' then coth_set(false) else coth_set(true) end
+    -- THE ANCHOR POINT. Coordinates, not a character - whoever started the gather fixes the spot and can
+    -- then walk away without moving it.
+    -- WHERE IS EVERYBODY, AND WHAT DOES EACH OF THEM THINK?
+    --   /atcothwho        this character's own view
+    --   /atcothwho all    every character answers into group chat
+    -- Prints the raw parts as well as the verdict, because a disagreement between 'dist 12, los 1' and
+    -- 'here 0' is the interesting case and averaging it away would hide exactly what we are chasing.
+    -- START A GATHER FROM ANY CHARACTER, not just the driver. The anchor is wherever the character that
+    -- runs this is standing, so it is the natural way to say 'everyone come to me' from whoever is in the
+    -- right place - which is often not the toon with the window open.
+    --   /atcoth        gather on me
+    --   /atcoth off    stop
+    -- The rewrite dropped this bind while keeping its unbind, so the command simply did nothing.
+    mq.bind('/atcoth', function(arg)
+        local off = arg and tostring(arg):lower() == 'off'
+        -- coth_set broadcasts, and peer_bcast can wait on channel detection - so the bind records and the
+        -- tick acts, the same as the buttons.
+        cothSetWanted = off and 'off' or 'on'
+        log('[coth] %s', off and 'stopping the gather' or 'starting a gather here')
     end)
-    mq.bind('/at_cothgo', function(mode, anchor)
-        COTH.active = (mode == 'on')
-        COTH.claims = {}; COTH.pending = nil; COTH.startedAt = mq.gettime()
-        COTH.anchor = COTH.active and (anchor ~= '' and anchor or nil) or nil
-        COTH.state  = {}   -- old distances were measured against a different anchor
+    mq.bind('/atcothwho', function(scope)
+        if scope and tostring(scope):lower() == 'all' then
+            pcall(function() peer_bcast('/atcothwho') end)
+        end
+        local x, y, z = 0, 0, 0
+        pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+        pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+        pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+        local a = COTH.at
+        local em = coth_emblem()
+        local line = string.format('CoTH %s: at %d,%d,%d | %d from anchor | los=%d | here=%s | emblem=%s',
+            myName, x, y, z, coth_dist_to_anchor(), coth_los(),
+            coth_here() and 'YES' or 'no',
+            (em < 0) and 'none' or ((em == 0) and 'ready' or (em .. 's')))
+        pcall(function() mq.cmdf('/gsay %s', line) end)
+        log('[coth] %s', line)
+        if a then
+            log('[coth]   anchor %d,%d,%d zone %d set by %s', a.x, a.y, a.z, a.zone or 0, a.by or '?')
+        else
+            log('[coth]   no anchor set')
+        end
+        -- And what I believe about everyone else, which is what the queue is actually built from.
+        for _, nm in ipairs(group_members()) do
+            if nm:lower() ~= myName:lower() then
+                local st = COTH.state[nm]
+                if st then
+                    log('[coth]   %-10s dist=%-5s los=%-2s here=%-4s emblem=%-5s %s%s',
+                        nm, tostring(st.dist), tostring(st.los), tostring(st.here), tostring(st.emblem),
+                        COTH.grey[nm] and 'GREY ' or '',
+                        (COTH.skip[nm] and mq.gettime() < COTH.skip[nm]) and 'SKIPPED' or '')
+                else
+                    log('[coth]   %-10s no report', nm)
+                end
+            end
+        end
+    end)
+    -- Somebody has agreed a target with them. Leave that one alone; they are handling it.
+    mq.bind('/at_cothmine', function(tgt)
+        if tgt and tgt:lower() ~= myName:lower() then
+            COTH.skip[tgt] = mq.gettime() + COTH_SKIP_BUSY
+        end
+    end)
+    mq.bind('/at_cothat', function(x, y, z, zn, by)
+        COTH.at = { x = tonumber(x) or 0, y = tonumber(y) or 0,
+                    z = tonumber(z) or 0, zone = tonumber(zn) or 0, by = by }
+    end)
+    -- I AM BEING SUMMONED. Record where I am RIGHT NOW; arrival is this position changing.
+    mq.bind('/at_cothwatch', function(who)
+        if not who or who == '' then return end
+        -- Already being summoned by somebody else? Say no rather than letting two emblems go. The slice
+        -- should prevent this; a character that became a summoner a moment ago can still race it.
+        if COTHW and COTHW.by ~= who then
+            -- Already being summoned by somebody else. Say WHY: 'busy' means wait, somebody's summon is
+            -- already on its way to me, whereas a plain no means that summon failed and another is worth
+            -- trying. Treating them the same is what had a summoner re-pick the same target instantly and
+            -- get refused again, three times in six seconds on 2026-08-15 03:44.
+            pcall(function() peer_cmdf(who, '/at_cothhere %s no busy', myName) end)
+            return
+        end
+        local x, y, z = 0, 0, 0
+        pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+        pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+        pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+        COTHW = { by = who, at = mq.gettime(), x = x, y = y, z = z, cast = false, castAt = 0 }
+        rezlog('[coth] %s is summoning me - watching my own position', who)
+    end)
+    -- Their cast has landed. Only now does not-having-moved mean anything.
+    mq.bind('/at_cothcast', function(who)
+        if who and COTHW and COTHW.by == who then
+            COTHW.cast, COTHW.castAt = true, mq.gettime()
+        end
+    end)
+    -- THE ONLY TWO ANSWERS, both from the character that was summoned.
+    mq.bind('/at_cotharrived', function(who)
+        if not who then return end
+        -- BELIEVE THEM IMMEDIATELY. Their pushed 'here' verdict is up to a second behind, and on
+        -- 2026-08-15 03:48 Khulian was summoned again 1.1 seconds AFTER reporting it had arrived, because
+        -- the queue was still built from a report taken before the jump.
+        -- They just told us they moved; that is better evidence than anything we hold about them.
+        if COTH.state[who] then
+            COTH.state[who].here = 1
+            COTH.state[who].updated = mq.gettime()
+        else
+            COTH.state[who] = { emblem = -1, dist = 0, here = 1, updated = mq.gettime() }
+        end
+        COTH.grey[who] = nil          -- settled: they really are here
+        if COTH.pending and COTH.pending.name == who then
+            rezlog('[coth] %s arrived', who)
+            COTH.pending = nil
+        end
+    end)
+    mq.bind('/at_cothhere', function(who, verdict, why)
+        if not who or verdict == 'yes' then return end
+        if COTH.pending and COTH.pending.name == who then
+            -- STAND OFF THIS ONE FOR A MOMENT. Clearing pending alone put them straight back at the top
+            -- of the queue and we picked them again on the very next tick.
+            -- Longer for 'busy': somebody else's summon is in flight and will land, so this target is
+            -- simply not ours. Shorter for a failure: worth another go, just not immediately.
+            local secs = (why == 'busy') and COTH_SKIP_BUSY or COTH_SKIP_FAIL
+            COTH.skip[who] = mq.gettime() + secs
+            COTH.grey[who] = nil          -- settled the other way: they did not move, back in the queue
+            rezlog('[coth] %s says no (%s) - leaving them for %.0fs', who, why or '?', secs / 1000)
+            COTH.pending = nil
+        end
+    end)
+    mq.bind('/at_cothgo', function(mode)
+        COTH.active, COTH.pending, COTH.startedAt = (mode == 'on'), nil, mq.gettime()
+        COTHW = nil        -- not being summoned any more either
+        -- Distances were measured against the previous anchor point and mean nothing now. The new one
+        -- arrives in /at_cothat, and until it does everyone reports -1 and nobody is judged 'away'.
+        COTH.state = {}
+        if mode ~= 'on' then COTH.at = nil end
     end)
     mq.bind('/at_di', function(name, staff, em, dg, save, sname)
         if name then
@@ -5890,6 +6308,7 @@ pcall(function()
 PORT_CAT = 'transport'
 portBook = {}          -- [char] = { {name=, sub=, lvl=}, ... }
 portScanWanted = false -- I should read my own book on the next tick
+portCastWanted = nil   -- a port somebody asked me to cast; the tick does it, because casting blocks
 portAskedBy = nil      -- who wants my list; answered from the tick for the same reason
 portAsked = false      -- have we asked the group yet this session
 
@@ -6172,12 +6591,41 @@ end
         portBook[char] = out
     end)
     -- The spell name has spaces, so it arrives as several arguments and has to be rejoined.
-    mq.bind('/at_portcast', function(...) port_cast(table.concat({ ... }, ' ')) end)
+    -- port_cast memmes, waits for the gem and casts - all of it blocking. A bind runs inside
+    -- mq.doevents(), so it records the request and the tick does the work.
+    mq.bind('/at_portcast', function(...) portCastWanted = table.concat({ ... }, ' ') end)
     mq.bind('/atportlist', function(n)
         portProbeWant = math.max(1, math.min(720, tonumber(n) or 30))
         log('[portprobe] queued - will read the first %d book slot(s) on the next tick', portProbeWant)
     end)
-    mq.bind('/at_inviscast', function(key, ms) invis_arm(key, tonumber(ms) or INVIS_LEAD) end)
+    -- TWO SHAPES. The combo sends '<lead> Name:key,Name:key' in one broadcast so both casters set their
+    -- deadline from the same message; the single-row path still sends '<key> <lead>' to one character.
+    -- QUIET DOWN: the invis combo is about to fire. Pause E3 and stop anything in flight, so this
+    -- character is not casting when the invis lands on it.
+    -- RECORD, DO NOT PREP. invis_prep_self stops a cast and waits for it, and scans the buff list - and a
+    -- bind runs inside mq.doevents(), where yielding is as unsafe as it is in a draw.
+    -- This one reached every character at once, so it took the whole group down together: six clients,
+    -- all last recorded in 'doevents', all at 03:41:14.
+    mq.bind('/at_invisprep', function() invisPrepWanted = true end)
+    -- And go back to normal. Sent once the casts are done.
+    mq.bind('/at_invisdone', function()
+        if invisPrepped then invisPrepped = nil; e3_release('invis') end
+    end)
+    -- SAME RULE HERE. invis_arm prepares and then waits out the countdown in place, which is a yield -
+    -- so the bind only records what to do and the tick does it.
+    -- STAMP WHEN THE MESSAGE ARRIVED. The deadline has to be measured from here, not from whenever the
+    -- tick gets round to arming: the tick is 250ms and other subsystems can hold it far longer, so two
+    -- casters that received the same broadcast together were setting deadlines hundreds of milliseconds
+    -- apart. 683ms on 2026-08-16 12:54.
+    -- The bind itself does nothing but record - arming waits, and a bind cannot.
+    mq.bind('/at_inviscast', function(a, b)
+        local at = mq.gettime()
+        if a and b and tostring(a):match('^%d+$') and tostring(b):find(':', 1, true) then
+            invisTake = { lead = a, blob = b, at = at }
+        else
+            invisTake = { key = a, lead = tonumber(b) or INVIS_LEAD, at = at }
+        end
+    end)
     -- WHAT IS THE CAST TIME, REALLY? invis_cast_ms reported 0s for both rows, which cannot be right when
     -- one of them visibly takes a moment - so this tries every route to the number and prints all of
     -- them rather than trusting the one I picked. Same approach as /atportlist, which settled a question
@@ -8554,7 +9002,21 @@ function magic_click(key)
     local e = magic_source(key)
     if not e then return end
     if e.aa then
-        pcall(function() mq.cmdf('/nowcast %s "%s/CastType|AA"', myName, e.aa) end)
+        -- STRAIGHT TO THE CLIENT FOR AN AA, not through E3.
+        -- AdventureTime issues the two invis casts 4ms apart - 349669956 and 349669960 on 2026-08-14
+        -- 21:50 - so the coordination is already as tight as it can be. Everything after that is E3's
+        -- /nowcast queue: it is processed on E3's own loop, which is busy healing, so the two commands
+        -- come out hundreds of milliseconds apart even though they went in together.
+        -- /alt activate skips all of it. There is nothing for E3 to add here anyway: a group invis is
+        -- self-cast, needs no target and no pause, so the only thing /nowcast was contributing was delay.
+        -- Falls back to /nowcast if the ability id cannot be read, since that path is proven.
+        local aid = 0
+        pcall(function() aid = tonumber(mq.TLO.Me.AltAbility(e.aa).ID()) or 0 end)
+        if aid > 0 then
+            pcall(function() mq.cmdf('/alt activate %d', aid) end)
+        else
+            pcall(function() mq.cmdf('/nowcast %s "%s/CastType|AA"', myName, e.aa) end)
+        end
     elseif e.spell then
         pcall(function() mq.cmdf('/nowcast %s "%s"', myName, e.spell) end)
     else
@@ -8719,9 +9181,10 @@ function draw_magic_buttons()
                 local face = b.nm
                 if (perName[b.nm] or 0) > 1 then face = b.nm .. ' ' .. (b.e.short or b.e.key) end
                 local pushed = push_state_button(cr, cg, cb)
+                -- QUEUED, NOT CLICKED HERE. magic_click casts, and peer_cmdf can wait on channel
+                -- detection - both are yields, and a yield in an ImGui callback is a hard client crash.
                 if ImGui.SmallButton(face .. '##at_magic_' .. b.e.key .. '_' .. b.nm) then
-                    if b.nm:lower() == myName:lower() then magic_click(b.e.key)
-                    else peer_cmdf(b.nm, '/at_magic %s', b.e.key) end
+                    magicWanted = { key = b.e.key, nm = b.nm }
                 end
                 pop_state_button(pushed)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
@@ -10304,13 +10767,21 @@ local function e3_holders()
     for _ in pairs(E3HOLD) do n = n + 1 end
     return n
 end
-function e3_hold(owner)
+-- nowait = send the pause and carry on, without waiting for E3 to confirm it.
+-- The confirmation is worth having when the next thing we do must not be interrupted and we can afford
+-- to stand still for it. It is NOT worth having when two clients are counting down to a shared instant:
+-- E3 taking its time to answer on one of them turns into that character firing late. Measured 5001ms on
+-- 2026-08-16 16:14 - the 2500ms wait, a retry, and 2500ms again - against a 3500ms lead, so that caster
+-- was 1.7 seconds past its deadline before it even started.
+-- The pause command is queued either way; not waiting only means we stop watching for it to land.
+function e3_hold(owner, nowait)
     owner = owner or 'unknown'
     if E3HOLD[owner] then return end          -- idempotent per owner: strip may ask after the mem did
     local was = e3_holders()
     E3HOLD[owner] = true
     if was == 0 then
         mq.cmd('/e3p on')
+        if nowait then return end
         -- /e3p IS QUEUED, NOT IMMEDIATE. E3's own IsPaused() starts with
         --     EventProcessor.ProcessEventsInQueues("/e3p")
         -- so the command sits in a queue and only lands when E3's loop next asks whether it is paused.
@@ -12828,7 +13299,9 @@ function draw_pacify()
         end
         ImGui.SameLine()
         if ImGui.SmallButton('x##pacdel' .. i) then
-            pcall(function() peer_bcast('/at_pacdel %d', e.id) end)
+            -- Remove it locally right away so the list responds, but let the tick tell the group:
+            -- peer_bcast can fall through to channel detection, which waits.
+            pacDelWanted = e.id
             table.remove(pacQueue, i)
             break
         end
@@ -12877,14 +13350,21 @@ end
 
 function draw_coth_mini()
     if COTH.active then
-        if ImGui.SmallButton('Stop gather##at_coth_mini') then coth_set(false) end
+        -- NEVER FROM THE DRAW. coth_set broadcasts, and peer_bcast falls through to peer_cmdf for
+        -- channel detection, which waits 750ms the first time - a yield inside an ImGui callback is a
+        -- hard client crash. The button asks; the tick acts.
+        if ImGui.SmallButton('Stop gather##at_coth_mini') then cothSetWanted = 'off' end
         -- BELOW, NOT BESIDE. This sits on the mini header at an absolute X near the right edge, so a
         -- SameLine after it started the text past the window and ImGui grew the window to fit - the
         -- whole panel stretched off to the right the moment a gather was running.
         -- A new line starts at the window's left margin, so it costs a row and cannot overflow.
-        ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'CoTH gathering on ' .. (coth_anchor() or '?'))
+        -- The anchor is a POINT now, so there is no name to show - how far away I am is the useful
+        -- number anyway, and it is the same figure the gather is deciding on.
+        ImGui.TextColored(0.36, 0.80, 0.46, 1.0,
+            string.format('CoTH gathering - %s', coth_here() and 'I am there'
+                          or (coth_dist_to_anchor() .. ' away')))
     else
-        if ImGui.SmallButton('CoTH Group##at_coth_mini') then coth_set(true) end
+        if ImGui.SmallButton('CoTH Group##at_coth_mini') then cothSetWanted = 'on' end
     end
 end
 
@@ -13006,7 +13486,29 @@ end
 -- HOW LONG THE CASTERS GET TO PREPARE before the coordinated fire. It has to cover the relay hop plus
 -- pausing E3 and stopping any cast in flight, and every millisecond of it is a millisecond the group is
 -- standing still - so it is as short as those two things allow.
-INVIS_LEAD = 1500
+-- Only the final stretch of the countdown is waited out in place; anything longer goes back to the main
+-- loop so the rest of the script keeps running. Comfortably more than a tick, so the wait still lands
+-- precisely on the deadline.
+-- WAIT OUT THE WHOLE LEAD IN PLACE, not just the last stretch.
+-- At 400 both casters handed the remainder back to the tick - 1266ms and 766ms - and then fired whenever
+-- their own loop next came round, which was 1096ms apart on 2026-08-16 13:46 even though their deadlines
+-- agreed to within NINE milliseconds. Every millisecond of alignment we win by anchoring the deadline is
+-- given straight back if the firing is left to a tick that varies.
+-- Blocking for the lead does starve the rest of the loop, but the fire that follows already blocks for
+-- five seconds taking its readings - so this is not where the cost lives, and it is the only way the two
+-- casts land together.
+-- Must exceed INVIS_LEAD, or the tail of the countdown goes back to the tick and the jitter we just
+-- removed from the deadline comes straight back at the firing.
+INVIS_WAIT_HERE = 4000
+-- THE LEAD HAS TO OUTLAST THE PREP, on the slowest client, or it is not a lead at all.
+-- The prep is not a fixed cost: e3_hold waits for E3 to confirm the pause, and how long that takes
+-- depends entirely on what that client's E3 was doing. Measured on 2026-08-16 15:11: 299ms on one caster
+-- and 2080ms on the other, from the same broadcast. With a 1500ms lead the second was already a second
+-- PAST its deadline when it finished prepping, so it fired at once while the first still had 766ms to
+-- wait - and the casts landed 1234ms apart despite agreeing on the deadline to within 35ms.
+-- 3500 clears the worst prep seen with room to spare. The cost is a longer pause before the invis goes
+-- out, which is a fair trade for it actually landing on everybody.
+INVIS_LEAD = 3500
 -- CLERIC FIRST, DRUID A QUARTER SECOND BEHIND.
 -- The measured rule is simple: CASTING STRIPS THE INVIS YOU ALREADY HAVE. So whoever goes second has
 -- already received the first caster's buff, and their own cast removes it. The logs show it exactly:
@@ -13065,7 +13567,23 @@ INVIS_LEAD = 1500
 -- landing, so the shaman received it and then stripped it. Halving the configured value keeps the
 -- observed gap inside the cast on a jittery box.
 -- Effectively simultaneous is the target; 50 exists only so they are not fighting for the same instant.
-INVIS_ROW_OFFSET = { ITU = 0, Invis = 50 }
+-- THE ONE WITH A CAST TIME GOES FIRST; THE INSTANT ONE GOES AFTER IT FINISHES.
+-- Firing together does not work when the two differ in speed, and on the A-team they do: the shaman's
+-- Group Silent Presence takes about two seconds while the cleric's ITU is effectively instant.
+-- 2026-08-14 21:28 shows the failure exactly - ITU fired at 09.169 and landed at once, the shaman began
+-- casting 83ms later, and the ITU it had just been given was stripped by its own cast. Its own log line
+-- reads casting=27501 a full 1.2s after firing, so the ITU landed squarely inside that window.
+-- Making the gap smaller cannot fix it. The instant spell has to land when nobody is mid-cast, which
+-- means AFTER the slow one has completed - so Invis leads and ITU follows it by more than its cast.
+-- If both picks ever have cast times again (the B-team's enchanter did), any small offset works and this
+-- BOTH AT ONCE. Zero, deliberately.
+-- What removes invis is a spell STARTING, not landing. So if both casters begin at the same moment,
+-- neither is holding anything for the other's cast to strip - they simply both land afterwards.
+-- Any offset at all reintroduces the failure it was meant to fix: the first one lands, the second caster
+-- receives it, and then the second cast starts and strips what it was just given. That is exactly what
+-- an 83ms gap did on 2026-08-14 21:28 - the shaman got the ITU and lost it to its own cast.
+-- The residual is relay jitter, which is tens of milliseconds and cannot be tuned away from here.
+INVIS_ROW_OFFSET = { ITU = 0, Invis = 0 }
 invisFireKey, invisFireAt = nil, nil
 
 -- What does this thing take to cast? Logged so the offset above can be set from evidence.
@@ -13085,57 +13603,130 @@ end
 
 -- Arm the countdown and get ready during it. Called on the caster, whether that is this character or a
 -- peer that was sent /at_inviscast.
-function invis_arm(key, ms)
+function invis_arm(key, ms, arrivedAt)
     if not key or key == '' then return end
+    local lead = tonumber(ms) or INVIS_LEAD
+    -- FROM WHEN THE MESSAGE LANDED, not from now. 'Now' is whenever this character's tick came round,
+    -- which varies by hundreds of milliseconds depending on what else that client was doing - and that
+    -- variance went straight into the gap between the two casts.
+    local base = tonumber(arrivedAt) or mq.gettime()
     invisFireKey = key
-    invisFireAt  = mq.gettime() + (tonumber(ms) or INVIS_LEAD)
-    -- PREPARE NOW, CAST LATER. Holding E3 and clearing a cast in flight are the two things that would
-    -- otherwise happen at the deadline and make this caster late - which is the whole problem.
-    e3_hold('invis')
-    local casting = false
-    pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
-    if casting then
-        pcall(function() mq.cmd('/stopcast') end)
-        mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
-    end
+    invisFireAt  = base + lead
+    local lateBy = mq.gettime() - base
+    local prepFrom = mq.gettime()
+    -- ONE PREP, NOT TWO. invis_prep_self already holds E3 and clears any cast in flight, and it runs
+    -- first - the prep broadcast goes out ahead of the cast message. Doing it again here meant every
+    -- caster paused E3 twice, stopped its cast twice, and needed two releases to balance: an /e3p on,
+    -- /e3p on, /e3p off, /e3p off shuffle around every combo.
+    -- It is idempotent, so calling it covers the case where the prep broadcast was missed and costs
+    -- nothing when it was not.
+    invis_prep_self()
     -- The cast time is the number the offset has to be set against, so it goes in the log every time.
-    log('[invis] armed %s - firing in %dms (this spell casts in %ss)',
-        key, tonumber(ms) or INVIS_LEAD, tostring(invis_cast_ms(key)))
+    -- THE BREAKDOWN, so a stagger can be attributed rather than guessed at: how long this character took
+    -- to pick the message up, how long its prep took, and how much of the lead is left to wait.
+    -- 'prep took' was measured as (now - base - lateBy), which is zero by construction and told us
+    -- nothing - the time it was meant to expose was hiding inside 'picked up late'.
+    local prepMs, leftMs = mq.gettime() - prepFrom, invisFireAt - mq.gettime()
+    log('[invis] armed %s - msg picked up %dms late, prep took %dms, %dms left of the lead (casts in %ss)',
+        key, lateBy, prepMs, leftMs, tostring(invis_cast_ms(key)))
+    -- A negative remainder means this caster is already past the moment it was meant to fire, so it will
+    -- go immediately and the other one will not. That is the whole failure in one line - say so loudly
+    -- rather than leaving it to be worked out from two logs side by side.
+    if leftMs < 0 then
+        log('\\ar[invis] I am %dms LATE - the prep outlasted the lead, this cast will not line up\\ax',
+            -leftMs)
+    end
+
+    -- HOLD RIGHT HERE UNTIL THE DEADLINE, do not go back to the main loop for it.
+    -- The two casters arm within about four milliseconds of each other - the single broadcast made sure
+    -- of that - and then drifted 215ms apart waiting, because the fire ran on the main tick and each
+    -- character has different work queued ahead of it. On 2026-08-14 22:14 one fired 309ms after its own
+    -- deadline and the other 520ms after its own.
+    -- Waiting here removes the tick from the equation entirely: mq.delay still pumps events, so nothing
+    -- is starved, and blocking for the lead is exactly what the lead is for.
+    invis_push_now()
+    -- WAIT HERE, BUT ONLY IF THE DEADLINE IS CLOSE. Holding the loop for a full 1500ms lead starves
+    -- everything else - and on the other caster that delay is what made ITS tick late for the very same
+    -- message. Two casters each blocking the other is why the gap grew rather than shrank.
+    -- So: if the deadline is more than a tick away, go back to the loop and let invis_fire_tick catch it.
+    -- Only the last stretch is waited out in place, which is what keeps the firing precise.
+    local left = invisFireAt - mq.gettime()
+    if left > INVIS_WAIT_HERE then
+        log('[invis] armed - %dms to go, letting the loop run until then', left)
+        return
+    end
+    if left > 0 then mq.delay(left) end
+    invis_push_now()
+    invis_fire_now()
+end
+
+-- The cast itself, split out so both the armed wait above and the tick backstop use one path.
+-- Report my invis state RIGHT NOW rather than waiting for the tick.
+-- The two casters are the last characters the panel updates for, which is the opposite of what you would
+-- expect - they are the ones who know first. The reason is that invis_fire_now blocks for nearly five
+-- seconds taking its after-readings, and the tick that would normally push state does not run while it
+-- does. So the casters sit on the newest information in the group and cannot say it.
+-- Change-gated exactly like the tick's version, so calling it often costs nothing.
+function invis_push_now()
+    local n, u = invis_self()
+    local ik = n .. '/' .. u
+    if invisLast == ik then return end
+    invisLast = ik
+    if SHOW_UI then invisState[myName] = { norm = n, und = u, updated = mq.gettime() }
+    elseif driverName then pcall(function() peer_cmdf(driverName, '/at_invis %s %d %d', myName, n, u) end) end
+end
+
+function invis_fire_now()
+    local key = invisFireKey
+    invisFireKey, invisFireAt = nil, nil
+    if not key then return end
+    local n0, u0 = invis_self()
+    log('[invis] FIRING %s at %d (before: invis=%d itu=%d)', key, mq.gettime(), n0, u0)
+    pcall(function() magic_click(key) end)
+    -- Say what we look like the moment the cast goes out, before settling in to watch.
+    invis_push_now()
+    -- READINGS AT 1.2 AND 2.7 SECONDS, not three spread over five.
+    -- The third told us nothing the second had not, and the loop was held for the whole 4.7s - which is
+    -- the single longest block in the file and lands immediately after a cast, when the group is most
+    -- likely to need something else.
+    for _, wait in ipairs({ 1200, 1500 }) do
+        mq.delay(wait)
+        invis_push_now()          -- and at every reading, so the panel tracks us rather than trailing
+        local n1, u1 = invis_self()
+        local casting = 0
+        pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+        log('[invis] after %s +%dms: invis=%d itu=%d casting=%d', key,
+            (wait == 1200) and 1200 or 2700, n1, u1, casting)
+    end
+    -- Hand the group back. Everyone was held for this, so everyone gets released - and locally too, since
+    -- a broadcast does not return to the sender.
+    pcall(function() peer_bcast('/at_invisdone') end)
+    invis_push_now()
+    -- ONE RELEASE, matching the one hold. The second was here to balance the arm's duplicate hold and
+    -- would now hand E3 back while somebody else still wanted it held.
+    if invisPrepped then invisPrepped = nil; e3_release('invis') end
 end
 
 -- Called from the tick. Fires when the countdown expires, then hands E3 back.
+-- Backstop only. The arm now waits out its own deadline and fires there, so this normally has nothing
+-- to do - it exists in case an arm was interrupted before it could complete.
 function invis_fire_tick()
-    if not invisFireAt then return end
-    -- FIRE AT THE DEADLINE, NOT ON THE NEXT TICK. The main loop runs every 250ms, so waiting for a tick
-    -- to notice the deadline has passed adds up to a quarter second of error - and the two casters draw
-    -- that error independently, which is where a 250ms offset turned into gaps of 101 and 451.
-    -- Once the deadline is within one tick, wait out the remainder precisely and go. The whole point of
-    -- the countdown is that both casters know exactly when to act; this is what lets them act on it.
-    local left = invisFireAt - mq.gettime()
-    if left > 300 then return end
-    if left > 0 then mq.delay(left) end
-    local key = invisFireKey
-    invisFireKey, invisFireAt = nil, nil
-    if key then
-        -- Timestamped on both casters so the two logs can be laid side by side and the real gap read off
-        -- rather than inferred from whether the buff stuck.
-        local n0, u0 = invis_self()
-        log('[invis] FIRING %s at %d (before: invis=%d itu=%d)', key, mq.gettime(), n0, u0)
-        pcall(function() magic_click(key) end)
-        -- And what it actually achieved, a moment later. If invis reads 0 here after firing an invis,
-        -- something stripped it between the cast and now - which is the failure being chased.
-        -- SAMPLED, NOT A SINGLE LOOK. One read at 1.2s cannot tell a cast still in flight from one that
-        -- landed and was stripped - and those want opposite fixes. Three looks show which.
-        for _, wait in ipairs({ 1200, 1500, 2000 }) do
-            mq.delay(wait)
-            local n1, u1 = invis_self()
-            local casting = 0
-            pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
-            log('[invis] after %s +%dms: invis=%d itu=%d casting=%d', key,
-                (wait == 1200) and 1200 or ((wait == 1500) and 2700 or 4700), n1, u1, casting)
+    -- SAFETY RELEASE. If the group was quieted and no cast followed - a caster died, zoned, or the pick
+    -- turned out to be unable - somebody has to hand E3 back or the whole group sits paused.
+    if invisPrepped and not invisFireAt then
+        if not invisPrepAt then invisPrepAt = mq.gettime() end
+        if (mq.gettime() - invisPrepAt) > INVIS_PREP_MAX then
+            log('\\ay[invis] no cast followed the prep - releasing the group\\ax')
+            invisPrepped, invisPrepAt = nil, nil
+            pcall(function() peer_bcast('/at_invisdone') end)
+            e3_release('invis')
         end
+        return
     end
-    e3_release('invis')
+    invisPrepAt = nil
+    if not invisFireAt then return end
+    if mq.gettime() < invisFireAt then return end
+    invis_fire_now()
 end
 
 -- A COUNTDOWN, NOT A COMMAND. Two casters told to go separately go separately: the relay delivers at
@@ -13146,6 +13737,118 @@ end
 -- measures N from the moment it receives, and the relay hop is the only variance left.
 -- The lead time is also prep time - each caster holds E3 and stops any cast in flight while it waits, so
 -- when the deadline arrives there is nothing left to do but cast.
+-- Fire the whole combo in one relay. Names go out with the keys so every character can decide for
+-- itself whether it is one of the two casters - the picks live in the driver's settings and a worker has
+-- no copy of them.
+-- Pause E3 and clear any cast in flight, on THIS character. Idempotent: the two casters call it via
+-- invis_arm as well and the hold is refcounted, so being prepped twice is harmless.
+invisFireWanted = false   -- set by the combo button; the tick fires it, because the fire blocks
+invisPrepWanted = false   -- set by /at_invisprep; the tick does it, for the same reason
+invisTake = nil           -- set by /at_inviscast; the tick arms it, because arming blocks
+invisPrepped, invisPrepAt = nil, nil
+-- Longest the group may stay quieted with no cast following. Generous against the 1500ms lead, short
+-- enough that a failed combo does not leave everyone paused.
+INVIS_PREP_MAX = 6000
+-- PAUSE FIRST, THEN STOP THE CAST. On every character, not just the casters.
+-- The order is the whole point and I had it wrong: stopping a cast without pausing leaves E3 free to
+-- start another one immediately, so the invis lands on somebody who has just begun casting and strips
+-- straight off them again. Pausing first means nothing can restart, and the stopcast then clears
+-- whatever was already in flight.
+-- It is also why this cannot be casters-only. Every character is receiving the invis, so every character
+-- has to be quiet for it - the casters are simply the most obvious case, not the only one.
+function invis_prep_self()
+    -- ANY PENDING REQUEST IS SATISFIED BY THIS. The arm runs before the prep handler in the tick and
+    -- calls us itself, then blocks for the lead and the cast - about four seconds. The queued
+    -- /at_invisprep is still sitting there when it returns, so the tick prepped a SECOND time for a cast
+    -- that had already happened: pause, cast, unpause, pause again, then the six second safety net
+    -- unpausing it once more. That is the shuffle, and it was pausing E3 over nothing.
+    invisPrepWanted = false
+    if invisPrepped then return end
+    invisPrepped = true
+    -- NOWAIT. Every millisecond spent confirming the pause comes off this caster's share of the lead, and
+    -- the two casters do not spend the same amount - which is precisely what pulls their casts apart.
+    -- The invis flow has its own protection anyway: /makemevis and /stopcast below clear whatever E3 had
+    -- going, and the heal-interrupt event catches the one thing that can still cut a cast.
+    e3_hold('invis', true)
+    -- CLEAR ANY INVIS WE ALREADY HAVE, before casting more at ourselves.
+    -- Right here is the moment: E3 is paused so nothing will re-apply anything, and the stopcast below
+    -- has not run yet. Starting from a known-visible state means the after-readings measure THIS combo
+    -- rather than whatever was left over - and a partial cover from a previous press cannot be mistaken
+    -- for a success this time.
+    -- /makemevis is the client's own answer to 'stop being invisible', which is more reliable than
+    -- removing buffs by name and does not care what put the invis there.
+    pcall(function() mq.cmd('/makemevis') end)
+    local casting = false
+    pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
+    if casting then
+        pcall(function() mq.cmd('/stopcast') end)
+        mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+    end
+    -- STRIP THE PROC BUFF THAT BREAKS INVIS. The necro line has one whose proc fires and drops invis a
+    -- moment later, which looks exactly like the invis never landed.
+    -- Removed BY FULL NAME after finding it, not by passing 'chaotic' to /removebuff directly: a partial
+    -- name matches whatever the client decides it matches, and that is how 'Undead Chokidai Blessing' got
+    -- stripped off three characters by a substring rule earlier. Logging the full name means a wrong
+    -- match is visible immediately rather than discovered later.
+    local nb, ns = 0, 0
+    pcall(function() nb = tonumber(mq.TLO.Me.CountBuffs()) or 0 end)
+    pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
+    local function strip(getName, count)
+        for i = 1, (count or 0) do
+            local nm = ''
+            pcall(function() nm = tostring(getName(i) or '') end)
+            if nm ~= '' and nm ~= 'NULL' and nm:lower():find('chaotic', 1, true) then
+                pcall(function() mq.cmdf('/removebuff "%s"', nm) end)
+                log('[invis] stripped %s - its proc breaks invis', nm)
+            end
+        end
+    end
+    pcall(function() strip(function(i) return mq.TLO.Me.Buff(i).Name() end, nb) end)
+    pcall(function() strip(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
+    invis_push_now()      -- stopcast and the strip can both change what I am carrying
+end
+
+function invis_combo_fire()
+    local parts = {}
+    for _, grp in ipairs(INVIS_ROWS) do
+        local pick = invisPick[grp]
+        if pick then
+            for _, h in ipairs(invis_holders(grp)) do
+                if h.nm == pick then
+                    parts[#parts + 1] = pick .. ':' .. h.e.key
+                    break
+                end
+            end
+        end
+    end
+    if #parts == 0 then
+        log('\\ay[invis] nobody is picked - set who casts each row in Settings\\ax')
+        return false
+    end
+    -- QUIET THE WHOLE GROUP FIRST, not just the two casters.
+    -- Anyone mid-cast when the invis lands strips their OWN - the caster is only the most obvious case.
+    -- So everybody pauses E3 and drops whatever is in flight, and the lead below is what gives them time
+    -- to do it before the two casts go out.
+    -- Sent before the cast message so the prep is already underway while that one is still travelling.
+    pcall(function() peer_bcast('/at_invisprep') end)
+    invis_prep_self()
+    -- The lead has to cover the relay hop plus each caster pausing E3 and clearing any cast in flight.
+    pcall(function() peer_bcast('/at_inviscast %d %s', INVIS_LEAD, table.concat(parts, ',')) end)
+    -- And act on it locally too, since a broadcast does not come back to the sender.
+    invis_combo_take(INVIS_LEAD, table.concat(parts, ','))
+    return true
+end
+
+-- Am I one of the casters named in that message? Runs on every character; only the two named act.
+function invis_combo_take(lead, blob, at)
+    for chunk in tostring(blob or ''):gmatch('[^,]+') do
+        local who, key = chunk:match('^(.-):(.+)$')
+        if who and who:lower() == myName:lower() then
+            invis_arm(key, tonumber(lead) or INVIS_LEAD, at)
+        end
+    end
+end
+
 function invis_cast(grp, lead)
     local pick = invisPick[grp]
     if not pick then return false end
@@ -13242,12 +13945,18 @@ function draw_invis()
                 -- ONE lead for both, so the two countdowns expire together. Passing the same number
                 -- rather than letting each default is the entire point: two defaults started a few
                 -- milliseconds apart are two different deadlines.
-                -- Same base for both, plus the per-row offset that keeps the slow cast ahead of the
-                -- instant one. INVIS_ROWS is { 'ITU', 'Invis' } so ITU is dispatched first as well.
-                local lead = INVIS_LEAD
-                for _, grp in ipairs(INVIS_ROWS) do
-                    invis_cast(grp, lead + (INVIS_ROW_OFFSET[grp] or 0))
-                end
+                -- ONE MESSAGE FOR BOTH CASTERS, not one each.
+                -- Sending them separately meant two relay operations, and each caster started its
+                -- countdown from when ITS OWN message arrived - so the gap between the two arrivals became
+                -- the gap between the two casts, exactly. The lead absorbs the round trip but not that.
+                -- A single broadcast lands on both in one operation, so the two deadlines are set from
+                -- very nearly the same instant and the residual is only how fast each client picks the
+                -- message up.
+                -- NEVER FROM THE DRAW. invis_combo_fire prepares and then WAITS OUT the countdown in
+                -- place - that is what made the two casts land 6ms apart - and a wait inside an ImGui
+                -- callback is a hard client crash, not a Lua error.
+                -- The button asks; the tick does it.
+                invisFireWanted = true
             end
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 local who = {}
@@ -14938,6 +15647,12 @@ while running do
             log('[portprobe] DONE - if you are reading this, nothing crashed.')
         end
         -- Ports. Both of these read the spellbook, so both belong here rather than where they were asked.
+        if portCastWanted then
+            local sp = portCastWanted
+            portCastWanted = nil
+            atphase('port_cast')
+            pcall(function() port_cast(sp) end)
+        end
         if portScanWanted then
             portScanWanted = false
             atphase('port_scan'); atphase_flush(true)
@@ -15321,12 +16036,63 @@ while running do
             end
         end
     end
-    if COTH.active and not distributing and (mq.gettime() - COTH.lastPush) > 1000 then
-        COTH.lastPush = mq.gettime()
-        local e, d, l = coth_read_self()
-        COTH.state[myName] = { emblem = e, dist = d, los = l, updated = mq.gettime() }
-        peer_bcast('/at_coth %s %d %d %d', myName, e, d, l)
-    end
+    -- The state push lives in coth_tick now. This copy survived the rewrite and still sent the OLD
+    -- four-field form - emblem, distance and a line-of-sight flag - but coth_read_self returns two
+    -- values, so the fourth was nil and string.format threw. That killed the whole script on load.
+    -- INVIS FIRST, BEFORE ANYTHING THAT BLOCKS.
+    -- The two casters count down to a shared deadline, so every millisecond the tick spends elsewhere
+    -- before reaching this is a millisecond of drift between them. CoTH's cast wait sits below and holds
+    -- the loop for up to twenty seconds - the message was being picked up 2.4 and 4.5 SECONDS late on
+    -- 2026-08-16 13:02, by which point the deadline had already passed and both fired on their own
+    -- schedule instead of together.
+    -- Nothing here waits, so putting it first costs the subsystems below nothing.
+        -- ARM BEFORE PREPPING. e3_hold inside the prep can wait 2.5s for the pause to confirm and another
+        -- 6s if a cast is in flight - and that lands squarely between the message arriving and the
+        -- deadline being set, which is where 2.4 and 4.5 seconds of drift came from on 2026-08-16 13:02.
+        -- The deadline is the only thing the two casters must agree on, and setting it needs no waiting.
+        -- Prep afterwards, inside the lead, which is what the lead is for.
+        -- Anything the phase timer noticed. Reported here because atphase itself cannot reach `log`.
+        if AT_slowPending then
+            local m = AT_slowPending
+            AT_slowPending = nil
+            log('\\ay[slow] %s\\ax', m)
+        end
+        if invisTake then
+            local tk = invisTake
+            invisTake = nil
+            atphase('invis_arm')
+            if tk.blob then pcall(function() invis_combo_take(tk.lead, tk.blob, tk.at) end)
+            else pcall(function() invis_arm(tk.key, tk.lead, tk.at) end) end
+        end
+        if invisPrepWanted then
+            invisPrepWanted = false
+            atphase('invis_prep')
+            pcall(invis_prep_self)
+        end
+        if invisFireWanted then
+            invisFireWanted = false
+            atphase('invis_combo')
+            pcall(invis_combo_fire)
+        end
+        if magicWanted then
+            local w = magicWanted
+            magicWanted = nil
+            atphase('magic_click')
+            if w.nm:lower() == myName:lower() then pcall(function() magic_click(w.key) end)
+            else pcall(function() peer_cmdf(w.nm, '/at_magic %s', w.key) end) end
+        end
+        if pacDelWanted then
+            local id = pacDelWanted
+            pacDelWanted = nil
+            pcall(function() peer_bcast('/at_pacdel %d', id) end)
+        end
+        if cothSetWanted then
+            local w = cothSetWanted
+            cothSetWanted = nil
+            atphase('coth_set')
+            pcall(function() coth_set(w == 'on') end)
+        end
+
     if COTH.active and not distributing and (mq.gettime() - COTH.lastPoll) > 1000 then
         COTH.lastPoll = mq.gettime()
         local ok, err = pcall(coth_tick)
@@ -15457,6 +16223,7 @@ while running do
         -- THE FAST PATH FIRST. On the tank this decides and asks; on everyone else it returns at once.
         -- It runs BEFORE di_tick so that when it is working, the old ladder sees a covered tank and never
         -- reaches for anything - the stand-down it broadcasts is the same one the ladder already honours.
+        atphase('cothwatch'); pcall(coth_watch_tick)
         atphase('diq')
         local oks, errs = pcall(diq_self_check)
         if not oks then log('\\ar[diq] self-check error: %s\\ax', tostring(errs)) end
@@ -15651,9 +16418,14 @@ pcall(function() mq.unbind('/at_burn') end)
 pcall(function() mq.unbind('/at_rezlog') end)
 pcall(function() mq.unbind('/at_rezauto') end)
 pcall(function() mq.unbind('/at_coth') end)
-pcall(function() mq.unbind('/at_cothclaim') end)
-pcall(function() mq.unbind('/at_cothfail') end)
+pcall(function() mq.unbind('/at_cothwatch') end)
 pcall(function() mq.unbind('/at_cothgo') end)
+pcall(function() mq.unbind('/at_cotharrived') end)
+pcall(function() mq.unbind('/at_cothhere') end)
+pcall(function() mq.unbind('/at_cothcast') end)
+pcall(function() mq.unbind('/at_cothat') end)
+pcall(function() mq.unbind('/atcothwho') end)
+pcall(function() mq.unbind('/at_cothmine') end)
 pcall(function() mq.unbind('/at_di') end)
 pcall(function() mq.unbind('/at_diauto') end)
 pcall(function() mq.unbind('/at_difired') end)
