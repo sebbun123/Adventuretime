@@ -36,6 +36,23 @@
 -- ===========================================================================
 
 local mq    = require('mq')
+
+-- EVERY USER-FACING COMMAND THIS SCRIPT BINDS, collected as they are registered rather than written out
+-- by hand. A hand-kept list of commands is a list that drifts from the commands, and the whole point of
+-- /atcommand is to be trusted when memory has already failed.
+-- Relay commands (/at_*) are excluded: six characters send them to each other constantly and typing one
+-- does nothing useful.
+AT_ALL_BINDS = {}
+do
+    local realBind = mq.bind
+    mq.bind = function(name, fn)
+        if type(name) == 'string' and name:sub(1, 4) ~= '/at_' then
+            AT_ALL_BINDS[#AT_ALL_BINDS + 1] = name
+        end
+        return realBind(name, fn)
+    end
+end
+
 local ImGui = require('ImGui')
 
 local scriptName = 'AdventureTime'
@@ -50,8 +67,8 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.14'
-local BUILD_TAG = '1.14'  -- bump on every change; prints on startup
+VERSION = '1.17'
+local BUILD_TAG = '1.17'  -- bump on every change; prints on startup
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -2448,6 +2465,16 @@ local function save_settings()
             f:write('epGem=' .. tostring(epGem or 8) .. '\n')
             f:write('miniMagic=' .. (miniMagic and '1' or '0') .. '\n')
             f:write('miniOrder=' .. table.concat(miniOrder, ',') .. '\n')
+            -- Which panel each section sits in, as key:number pairs. Absent = the mini, so only the ones
+            -- that have been moved take up any space in the file.
+            do
+                local parts = {}
+                for k, v in pairs(popOut) do
+                    if type(v) == 'number' then parts[#parts + 1] = k .. ':' .. v end
+                end
+                table.sort(parts)
+                f:write('popOut=' .. table.concat(parts, ',') .. '\n')
+            end
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
             f:write('uiLocked=' .. (uiLocked and '1' or '0') .. '\n')
             do
@@ -2593,6 +2620,13 @@ local function load_settings()
             if k == 'miniOrder' then
                 miniOrder = {}
                 for part in v:gmatch('[^,]+') do miniOrder[#miniOrder + 1] = part end
+            end
+            if k == 'popOut' then
+                popOut = {}
+                for part in v:gmatch('[^,]+') do
+                    local sk, pn = part:match('^(.-):(%d+)$')
+                    if sk then popOut[sk] = tonumber(pn) end
+                end
             end
             if k == 'miniBurns' then miniBurns = (v == '1' or v:lower() == 'true') end
             if k == 'miniPots'  then miniPots  = (v == '1' or v:lower() == 'true') end
@@ -2940,6 +2974,57 @@ function coth_watch_tick()
     end
 end
 
+-- Invis alignment test: fires the combo on a timer and records how far apart the two casters landed.
+INVT = { on = false, n = 0, total = 0, bucket = {}, seen = {}, until_ = 0, every = 15000, nextAt = 0,
+         covered = 0, partial = 0, checkAt = nil, checkRun = 0, worstMiss = nil }
+-- How long after the casts to read everyone's coverage. Both spells have a cast time and their reports
+-- have to travel, so an immediate read would show misses that are only late.
+INVT_CHECK_MS = 5000
+
+-- Who ended up with what. Runs a few seconds after each test press.
+function invistest_check()
+    local miss = {}
+    for _, nm in ipairs(group_members()) do
+        local st = invisState[nm]
+        if not st then miss[#miss + 1] = nm .. '(silent)'
+        elseif (st.norm or 0) == 0 and (st.und or 0) == 0 then miss[#miss + 1] = nm .. '(neither)'
+        elseif (st.norm or 0) == 0 then miss[#miss + 1] = nm .. '(no invis)'
+        elseif (st.und or 0) == 0 then miss[#miss + 1] = nm .. '(no ITU)'
+        end
+    end
+    if #miss == 0 then
+        INVT.covered = INVT.covered + 1
+        log('[invistest] run %d: everybody has both', INVT.checkRun)
+    else
+        INVT.partial = INVT.partial + 1
+        INVT.worstMiss = table.concat(miss, ' ')
+        log('\\ay[invistest] run %d: MISSED - %s\\ax', INVT.checkRun, INVT.worstMiss)
+    end
+end
+function invistest_report()
+    if INVT.n == 0 then log('[invistest] no completed runs'); return end
+    log('\\ag[invistest] %d runs - best %dms, worst %dms, average %dms\\ax',
+        INVT.n, INVT.best or 0, INVT.worst or 0, INVT.total / INVT.n)
+    -- COVERAGE FIRST. The gap is diagnostic; this is the result.
+    local runs = INVT.covered + INVT.partial
+    if runs > 0 then
+        log('\\ag[invistest] everybody covered on %d of %d runs (%d%%)\\ax',
+            INVT.covered, runs, math.floor(INVT.covered * 100 / runs + 0.5))
+        if INVT.partial > 0 then
+            log('[invistest]   last miss: %s', tostring(INVT.worstMiss))
+        end
+    end
+    local names = { '<=50ms', '51-150ms', '151-500ms', '501-1000ms', '>1s' }
+    for i = 1, 5 do
+        local c = INVT.bucket[i] or 0
+        if c > 0 then
+            log('[invistest]   %-11s %3d  (%d%%)', names[i], c, math.floor(c * 100 / INVT.n + 0.5))
+        end
+    end
+end
+
+potWanted     = nil    -- set by /atshimmer and friends; the tick drinks, because group_pot relays
+pacAddWanted  = nil    -- set by /atpacify; the tick queues it
 cothSetWanted = nil    -- set by the CoTH buttons; the tick calls coth_set, because it broadcasts
 magicWanted   = nil    -- set by a Countermeasures button; the tick casts it
 pacDelWanted  = nil    -- set by the placate 'x' button; the tick tells the group
@@ -2964,6 +3049,10 @@ COTH_SUMMONER_GRACE = 8000
 COTH_BARD_CAST = 11000
 -- How many summons a bard does before handing over, if anyone else can take it.
 COTH_BARD_MAX  = 2
+-- How long a fired rung stays assumed-spent before the client's own timers are believed again.
+-- Long enough to cover a read that lies immediately after casting, short enough that it cannot mask a
+-- cooldown that has genuinely finished.
+DI_SPENT_CAP = 20000
 COTH_LOS_FREE  = 25
 -- How long to keep reporting after deciding the gather is over. Covers the gap where somebody else has
 -- not reached the same conclusion and is still deciding from my last report.
@@ -3250,21 +3339,20 @@ DI = {
     -- client named it for us in "your divine intervention did not take hold on Sebbun".
     STAFF_SPELL = 'Divine Intervention',
     -- Options passed through to E3, mirroring the INI line this replaced. %s = the tank's name:
-    -- E3 needs the target NAMED for CheckFor to be evaluated against him rather than the caster.
-    -- CheckFor lists EVERY save a tank might already be carrying. Divine Redemption is the upgrade
     -- to Divine Intervention; a cleric who has it casts that instead. Both stay listed so a group
     -- mixing upgraded and un-upgraded clerics still recognises a save that is already up, rather
     -- than spending a staff charge on a tank who is covered.
     -- MATCHES THE RUNG SPEC EXACTLY, minus nothing but the reagent. Inline options are not the problem -
     -- if they were, the rungs would fail too, and they land saves on Sebbun reliably with this same syntax:
-    --     rung:  Divine Redemption/CastType|Spell/Sebbun/CheckFor|.../NoInterrupt
     -- The one field the staff carried that the rungs never did is Reagent|Emerald, and reagent tracking is
     -- an ini-config concept for E3's own bookkeeping rather than something the inline caster can act on.
     -- With it in the string the staff clicked, took its cooldown, spent its charge and landed nothing on a
     -- target the log confirmed was Sebbun the PC at 16m.
-    -- CheckFor is kept deliberately: it is what stops a charge going into an already-covered tank, and it
     -- costs nothing to leave in a form that is proven to parse.
-    OPTS    = '/CastType|Item/%s/CheckFor|Divine Guardian,Divine Intervention,Divine Redemption/NoInterrupt',
+    -- Same reasoning as RUNG_OPTS above: the ask only happens when the tank has nothing, so CheckFor has
+    -- no work to do and can only decline a needed cast. The staff has been landing fine with it, so if a
+    -- double-spend ever appears after this, this line is the first place to look.
+    OPTS    = '/CastType|Item/%s/NoInterrupt',
     REAGENT = 'Emerald',
     -- EMERALDS DO EXACTLY ONE JOB: below this, do not try to cast. They are not evidence of anything else.
     -- Every other use of them tonight was wrong. As a reagent field in the cast spec they broke the cast
@@ -3306,10 +3394,18 @@ DI = {
     -- is a tank nobody saved.
     SAVED_HOLD = 25000,
     -- Spec for casting a LADDER RUNG through E3, mirroring the staff's. %s = ability name, cast type, tank.
-    -- CheckFor makes E3 decline if the tank is already covered, which is free insurance on top of our own
     -- gate. The CastType tokens are E3's vocabulary, not MQ's: Item is proven on this setup by the staff,
     -- Spell and Alt are not. If a rung logs FIRING and nothing happens, correct the token HERE first.
-    RUNG_OPTS = '%s/CastType|%s/%s/CheckFor|Divine Guardian,Divine Intervention,Divine Redemption/NoInterrupt',
+    -- NO CheckFor. It was there as 'free insurance' against spending a save on a covered tank - but the
+    -- tank only asks when it has NOTHING, so there is nothing to insure against, and the check can only
+    -- refuse the one cast we actually need.
+    -- It refuses silently, in E3's own window: on 2026-08-16 23:30:59 Divine Redemption was issued and
+    -- announced, the gem timer never moved, and the tank sat uncovered for eight seconds. CheckFor even
+    -- listed Divine Redemption itself, so a stale view of the tank's buffs blocks the upgrade.
+    -- The tank's own local read decides whether it needs a save. That is one decider, and it is the right
+    -- one - a second opinion inside E3, working from a copy that can lag, is exactly the pattern that has
+    -- gone wrong everywhere else tonight.
+    RUNG_OPTS = '%s/CastType|%s/%s/NoInterrupt',
     -- How long the ladder sits still after issuing a rung, so the TANK'S save flag can catch up. NOT a wait
     -- on the rung's own cooldown - that read lags badly on items (the boots showed nothing for 29s).
     -- Twelve seconds, from measurement rather than taste: rung casts have landed at 3s, 3.5s, 5s and 7.5s
@@ -4018,6 +4114,25 @@ end
 -- The reuse comes from whichever read applies to the thing: an item carries it on its clicky, an AA on
 -- the ability, a spell on the spell. If none of them answers, fall back to a flat minute - long enough
 -- to cover the lag, short enough that a genuinely ready rung is not held back for long.
+-- Did the rung we just fired actually go out? Called from the tick a moment after issuing it.
+-- The gem timer is the evidence: casting from a gem starts it, whoever did the casting. Still zero means
+-- the command was accepted and nothing came of it.
+function di_rung_verify()
+    local c = DI.rungCheck
+    if not c then return end
+    if (mq.gettime() - c.at) < 1500 then return end
+    DI.rungCheck = nil
+    if not c.gem or c.gem <= 0 then return end          -- not a gem spell, nothing to read
+    local s = -1
+    pcall(function() s = tonumber(mq.TLO.Me.GemTimer(c.gem).TotalSeconds()) or -1 end)
+    if s == 0 then
+        rezlog('\\ar[di] %s was issued but gem %d never started its timer - E3 did not cast it\\ax',
+               c.name, c.gem)
+        -- It was never spent, so do not let the fired-stamp hold it back from the next attempt.
+        if DI.rungFiredAt then DI.rungFiredAt[c.name] = nil end
+    end
+end
+
 function di_rung_spent(name, kind)
     local fired = DI.rungFiredAt and DI.rungFiredAt[name]
     if not fired then return false end
@@ -4031,7 +4146,15 @@ function di_rung_spent(name, kind)
         pcall(function() rc = tonumber(mq.TLO.Spell(name).RecastTime()) or 0 end)
     end
     if rc <= 0 then rc = 60 end
-    return (mq.gettime() - fired) < (rc * 1000)
+    -- CAP IT. The stamp exists because a timer read right after firing can lie for a few seconds - not
+    -- because we know better than the client for the next half hour. Spell.RecastTime can report far
+    -- longer than the gem's actual refresh: Divine Redemption's gem counted down from about 100s on
+    -- 2026-08-16 23:22 while this was still calling it spent, so the save read as unavailable while it
+    -- was sitting there ready and the ladder went straight to the staff.
+    -- Past the cap, whatever the client says is better evidence than our memory of having cast it.
+    local ms = rc * 1000
+    if ms > DI_SPENT_CAP then ms = DI_SPENT_CAP end
+    return (mq.gettime() - fired) < ms
 end
 
 function di_rung_list()
@@ -4042,6 +4165,34 @@ function di_rung_list()
     -- was invention rather than something the data asked for.
     for _, nm in ipairs(DI.CLR_SAVES) do
         local gem = 0; pcall(function() gem = tonumber(mq.TLO.Me.Gem(nm)()) or 0 end)
+        -- IN THE BOOK BUT NOT IN A GEM IS INVISIBLE. A rung that fails the gem test is not offered, not
+        -- declined and not logged - so a save spell that is memmed but whose gem read comes back 0 looks
+        -- exactly like one that is simply on cooldown, and the ladder appears to skip it for no reason.
+        -- Me.Gem(name) is the by-name form, which E3 never uses anywhere in its source; the gem walk is
+        -- the form it does use. Said once per spell so it does not repeat every poll.
+        if gem <= 0 then
+            local inBook = false
+            pcall(function() inBook = tlo_true(mq.TLO.Me.Book(nm)()) end)
+            if inBook then
+                DI.saidNoGem = DI.saidNoGem or {}
+                if not DI.saidNoGem[nm] then
+                    DI.saidNoGem[nm] = true
+                    local found = 0
+                    pcall(function()
+                        for g = 1, 12 do
+                            if tostring(mq.TLO.Me.Gem(g)() or '') == nm then found = g; break end
+                        end
+                    end)
+                    if found > 0 then
+                        rezlog('\\ay[di] %s is in gem %d but Me.Gem("%s") read 0 - using the gem walk instead\\ax',
+                               nm, found, nm)
+                        gem = found
+                    else
+                        rezlog('[di] %s is in my book but not memmed - it cannot be used as a save', nm)
+                    end
+                end
+            end
+        end
         if gem > 0 then
             local s = -1
             pcall(function() s = tonumber(mq.TLO.Me.GemTimer(gem).TotalSeconds()) or -1 end)
@@ -4071,8 +4222,12 @@ function di_rung_list()
             -- guessing at reads instead of printing them; this one prints them.
             -- Change-detected AND rate limited. Change-detection alone printed 62 lines in a 114 line
             -- log, because the thing it was watching flickers by nature.
-            local k = string.format('%s/%d/%s', tostring(s), gem, tostring(spent))
-            if DI.rungSaid ~= k and (mq.gettime() - (DI.rungSaidAt or 0)) > 30000 then
+            -- ON THE VERDICT, not on the numbers. Keying this on the gem timer meant a new key every
+            -- second while it counted down, so the 30s rate limit was doing all the work and the verdict
+            -- could flip to not-ready and back without ever printing. Two READY lines an hour apart said
+            -- nothing about the hour in between, which is where the answer was.
+            local k = tostring(ready) .. '/' .. tostring(spent)
+            if DI.rungSaid ~= k and (mq.gettime() - (DI.rungSaidAt or 0)) > 2000 then
                 DI.rungSaid, DI.rungSaidAt = k, mq.gettime()
                 rezlog('[di] rung 1 %s: gem %d, gem timer %ss (slack %ds), assumed-spent %s -> %s',
                        nm, gem, tostring(s), DI.RUNG_READY_SLACK, tostring(spent),
@@ -5551,7 +5706,24 @@ pcall(function()
         cothSetWanted = off and 'off' or 'on'
         log('[coth] %s', off and 'stopping the gather' or 'starting a gather here')
     end)
-    mq.bind('/atcothwho', function(scope)
+    -- FIRE THE COMBO ON A TIMER AND MEASURE IT.
+    --   /atinvistest            10 minutes, one press every 15s
+    --   /atinvistest 5 10       5 minutes, every 10s
+    --   /atinvistest off        stop early and report
+    -- Presses are spaced generously on purpose: each one pauses E3 across the group, casts, and takes
+    -- readings for nearly three seconds, so anything under about ten seconds would have runs overlapping
+    -- and measure the overlap rather than the alignment.
+    mq.bind('/atinvistest', function(mins, gapSecs)
+        if mins and tostring(mins):lower() == 'off' then invistest_report(); INVT.on = false; return end
+        local m = tonumber(mins) or 10
+        local g = math.max(10, tonumber(gapSecs) or 15)
+        INVT.on, INVT.n, INVT.total, INVT.best, INVT.worst = true, 0, 0, nil, nil
+        INVT.bucket, INVT.seen = {}, {}
+        INVT.covered, INVT.partial, INVT.checkAt, INVT.worstMiss = 0, 0, nil, nil
+        INVT.until_, INVT.every, INVT.nextAt = mq.gettime() + m*60000, g*1000, mq.gettime() + 1000
+        log('\\ag[invistest] running for %d min, a press every %ds - /atinvistest off to stop\\ax', m, g)
+    end)
+        mq.bind('/atcothwho', function(scope)
         if scope and tostring(scope):lower() == 'all' then
             pcall(function() peer_bcast('/atcothwho') end)
         end
@@ -6618,7 +6790,32 @@ end
     -- casters that received the same broadcast together were setting deadlines hundreds of milliseconds
     -- apart. 683ms on 2026-08-16 12:54.
     -- The bind itself does nothing but record - arming waits, and a bind cannot.
-    mq.bind('/at_inviscast', function(a, b)
+    -- A caster fired. Pair it with the other one and record the gap.
+    mq.bind('/at_invisfired', function(who, ms)
+        local at = tonumber(ms); if not who or not at then return end
+        INVT.seen[who] = at
+        local names, times = {}, {}
+        for nm, t in pairs(INVT.seen) do names[#names+1] = nm; times[#times+1] = t end
+        if #times < 2 then return end
+        table.sort(times)
+        local gap = times[#times] - times[1]
+        INVT.seen = {}
+        if not INVT.on then return end
+        INVT.n = INVT.n + 1
+        INVT.total = INVT.total + gap
+        if gap > (INVT.worst or -1) then INVT.worst = gap end
+        if gap < (INVT.best or 1e9) then INVT.best = gap end
+        -- Buckets, because an average hides the shape: what matters is how often it is BAD, not the mean.
+        local b = (gap <= 50) and 1 or (gap <= 150) and 2 or (gap <= 500) and 3 or (gap <= 1000) and 4 or 5
+        INVT.bucket[b] = (INVT.bucket[b] or 0) + 1
+        log('[invistest] run %d: casters %dms apart', INVT.n, gap)
+        -- CHECK THE GROUP, not just the two casters. Two casts landing together is the means; everybody
+        -- ending up with both buffs is the point, and they are not the same thing - a perfectly aligned
+        -- pair still misses somebody who was out of range, zoning, or already casting.
+        -- Read a moment later, so both spells have had time to land and be reported.
+        INVT.checkAt, INVT.checkRun = mq.gettime() + INVT_CHECK_MS, INVT.n
+    end)
+        mq.bind('/at_inviscast', function(a, b)
         local at = mq.gettime()
         if a and b and tostring(a):match('^%d+$') and tostring(b):find(':', 1, true) then
             invisTake = { lead = a, blob = b, at = at }
@@ -6693,7 +6890,16 @@ end
     mq.bind('/at_magicstate', function(char, key, have, secs, up, dsecs)
         if not char or not key then return end
         magicState[char] = magicState[char] or {}
-        magicState[char][key] = { have = tonumber(have) or 0, secs = tonumber(secs) or -1,
+        local prev = magicState[char][key]
+        local h = tonumber(have) or 0
+        -- ONCE THEY HAVE IT, THEY HAVE IT. An AA does not un-train itself and a spell does not fall out
+        -- of the book, so a later report of have=0 is not news - it is a reading taken before the state
+        -- was ready, or a query that came back empty.
+        -- It matters because a pick is remembered in settings: an invis caster that momentarily reports 0
+        -- stops being a holder, and the combo drops that whole row without casting it. Cooldowns and
+        -- buff-up flags still track normally; only OWNERSHIP is sticky.
+        if prev and prev.have == 1 then h = 1 end
+        magicState[char][key] = { have = h, secs = tonumber(secs) or -1,
                                   up = tonumber(up) or 0, dsecs = tonumber(dsecs) or 0,
                                   updated = mq.gettime() }
     end)
@@ -6919,7 +7125,11 @@ end
             end
             local spec = DI.STAFF .. ((DI.OPTS ~= '') and DI.OPTS:format(tank) or '')
             rezlog('[diq] FIRING the staff for %s (%d emerald(s))', tank, em)
+            -- Same pairing as the rung above: nowcast is lost if E3 is busy, queuecast waits. The staff
+            -- has a long reuse, so the cooldown makes a second cast impossible and there is nothing to
+            -- lose by sending both - and rather more to lose by the one command going nowhere.
             pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
+            pcall(function() mq.cmdf('/queuecast me "%s" %d', spec, tid) end)
             DI.watch = { at = mq.gettime(), em = em, tank = tank, tries = 1,
                          saveWas = (DI.state[tank] or {}).saveName }
             DI.assumeSpentUntil = mq.gettime() + DI.ASSUME_SPENT
@@ -6938,7 +7148,25 @@ end
             DI.rungFiredAt[best.name] = mq.gettime()
             DI.pushNow = true          -- say so at once; the timers will not
             local spec = string.format(DI.RUNG_OPTS, best.name, best.kind, tank)
+            -- THE EXACT STRING WE HAND E3. On 2026-08-16 23:30:59 the cast was issued, announced, and
+            -- nothing happened - the gem timer never moved and no save landed. From our side that is
+            -- indistinguishable from E3 refusing it, and we could not see which.
+            -- BOTH, AND LET THE COOLDOWN SORT IT OUT.
+            -- /nowcast is dropped outright when E3 is busy: on 2026-08-17 00:00:45 it interrupted a Stun
+            -- to heal, our save went out a second later, and the gem timer never moved. No refusal, no
+            -- error - the command simply went nowhere and the tank sat uncovered for fifteen seconds.
+            -- /queuecast does not fire any sooner (E3 drains that queue from the same main loop) but it
+            -- WAITS rather than vanishing, so it covers exactly the case nowcast loses.
+            -- Sending both cannot double-cast: whichever lands first puts the save on cooldown and the
+            -- other finds nothing to do. And we do not interrupt what E3 is doing - a heal in progress may
+            -- well matter more than the save arriving half a second earlier; what matters is that the
+            -- cast is not simply lost.
+            rezlog('[di] nowcast + queuecast: %s (target id %d)', spec, tid)
             pcall(function() mq.cmdf('/nowcast me "%s" %d', spec, tid) end)
+            pcall(function() mq.cmdf('/queuecast me "%s" %d', spec, tid) end)
+            -- DID IT ACTUALLY GO OUT? The gem timer is the proof: casting from a gem starts it. If it is
+            -- still 0 a moment later, E3 took the command and did nothing with it.
+            DI.rungCheck = { name = best.name, gem = best.gem, at = mq.gettime(), tank = tank }
         end
     end)
     -- The answer. 'yes' means it has gone out and the tank should watch for the save rather than ask
@@ -7298,6 +7526,12 @@ pcall(function()
             DI.watch, DI.assumeSpentUntil = nil, nil
             DI.pushNow = true
         end
+    end)
+    -- E3 REFUSING A CAST. It says so in its own window and nowhere else, so without this a refusal looks
+    -- exactly like a cast that vanished - which is what a save that never arrives looks like from the
+    -- tank's side.
+    mq.event('at_e3_refused', '#*#CheckFor#*#', function(line)
+        rezlog('[di] E3 refused a cast: %s', tostring(line or '?'))
     end)
     mq.event('at_di_blocked', 'Your #1# did not take hold on #2#.#*#', function(line, spell, who)
         local sp = tostring(spell or ''):lower()
@@ -8427,6 +8661,17 @@ local ICONS_OK, ICO = pcall(require, 'mq.icons')
 local BURN_DOT = '#'   -- the dot glyph; ASCII so it renders in any ImGui font. Swap freely.
                        -- Declared HERE, above burn_glyph: it used to sit below, so the 'or BURN_DOT'
                        -- fallback read a nil global and an unknown kind rendered nothing at all.
+-- The pop-out glyph. An arrow leaving a box is the near-universal 'this opens somewhere else', so it
+-- needs no explaining - and unlike the '[ ]' it replaces, it cannot be mistaken for a checkbox sitting
+-- next to the real checkboxes in Settings.
+-- Falls back to ASCII on a build without the icon font, same as the burn glyphs.
+POP_ICON = (ICONS_OK and type(ICO) == 'table'
+            and (ICO.FA_EXTERNAL_LINK or ICO.MD_OPEN_IN_NEW or ICO.FA_WINDOW_RESTORE)) or '>>'
+-- The grab handle. Six dots is the near-universal 'drag me' and, unlike an arrow, it says the row moves
+-- rather than that something happens when you click.
+POP_GRIP = (ICONS_OK and type(ICO) == 'table'
+            and (ICO.FA_BARS or ICO.MD_DRAG_INDICATOR or ICO.FA_ELLIPSIS_V)) or '::'
+
 local BURN_GLYPH, BURN_GLYPH_BY_NAME
 if ICONS_OK and type(ICO) == 'table' then
     -- Other item candidates if the hand doesn't land: MD_TOUCH_APP, FA_DIAMOND, MD_DIAMOND,
@@ -13173,6 +13418,43 @@ function draw_nightveil()
 end
 
 -- The pacify panel: who can do it, what each caps at, and the queue with each mob routed to a caster.
+-- ADD A SPAWN TO THE PLACATE QUEUE. Pulled out of the button handler so the button and /atpacify are
+-- the same code: two routes into one queue, routed and assigned identically, rather than a command that
+-- almost does what the button does.
+-- Takes an id so it can be called for a named spawn as well as the current target.
+function pac_add_spawn(id)
+    id = tonumber(id) or 0
+    if id <= 0 then log('\\ay[pacify] target an NPC first\\ax'); return false end
+    local nm, ty, hp, lvl, dist = '', '', 0, 0, 0
+    pcall(function() nm   = tostring(mq.TLO.Spawn(id).CleanName() or '') end)
+    pcall(function() ty   = tostring(mq.TLO.Spawn(id).Type() or '') end)
+    pcall(function() hp   = tonumber(mq.TLO.Spawn(id).PctHPs()) or 0 end)
+    pcall(function() lvl  = tonumber(mq.TLO.Spawn(id).Level()) or 0 end)
+    pcall(function() dist = math.floor(tonumber(mq.TLO.Spawn(id).Distance()) or 0) end)
+    if ty ~= 'NPC' or hp <= 0 then
+        log('\\ay[pacify] %s is not a living NPC\\ax', (nm ~= '') and nm or ('id ' .. id))
+        return false
+    end
+    if pac_find(id) then log('[pacify] %s is already queued', nm); return false end
+    -- ROUTED AT ADD TIME, from the level the mob actually is. Deciding later would mean deciding again
+    -- on every tick, and the answer cannot change - a mob's level is fixed.
+    -- Distance is a snapshot: the mob may close before its turn comes, so it is used to PREFER a caster
+    -- who can already reach it rather than to rule anyone out permanently.
+    local who, cap, rng = pac_assign(lvl, dist)
+    if not who then who, cap, rng = pac_assign(lvl) end   -- nobody in range: fall back on level
+    pacQueue[#pacQueue + 1] = { id = id, name = nm, level = lvl, dist = dist, who = who,
+                                assignedAt = mq.gettime() }
+    if who then
+        log('[pacify] %s (level %d, %dm) -> %s (caps %d, reach %d)', nm, lvl, dist, who, cap or 0, rng or 0)
+        pcall(function() peer_bcast('/at_pacadd %d %s %d %s', id, nm:gsub(' ', '_'), lvl, who) end)
+        -- Every add can change who should have what, so settle the list before anyone picks up.
+        pac_rebalance()
+        return true
+    end
+    log('\\ay[pacify] %s is level %d - nobody here can pacify that high\\ax', nm, lvl)
+    return false
+end
+
 function draw_pacify()
     -- WHO IS AVAILABLE, and what they top out at. Shown because the routing is only as good as this
     -- table, and a caster missing from it is the first thing you would want to notice.
@@ -13209,36 +13491,9 @@ function draw_pacify()
     end
 
     if ImGui.Button('Pacify target##pacadd', 150, 0) then
-        local id, nm, ty, hp, lvl = 0, '', '', 0, 0
+        local id = 0
         pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
-        pcall(function() nm = tostring(mq.TLO.Target.CleanName() or '') end)
-        pcall(function() ty = tostring(mq.TLO.Target.Type() or '') end)
-        pcall(function() hp = tonumber(mq.TLO.Target.PctHPs()) or 0 end)
-        pcall(function() lvl = tonumber(mq.TLO.Target.Level()) or 0 end)
-        local dist = 0
-        pcall(function() dist = math.floor(tonumber(mq.TLO.Target.Distance()) or 0) end)
-        if id <= 0 or ty ~= 'NPC' or hp <= 0 then
-            log('\\ay[pacify] target an NPC first\\ax')
-        elseif pac_find(id) then
-            log('[pacify] %s is already queued', nm)
-        else
-            -- ROUTED AT CLICK TIME, from the level the mob actually is. Deciding later would mean
-            -- deciding again on every tick, and the answer cannot change - a mob's level is fixed.
-            -- Distance is a snapshot: the mob may close before its turn comes, so it is used to PREFER a
-            -- caster who can already reach it rather than to rule anyone out permanently.
-            local who, cap, rng = pac_assign(lvl, dist)
-            if not who then who, cap, rng = pac_assign(lvl) end   -- nobody in range: fall back on level
-            pacQueue[#pacQueue + 1] = { id = id, name = nm, level = lvl, dist = dist, who = who,
-                                        assignedAt = mq.gettime() }
-            if who then
-                log('[pacify] %s (level %d, %dm) -> %s (caps %d, reach %d)', nm, lvl, dist, who, cap or 0, rng or 0)
-                pcall(function() peer_bcast('/at_pacadd %d %s %d %s', id, nm:gsub(' ', '_'), lvl, who) end)
-                -- Every add can change who should have what, so settle the list before anyone picks up.
-                pac_rebalance()
-            else
-                log('\\ay[pacify] %s is level %d - nobody here can pacify that high\\ax', nm, lvl)
-            end
-        end
+        pac_add_spawn(id)
     end
     ImGui.SameLine()
     if ImGui.SmallButton('Clear##pacclear') then
@@ -13368,6 +13623,78 @@ function draw_coth_mini()
     end
 end
 
+-- EVERY COMMAND WORTH TYPING, in one place.
+-- They accumulated over months and lived only in the startup spam, which scrolls away in seconds - so
+-- the usual way to find one was to remember it existed and then guess the spelling.
+-- Grouped by what you are trying to do rather than alphabetically: nobody looks for a command by its
+-- first letter, they look for the thing it does.
+-- The relay commands (/at_*) are deliberately absent. Six characters send them to each other constantly
+-- and typing one by hand does nothing useful.
+
+AT_COMMANDS = {
+    { group = 'Windows' },
+    { cmd = '/at',              desc = 'toggle the window' },
+    { cmd = '/atui',            desc = 'open the mini window' },
+    { cmd = '/atuie',           desc = 'open the full window' },
+    { cmd = '/atui reset',      desc = 'put every popped-out section back in the mini' },
+    { cmd = '/attab',           desc = 'switch the active tab' },
+    { cmd = '/atcommand',       desc = 'print this list in the chat window' },
+
+    { group = 'Group actions' },
+    { cmd = '/atcoth',          desc = 'gather the group to where I am standing' },
+    { cmd = '/atcoth off',      desc = 'stop the gather' },
+    { cmd = '/atwipe',          desc = 'hold all rezzes until the group zones' },
+    { cmd = '/atwipe off',      desc = 'release the hold' },
+    { cmd = '/atresume',        desc = 'resume after a hold' },
+    { cmd = '/atinvis',         desc = 'fire the invis combo' },
+    { cmd = '/atshimmer',       desc = 'group Shimmering Reflection' },
+    { cmd = '/atfleeting',      desc = 'group Fleeting Fortitude' },
+    { cmd = '/atinferno',       desc = 'group Inferno Ward' },
+    { cmd = '/atreclaim',       desc = 'reclaim currency from the group' },
+
+    { group = 'Pacify' },
+    { cmd = '/atpacify',        desc = 'add my target to the placate queue' },
+    { cmd = '/atpacify <name>', desc = 'add a named mob to the placate queue' },
+    { cmd = '/atpac',           desc = 're-announce my pacify ceiling after memming a new rank' },
+    { cmd = '/atrange',         desc = 'set the pacify range' },
+
+    { group = 'Gear and buffs' },
+    { cmd = '/atregear',        desc = 're-equip after a placate strip' },
+    { cmd = '/atportlist',      desc = 'list the ports I can cast' },
+
+    { group = 'Diagnostics' },
+    { cmd = '/atburnpoll',      desc = 're-read my burn INI and report everything again' },
+}
+
+function draw_commands_tab()
+    ImGui.Spacing()
+    ImGui.TextDisabled('Click a command to copy it. Anything here can go on a hotkey.')
+    -- SAY THAT THE LIST IS EDITED. Fifteen working commands are deliberately not shown - the probes and
+    -- one-off diagnostics that are useful when something is wrong and clutter when it is not. Without
+    -- this line the tab reads as the complete set, and somebody who half-remembers /atstaff would decide
+    -- they had imagined it.
+    ImGui.TextDisabled('The everyday ones. Diagnostics and probes still work but are not listed.')
+    ImGui.Spacing()
+    for _, e in ipairs(AT_COMMANDS) do
+        if e.group then
+            ImGui.Spacing()
+            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.group)
+            ImGui.Separator()
+        else
+            -- The command IS the button. Clicking copies it, because the thing you want after finding a
+            -- command is usually to put it somewhere - a hotkey, a social, a message to somebody else.
+            if ImGui.SmallButton(e.cmd .. '##cmd_' .. e.cmd) then
+                pcall(function() ImGui.SetClipboardText(e.cmd) end)
+                log('[cmd] copied %s', e.cmd)
+            end
+            ImGui.SameLine(180)
+            ImGui.TextDisabled(e.desc)
+        end
+    end
+    ImGui.Spacing()
+    ImGui.EndTabItem()
+end
+
 -- Mini section registry. Order lives in ONE list so it can be reordered in Settings and saved, rather
 -- than being baked into the render function - which meant every layout change was a code change.
 -- Tribute is not here: it is the mini window's whole identity and stays pinned at the top.
@@ -13425,6 +13752,22 @@ invisLast  = ''
 -- MAGIC_CLICKS are the list - add one there and it is recognised here with nothing else to update.
 -- Nothing outside that list is touched, which is the property that matters for a button that removes
 -- buffs from six characters at once.
+-- Other things that make you invisible, beyond the four combo AAs. EXACT names only: a substring rule
+-- here once stripped 'Undead Chokidai Blessing' off three characters because it contained a word that
+-- looked right.
+-- Add to this rather than loosening the matching. If something is making a character invisible and is not
+-- listed, invis_self says so in the log with the name, which is how it gets added.
+INVIS_ALSO = {
+    ['invisibility']                       = 'Invis',
+    ['group invisibility']                 = 'Invis',
+    ['improved invisibility']              = 'Invis',
+    ['invisibility versus undead']         = 'ITU',
+    ['group invisibility versus undead']   = 'ITU',
+    ['invisibility to undead']             = 'ITU',
+    ['superior camouflage']                = 'Invis',
+    ['camouflage']                         = 'Invis',
+    ['shroud of stealth']                  = 'Invis',
+}
 function invis_known(name)
     local low = tostring(name or ''):lower()
     if low == '' then return nil end
@@ -13433,7 +13776,7 @@ function invis_known(name)
             if low == e.aa:lower() then return e.group end
         end
     end
-    return nil
+    return INVIS_ALSO[low]
 end
 function invis_self()
     local anyInvis = false
@@ -13455,9 +13798,29 @@ function invis_self()
     pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
     pcall(function() look(function(i) return mq.TLO.Me.Buff(i).Name() end, nb) end)
     pcall(function() look(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
-    -- The bare read is the authority on plain invis: if the client says invis and no ITU buff was found,
-    -- it is normal invis whatever cast it.
-    if anyInvis and not u then n = true end
+    -- THE BUFFS DECIDE, NOT Me.Invis.
+    -- This used to end with 'if anyInvis and not u then n = true' - treating the client's own invis flag
+    -- as the authority on plain invis. It is not: Me.Invis reads true when you are invisible to UNDEAD
+    -- as well, so a character carrying only ITU was reported as having normal invis whenever the ITU buff
+    -- name was not recognised. The coverage row then showed a cover that did not exist.
+    -- A named buff says exactly which kind you have. The flag says only that something is up.
+    -- Still worth reading the flag though - as a CHECK on our list rather than a substitute for it. If
+    -- the client says invisible and nothing we know about is present, the list is missing a name and this
+    -- is the only place that would ever notice.
+    if anyInvis and not n and not u then
+        invisSaidUnknown = invisSaidUnknown or {}
+        local names = {}
+        pcall(function()
+            for i = 1, (nb or 0) do names[#names + 1] = tostring(mq.TLO.Me.Buff(i).Name() or '') end
+            for i = 1, (ns or 0) do names[#names + 1] = tostring(mq.TLO.Me.Song(i).Name() or '') end
+        end)
+        local k = table.concat(names, '|')
+        if not invisSaidUnknown[k] then
+            invisSaidUnknown[k] = true
+            log('\\ay[invis] the client says I am invisible but no buff I recognise is up - tell me which of these it is:\\ax')
+            log('[invis]   %s', table.concat(names, ', '))
+        end
+    end
     return n and 1 or 0, u and 1 or 0
 end
 
@@ -13683,7 +14046,19 @@ function invis_fire_now()
     local n0, u0 = invis_self()
     log('[invis] FIRING %s at %d (before: invis=%d itu=%d)', key, mq.gettime(), n0, u0)
     pcall(function() magic_click(key) end)
-    -- Say what we look like the moment the cast goes out, before settling in to watch.
+    -- Target back, fire and forget - the readings do not need it and nothing waits on it.
+    if invisPrevTarget and invisPrevTarget > 0 then
+        local back = invisPrevTarget
+        invisPrevTarget = nil
+        pcall(function() mq.cmdf('/target id %d', back) end)
+    end
+    -- Tell the driver the exact instant, so a test run can measure the two casters against each other
+    -- rather than us reading two logs side by side. mq.gettime shares a time base across clients - the
+    -- values line up with the wall clock difference between sessions - so the subtraction is meaningful.
+    if driverName then
+        pcall(function() peer_cmdf(driverName, '/at_invisfired %s %d', myName, mq.gettime()) end)
+    end
+        -- Say what we look like the moment the cast goes out, before settling in to watch.
     invis_push_now()
     -- READINGS AT 1.2 AND 2.7 SECONDS, not three spread over five.
     -- The third told us nothing the second had not, and the loop was held for the whole 4.7s - which is
@@ -13778,6 +14153,21 @@ function invis_prep_self()
     -- /makemevis is the client's own answer to 'stop being invisible', which is more reliable than
     -- removing buffs by name and does not care what put the invis there.
     pcall(function() mq.cmd('/makemevis') end)
+    -- TARGET MYSELF. A group invis aimed at something outside the group - a pet, a mob, another player -
+    -- fails, and fails quietly: the cast goes out, nothing lands, and the readings show no coverage with
+    -- no reason given.
+    -- IN THE PREP, NOT AT THE CAST. Waiting for a target to take is another variable-length step, and
+    -- anything variable between the deadline and the cast is exactly what pulled the two casters apart
+    -- all evening. Here it sits inside the lead, where there are seconds to spare.
+    -- The previous target is remembered and put back once the cast is away.
+    invisPrevTarget = 0
+    pcall(function() invisPrevTarget = tonumber(mq.TLO.Target.ID()) or 0 end)
+    local myId = 0
+    pcall(function() myId = tonumber(mq.TLO.Me.ID()) or 0 end)
+    if myId > 0 and invisPrevTarget ~= myId then
+        pcall(function() mq.cmdf('/target id %d', myId) end)
+        mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == myId end)
+    end
     local casting = false
     pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
     if casting then
@@ -13812,12 +14202,28 @@ function invis_combo_fire()
     local parts = {}
     for _, grp in ipairs(INVIS_ROWS) do
         local pick = invisPick[grp]
-        if pick then
+        if not pick then
+            -- SAY WHICH ROW IS EMPTY. A combo with only one row set looks identical to a combo where the
+            -- second caster silently failed, and the two need completely different fixes.
+            log('\\ay[invis] %s: nobody picked - that row will not be cast\\ax', grp)
+        else
+            local found
             for _, h in ipairs(invis_holders(grp)) do
-                if h.nm == pick then
-                    parts[#parts + 1] = pick .. ':' .. h.e.key
-                    break
-                end
+                if h.nm == pick then found = h; break end
+            end
+            if found then
+                parts[#parts + 1] = pick .. ':' .. found.e.key
+            else
+                -- PICKED BUT NOT AVAILABLE. The selection is remembered in settings, so it survives the
+                -- character losing the ability, zoning out, or simply not having reported yet - and until
+                -- now the row was just dropped with nothing said. From outside that looks exactly like a
+                -- cast that failed, which sends you hunting for a timing bug that is not there.
+                local who = {}
+                for _, h in ipairs(invis_holders(grp)) do who[#who + 1] = h.nm end
+                log('\\ar[invis] %s: %s is picked but is not reporting the ability right now - skipping that row\\ax',
+                    grp, pick)
+                log('[invis]   %s available from: %s', grp,
+                    (#who > 0) and table.concat(who, ', ') or 'nobody')
             end
         end
     end
@@ -13825,6 +14231,7 @@ function invis_combo_fire()
         log('\\ay[invis] nobody is picked - set who casts each row in Settings\\ax')
         return false
     end
+    log('[invis] combo: %s', table.concat(parts, ', '))
     -- QUIET THE WHOLE GROUP FIRST, not just the two casters.
     -- Anyone mid-cast when the invis lands strips their OWN - the caster is only the most obvious case.
     -- So everybody pauses E3 and drops whatever is in flight, and the lead below is what gives them time
@@ -14462,7 +14869,250 @@ function draw_burn_table(filter)
         end
 end
 
+-- POP-OUTS. A second (and third) ImGui window drawn from the same callback as the main one.
+-- No second script and nothing to synchronise: they read the same tables the main window does, so a mob
+-- entering the placate queue appears in both at once with no message passing at all. A separate Lua
+-- would have needed its own copy of every queue and a channel to keep it current, which is a great deal
+-- of machinery for a small floating box.
+-- Each carries its own ###id so ImGui remembers its size and position independently of the main window.
+-- ANY SECTION, not a hardcoded pair. MINI_SECTIONS already names every drawable piece and holds the
+-- function that draws it, so popping one out is just calling that function inside its own Begin/End.
+-- Two special cases would have been more code than the general form and would need a third writing the
+-- moment you wanted a third.
+-- WHICH WINDOW EACH SECTION LIVES IN.
+--   nil  = the mini window, as always
+--   1..N = panel N, a window you compose yourself
+-- popOut used to be a boolean - in or out - which is the same idea with only two possible homes. Making
+-- it a NUMBER is the whole feature: two sections given the same number share a window, and that is what
+-- 'build your own layout' means. Nothing else had to change, because every place that asked 'is this
+-- popped' was really asking 'is this somewhere other than the mini'.
+popOut = {}          -- section key -> panel number, or nil for the mini
+POP_PANELS = 8       -- room to pop several out individually and still merge some together
+
+-- DRAG A SECTION FROM ONE WINDOW TO ANOTHER, the way a browser tab moves between windows.
+-- Two halves, and both are needed on every window that can hold sections - the mini and every panel:
+--   a SOURCE on each section's title, carrying the section key
+--   a TARGET on the window itself, which reassigns whatever was dropped on it
+-- Dropping onto the mini sends a section home; dropping onto a panel moves it there; and the pop icon
+-- still makes a section its own window, so 'pop one out' and 'merge two together' are the same mechanism
+-- seen from either end.
+-- THE GRIP, drawn as a real widget rather than text.
+-- BeginDragDropSource can be talked into accepting a Text item with SourceAllowNullID, but
+-- BeginDragDropTARGET cannot - there is no equivalent flag, and an item with no ImGui id can never
+-- receive a drop. So the handle has to be something that has an id: a button does, text does not.
+-- That is why dragging started working and dropping still did nothing.
+-- IS A SECTION BEING DRAGGED RIGHT NOW? GetDragDropPayload answers without needing a target under the
+-- cursor, which is what lets every window show a drop zone the moment a drag starts rather than only
+-- when you happen to be over the right few pixels.
+function pop_dragging()
+    if not ImGui.GetDragDropPayload then return false end
+    local ok, pl = pcall(function() return ImGui.GetDragDropPayload() end)
+    return ok and pl ~= nil
+end
+
+-- A BIG, OBVIOUS PLACE TO LET GO. The grips are small buttons and there was nothing on screen saying
+-- where a drop would land - so a drag that worked perfectly looked broken, because there was nowhere
+-- visible to drop it.
+-- Only drawn while something is actually being dragged, so it costs no space the rest of the time.
+function pop_drop_zone(panel, label)
+    if not pop_dragging() then return end
+    ImGui.PushStyleColor(ImGuiCol.Button, 0.20, 0.40, 0.25, 1.0)
+    ImGui.Button((label or 'drop here') .. '##at_dz_' .. tostring(panel or 'mini'), -1, 22)
+    ImGui.PopStyleColor()
+    pop_drop_target(panel)
+end
+
+-- ONE ICON, TWO GESTURES. Click it to pop the section into its own window; drag it to put the section
+-- somewhere specific. Both are 'move this', so both belong on the same control - and a separate grip
+-- next to a separate pop button was two icons per section competing for a strip of screen that is
+-- already tight.
+-- ImGui makes this free: a button that is dragged away does not report a click, so the two cannot be
+-- confused by accident.
+-- Returns true if it was CLICKED, so the caller decides what a click means in its context.
+function pop_grip(key, panel)
+    local clicked = ImGui.SmallButton(POP_ICON .. '##grip_' .. tostring(key))
+    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+        pcall(function() ImGui.SetTooltip(panel
+            and 'Click: send this back to the mini\nDrag: move it onto another window'
+            or  'Click: give this its own window\nDrag: move it onto another window') end)
+    end
+    return clicked
+end
+
+-- PULL THE STRING OUT OF WHATEVER AcceptDragDropPayload RETURNS.
+-- It hands back an ImGuiDragDropPayload, and in this binding that is USERDATA carrying a .Data field -
+-- not a table. Guarding the unwrap with `type(payload) == 'table'` therefore never fired, the object
+-- itself was used as the key, and tostring made it 'userdata: 0x...' - which matches no section, so the
+-- drop was accepted and then silently discarded.
+-- Indexing is attempted regardless of type, because userdata with fields indexes just like a table.
+function pop_payload_key(payload)
+    if payload == nil then return nil end
+    if type(payload) == 'string' then return payload end
+    local got
+    pcall(function() got = payload.Data end)
+    if type(got) ~= 'string' then pcall(function() got = payload.data end) end
+    if type(got) ~= 'string' then pcall(function() got = payload.RawData end) end
+    if type(got) == 'string' then return got end
+    return nil
+end
+
+function pop_drag_source(key, label)
+    -- SourceAllowNullID, because the thing being dragged is a Text item.
+    -- BeginDragDropSource attaches to the LAST ITEM DRAWN, and it needs that item to have an ImGui id.
+    -- Text and TextDisabled do not have one, so without this flag the call quietly returns false and the
+    -- drag simply never starts - no error, nothing on screen, which is exactly how it looked.
+    -- The enum's own description names Text() as the case it exists for.
+    local flags = (ImGuiDragDropFlags and ImGuiDragDropFlags.SourceAllowNullID) or 8
+    if ImGui.BeginDragDropSource and ImGui.BeginDragDropSource(flags) then
+        pcall(function() ImGui.SetDragDropPayload('AT_SECTION', key) end)
+        ImGui.Text('move ' .. (label or key))
+        ImGui.EndDragDropSource()
+    end
+end
+
+-- REORDER A LIST BY DRAGGING, for the three places that had a pair of arrow buttons per row.
+-- Call immediately after drawing the row's first widget: the row becomes both a drag source and a drop
+-- target, and dropping row A onto row B moves A to B's position.
+--
+-- MOVE, NOT SWAP. Arrows swapped neighbours because that is all an arrow can do - dragging says 'put it
+-- HERE', and swapping would leave the thing you dropped onto somewhere you did not ask for. Moving one
+-- item and shuffling the rest is what every list that can be dragged does.
+--
+-- 'kind' keeps the three lists apart, so a section cannot be dropped into the character order.
+-- Returns true if the list changed, so the caller can save.
+function drag_reorder(list, i, kind, label)
+    local moved = false
+    -- Same reason as pop_drag_source: these rows are dragged by a Text grip, which carries no id.
+    local flags = (ImGuiDragDropFlags and ImGuiDragDropFlags.SourceAllowNullID) or 8
+    if ImGui.BeginDragDropSource and ImGui.BeginDragDropSource(flags) then
+        pcall(function() ImGui.SetDragDropPayload(kind, tostring(i)) end)
+        ImGui.Text(tostring(label or list[i]))
+        ImGui.EndDragDropSource()
+    end
+    if ImGui.BeginDragDropTarget and ImGui.BeginDragDropTarget() then
+        local ok, payload = pcall(function() return ImGui.AcceptDragDropPayload(kind) end)
+        if ok and payload then
+            local from = tonumber(pop_payload_key(payload))
+            if from and from ~= i and list[from] then
+                local item = table.remove(list, from)
+                table.insert(list, i, item)
+                moved = true
+            end
+        end
+        ImGui.EndDragDropTarget()
+    end
+    return moved
+end
+
+-- Called just after a window's contents. panel = the number to assign, or nil to send it to the mini.
+function pop_drop_target(panel)
+    if not ImGui.BeginDragDropTarget then return end
+    if ImGui.BeginDragDropTarget() then
+        local ok, payload = pcall(function() return ImGui.AcceptDragDropPayload('AT_SECTION') end)
+        if ok and payload then
+            -- WHATEVER SHAPE IT ARRIVES IN. Different bindings hand back the string itself, a table with
+            -- Data, or userdata - and guessing wrong looks identical to the drop not registering at all.
+            -- Said once with the type, so a shape we do not handle names itself instead of failing mute.
+            local key = pop_payload_key(payload)
+            if key and mini_section(key) then
+                popOut[key] = panel
+                save_settings()
+                log('[pop] %s moved to %s', key, panel and ('panel ' .. panel) or 'the mini')
+            elseif not POP_SAID_PAYLOAD then
+                POP_SAID_PAYLOAD = true
+                log('\\ay[pop] a drop arrived but the payload did not read as a section: %s (%s)\\ax',
+                    tostring(key), type(payload))
+            end
+        end
+        ImGui.EndDragDropTarget()
+    end
+end
+
+local function draw_popouts()
+    for p = 1, POP_PANELS do
+        -- Who lives here? In miniOrder order, so a panel reads the way the mini would.
+        local mine = {}
+        for _, k in ipairs(miniOrder) do
+            local sec = mini_section(k)
+            if sec and sec.draw and popOut[k] == p then mine[#mine + 1] = sec end
+        end
+        if #mine > 0 then
+            -- TITLED BY ITS CONTENTS. A window called 'Panel 2' tells you nothing once you have three of
+            -- them; one called 'Pacify + Rez' is self-describing and updates itself as you move things.
+            local names = {}
+            for _, s in ipairs(mine) do names[#names + 1] = s.label end
+            local title = table.concat(names, ' + ')
+            -- ###at_panel_N and not the title: the id has to stay put or ImGui forgets the window's size
+            -- and position the moment its contents change.
+            local show = ImGui.Begin(title .. '###at_panel_' .. p, true,
+                                     ImGuiWindowFlags.AlwaysAutoResize)
+            -- DOCKED IS NOT MERGED. Dragging this window onto another makes ImGui tab them, which looks
+            -- like a merge and is not one - the sections still live in separate windows and only one is
+            -- visible at a time. Say so once, because the two gestures are easy to confuse and the wrong
+            -- one is the more obvious.
+            if show and ImGui.IsWindowDocked and ImGui.IsWindowDocked() then
+                if not POP_SAID_DOCK then
+                    POP_SAID_DOCK = true
+                    log('\\ay[pop] that window is DOCKED as a tab, not merged. To merge, drag a section by ' ..
+                        'its %s handle onto another window instead of dragging the window itself.\\ax',
+                        tostring(POP_GRIP))
+                end
+            end
+            if not show then
+                -- Closing a panel sends everything in it home, rather than leaving sections in a window
+                -- that is not on screen - which would look exactly like they had vanished.
+                for _, s in ipairs(mine) do popOut[s.key] = nil end
+                save_settings()
+            else
+                -- The zone sits at the TOP, where the cursor already is after dragging onto the window.
+                pop_drop_zone(p, 'drop a section here to merge it in')
+                for i, s in ipairs(mine) do
+                    if i > 1 then ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing() end
+                    -- THE GRIP IS THE HANDLE, and it needs to look like one. Without something visibly
+                    -- draggable people reach for the WINDOW title bar instead, and dragging one ImGui
+                    -- window onto another docks them into tabs - which is ImGui's own behaviour and not
+                    -- the merge that was wanted. Same gesture, two very different results, so the thing
+                    -- you are meant to grab has to be the thing that looks grabbable.
+                    -- ONE widget, three jobs: click sends this section back to the mini, dragging moves
+                    -- it elsewhere, and it is the spot another section can be dropped onto.
+                    -- A click means 'home' HERE rather than 'pop out', because it is already popped -
+                    -- the same control, doing the thing that makes sense where it is.
+                    -- Title first, control at the right - the same arrangement as the mini, so a section
+                    -- looks and behaves identically wherever it happens to be living.
+                    ImGui.TextDisabled(s.label)
+                    ImGui.SameLine()
+                    pcall(function()
+                        local availW = ImGui.GetContentRegionAvail()
+                        local w = ImGui.CalcTextSize(POP_ICON) + 14
+                        if availW and availW > w + 20 then
+                            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + availW - w)
+                        end
+                    end)
+                    if pop_grip(s.key, p) then
+                        popOut[s.key] = nil
+                        save_settings()
+                    end
+                    pop_drag_source(s.key, s.label)
+                    pop_drop_target(p)
+                    pcall(s.draw)
+                end
+                -- WHOLE-WINDOW DROP ZONE. An invisible button over the remaining space, so anywhere in
+                -- the window accepts a drop rather than only the exact title text.
+                local availX, availY = ImGui.GetContentRegionAvail()
+                if availY and availY > 4 then
+                    ImGui.InvisibleButton('##at_drop_' .. p, math.max(availX or 40, 40), availY)
+                    pop_drop_target(p)
+                end
+            end
+            ImGui.End()
+        end
+    end
+end
+
 local function render()
+    -- The pop-outs stand on their own: they are drawn even when the main window is closed, which is the
+    -- entire point of popping something out.
+    draw_popouts()
     if not windowOpen then return end
     if miniMode then   -- compact tribute-only window (its own ###id so it keeps its own small size/pos)
         -- AlwaysAutoResize is right for the compact view, and WRONG once the detail burn table is on:
@@ -14543,6 +15193,11 @@ local function render()
                 -- list so its Settings checkbox still turns it on and off - only its position in the
                 -- order list is now inert, since the header is a fixed spot.
                 if k == 'coth' then sec = nil end
+                -- POPPED OUT MEANS IT LIVES SOMEWHERE ELSE, so the mini does not draw it as well. Two
+                -- copies of the same panel is not what popping out is for - you moved it, you did not
+                -- duplicate it. Closing the pop-out clears the flag and it appears here again, which is
+                -- the same rule read backwards and needs no separate handling.
+                if sec and popOut[k] then sec = nil end
                 if sec and sec.get and sec.get() and sec.draw then
                     ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                     local folded = false
@@ -14575,9 +15230,49 @@ local function render()
                             draw_di_save_line()
                         end
                     end
+                    -- POP IT OUT FROM HERE. On the title row of the section itself, which is where you
+                    -- are looking when you decide you want it somewhere else - Settings is two clicks
+                    -- away and you have to remember the section is listed there.
+                    -- SameLine ONLY when there is a title to sit beside. A section that is not foldable
+                    -- draws no title, so SameLine would hang the button off the separator above it.
+                    -- The title first, then the control over at the right edge.
+                    if MINI_FOLDABLE[k] then
+                        -- the fold caret was drawn above; stay on its line
+                    else
+                        ImGui.TextDisabled(sec.label or k)
+                    end
+                    -- OVER AT THE RIGHT. The fold caret is on the left and is clicked constantly;
+                    -- popping a section out is neither frequent nor casual, so the two live at opposite
+                    -- ends of the row and cannot be hit in mistake for one another.
+                    -- Measured from the CONTENT REGION, never GetWindowWidth: positioning at
+                    -- window-width-minus-something extends the content to that point, which grows the
+                    -- window, which moves the target next frame - the panel crept wider every frame on
+                    -- 1.10.9 for exactly that reason.
+                    ImGui.SameLine()
+                    pcall(function()
+                        local availW = ImGui.GetContentRegionAvail()
+                        local w = ImGui.CalcTextSize(POP_ICON) + 14
+                        if availW and availW > w + 20 then
+                            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + availW - w)
+                        end
+                    end)
+                    if pop_grip(k) then
+                        local used = {}
+                        for _, v in pairs(popOut) do if type(v) == 'number' then used[v] = true end end
+                        local slot
+                        for pnum = 1, POP_PANELS do if not used[pnum] then slot = pnum; break end end
+                        if slot then popOut[k] = slot; save_settings()
+                        else log('\\ay[pop] all %d panels are in use - drag it onto one instead\\ax', POP_PANELS) end
+                    end
+                    pop_drag_source(k, sec.label)
+                    pop_drop_target(nil)      -- drop onto a mini row to bring a section home
                     if not folded then sec.draw() end
                 end
             end
+            -- DROP ANYTHING HERE TO BRING IT HOME. The mini is a target like any panel, so a section
+            -- dragged back out of a panel window lands where it started - which is what makes this feel
+            -- like moving tabs rather than a one-way trip.
+            pop_drop_zone(nil, 'drop here to put a section back in the mini')
         end
         ImGui.End()
         return
@@ -14662,6 +15357,9 @@ local function render()
             end
             if ImGui.BeginTabItem('Ports') then
                 draw_ports_tab()
+            end
+            if ImGui.BeginTabItem('Commands') then
+                draw_commands_tab()
             end
             if ImGui.BeginTabItem('Settings') then
                 ImGui.Spacing()
@@ -14756,19 +15454,24 @@ local function render()
                     for i, k in ipairs(miniOrder) do
                         local sec = mini_section(k)
                         if sec then
-                            if ImGui.SmallButton('^##at_up_' .. k) and i > 1 then
-                                miniOrder[i], miniOrder[i - 1] = miniOrder[i - 1], miniOrder[i]
-                                dirty = true
-                            end
-                            ImGui.SameLine()
-                            if ImGui.SmallButton('v##at_dn_' .. k) and i < #miniOrder then
-                                miniOrder[i], miniOrder[i + 1] = miniOrder[i + 1], miniOrder[i]
-                                dirty = true
+                            -- GRAB HANDLE instead of two arrows. Reordering ten sections with arrows is
+                            -- a click per position per item; dragging is one gesture, and it is the same
+                            -- gesture that moves a section between windows so there is nothing new to
+                            -- learn.
+                            ImGui.SmallButton(POP_GRIP .. '##gripsec_' .. k)
+                            if drag_reorder(miniOrder, i, 'AT_SECORDER', sec.label) then dirty = true end
+                            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                                pcall(function() ImGui.SetTooltip('Drag to reorder') end)
                             end
                             ImGui.SameLine()
                             local was = sec.get() and true or false
                             local now = ImGui.Checkbox(sec.label .. '##at_sec_' .. k, was)
                             if now ~= was then sec.set(now); dirty = true end
+                            -- The panel picker used to live here: M 1 2 3 4 5 6 7 8 on every row, nine
+                            -- buttons per section for something the mini now does with one click and a
+                            -- drag. Settings decides whether a section exists at all; WHERE it lives is
+                            -- decided by moving it, which is both fewer controls and the more obvious
+                            -- place to look for them.
                             -- A '?' beside the rows whose behaviour is not obvious from the label.
                             -- These are the things people have to be told once and then never again -
                             -- which is exactly what a hover is for, rather than a line of help text
@@ -14879,14 +15582,12 @@ local function render()
                 do
                     local ord = ordered_members()
                     for i, nm in ipairs(ord) do
-                        if ImGui.SmallButton('^##at_cu_' .. nm) and i > 1 then
-                            ord[i], ord[i - 1] = ord[i - 1], ord[i]
+                        ImGui.SmallButton(POP_GRIP .. '##gripchar_' .. nm)
+                        if drag_reorder(ord, i, 'AT_CHARORDER', nm) then
                             charOrder = ord; dirty = true
                         end
-                        ImGui.SameLine()
-                        if ImGui.SmallButton('v##at_cd_' .. nm) and i < #ord then
-                            ord[i], ord[i + 1] = ord[i + 1], ord[i]
-                            charOrder = ord; dirty = true
+                        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                            pcall(function() ImGui.SetTooltip('Drag to reorder') end)
                         end
                         ImGui.SameLine()
                         ImGui.Text(string.format('%d. %s', i, nm))
@@ -15052,17 +15753,133 @@ if DI.ladderOff then
 end
 if SHOW_UI then mq.imgui.init(scriptName, render) end
 pcall(function() mq.bind('/at', function() windowOpen = not windowOpen end) end)
+-- HOTKEYABLE, because a floating box you have to open through a menu is barely better than a tab.
+-- HOTKEYABLE, because a floating box you have to open through a menu is barely better than a tab.
+--   /atpop            list the section names
+--   /atpop pacify     toggle that one
+-- THE BUTTONS, AS COMMANDS. Each is something you would otherwise find in a window and click, which is
+-- fine when the window is in front of you and useless mid-pull.
+-- Each RECORDS and lets the tick act: drinking relays to the group and the invis combo waits out its
+-- lead, and a bind that yields is a hard client crash.
+-- /atcommand - the whole list in the MQ window.
+-- The tab is better for browsing, but it needs the window open and the right tab selected, and a chat
+-- window can be scrolled back through after the fact. This also prints the ones the tab hides: the tab
+-- is curated for everyday use, and this is for when you are trying to remember whether a probe exists.
+pcall(function() mq.bind('/atcommand', function(what)
+    local all = what and tostring(what):lower() == 'all'
+    printf('\ag[AdventureTime %s]\ax commands:', VERSION)
+    for _, e in ipairs(AT_COMMANDS) do
+        if e.group then printf('\ay%s\ax', e.group)
+        else printf('   %-22s %s', e.cmd, e.desc) end
+    end
+    if not all then
+        printf('   \ay/atcommand all\ax also lists the diagnostics and probes')
+        return
+    end
+    -- EVERYTHING ELSE THAT IS BOUND, worked out from the bind list rather than a second hand-written
+    -- table - a list of commands that can fall out of step with the commands is worse than none.
+    printf('\ayDiagnostics and probes\ax')
+    local shown = {}
+    for _, e in ipairs(AT_COMMANDS) do
+        if e.cmd then shown[(e.cmd:match('^(%S+)'))] = true end
+    end
+    table.sort(AT_ALL_BINDS)
+    for _, c in ipairs(AT_ALL_BINDS) do
+        if not shown[c] then printf('   %s', c) end
+    end
+end) end)
+
+pcall(function() mq.bind('/atinvis',    function() invisFireWanted = true end) end)
+pcall(function() mq.bind('/atshimmer',  function() potWanted = 'shimmer'   end) end)
+pcall(function() mq.bind('/atfleeting', function() potWanted = 'fortitude' end) end)
+pcall(function() mq.bind('/atinferno',  function() potWanted = 'inferno'   end) end)
+-- /atpacify [name] - my target, or a named spawn, into the placate queue.
+pcall(function() mq.bind('/atpacify', function(who)
+    local id = 0
+    if who and who ~= '' then
+        pcall(function() id = tonumber(mq.TLO.Spawn('npc =' .. who).ID()) or 0 end)
+    else
+        pcall(function() id = tonumber(mq.TLO.Target.ID()) or 0 end)
+    end
+    if id <= 0 then
+        log('\\ay[pacify] nothing targeted - use /atpacify with a target, or /atpacify <name>\\ax')
+        return
+    end
+    pacAddWanted = { id = id }
+end) end)
+
+pcall(function()
+    mq.bind('/atpop', function(key)
+        if not key or key == '' then
+            local names = {}
+            for _, s in ipairs(MINI_SECTIONS) do names[#names + 1] = s.key end
+            log('[pop] /atpop <name>: %s', table.concat(names, ', '))
+            return
+        end
+        local k = tostring(key):lower()
+        for _, s in ipairs(MINI_SECTIONS) do
+            if s.key == k then
+                popOut[k] = popOut[k] and nil or 1
+                save_settings()
+                log('[pop] %s %s', s.label,
+                    popOut[k] and ('moved to panel ' .. popOut[k]) or 'back in the mini')
+                return
+            end
+        end
+        log('\\ay[pop] no section called "%s" - /atpop on its own lists them\\ax', tostring(key))
+    end)
+end)
 -- BRINGING IT BACK. Closing the window with the X sets windowOpen false and there is nothing left on
 -- screen to click, so the only way back was /at - which is easy to forget and not obviously a toggle.
 -- These two say what they do and always OPEN rather than toggle, because someone typing them has just
 -- lost the window and wants it back; a toggle would half the time close it again.
 -- Bound here rather than with the rest because windowOpen and miniMode are locals declared far below
 -- that block, and a bind up there would close over nothing.
-pcall(function() mq.bind('/atui', function()
+pcall(function() mq.bind('/atui', function(what)
+    local arg = what and tostring(what):lower() or ''
+    -- PUT IT ALL BACK. A layout you can rearrange is a layout you can wreck - drag six sections into
+    -- four windows, push one off the edge of the screen, and there is no obvious way home.
+    -- Deliberately a typed command rather than a button: it undoes work, and a button that undoes work
+    -- sits one misclick away from doing so.
+    if arg == 'reset' then
+        local n = 0
+        for _ in pairs(popOut) do n = n + 1 end
+        popOut = {}
+        windowOpen = true
+        -- ImGui remembers window positions, not us - so a panel dragged off-screen simply stops being
+        -- drawn once it is empty, which is what fixes the worst case.
+        save_settings()
+        printf('\ag[AdventureTime]\ax %d section(s) put back in the mini window', n)
+        return
+    end
+    -- WHERE IS EVERYTHING. A section that is not on screen is otherwise indistinguishable from one that
+    -- has broken, and that is exactly when somebody needs to know which.
+    if arg == 'where' then
+        local home, panels = {}, {}
+        for _, k in ipairs(miniOrder) do
+            local sec = mini_section(k)
+            if sec then
+                local p = popOut[k]
+                if p then
+                    panels[p] = panels[p] or {}
+                    panels[p][#panels[p] + 1] = sec.label
+                else
+                    home[#home + 1] = sec.label
+                end
+            end
+        end
+        printf('\ag[AdventureTime]\ax mini: %s', (#home > 0) and table.concat(home, ', ') or '(empty)')
+        for p = 1, POP_PANELS do
+            if panels[p] then printf('   panel %d: %s', p, table.concat(panels[p], ' + ')) end
+        end
+        printf('   \ay/atui reset\ax puts everything back')
+        return
+    end
     windowOpen = true
     miniMode = true
     save_settings()
-    printf('\ag[AdventureTime]\ax mini window open (\ay/atuie\ax for the full one)')
+    printf('\ag[AdventureTime]\ax mini window open (\ay/atuie\ax full, ' ..
+           '\ay/atui where\ax layout, \ay/atui reset\ax undo it)')
 end) end)
 pcall(function() mq.bind('/atuie', function()
     windowOpen = true
@@ -16057,7 +16874,22 @@ while running do
             AT_slowPending = nil
             log('\\ay[slow] %s\\ax', m)
         end
-        if invisTake then
+        -- The test loop presses the combo for us. On the tick, never from a bind: firing blocks.
+        if INVT.checkAt and mq.gettime() >= INVT.checkAt then
+            INVT.checkAt = nil
+            pcall(invistest_check)
+        end
+        if INVT.on and mq.gettime() >= INVT.nextAt then
+            if mq.gettime() >= INVT.until_ then
+                INVT.on = false
+                invistest_report()
+            else
+                INVT.nextAt = mq.gettime() + INVT.every
+                INVT.seen = {}
+                invisFireWanted = true
+            end
+        end
+                if invisTake then
             local tk = invisTake
             invisTake = nil
             atphase('invis_arm')
@@ -16085,6 +16917,20 @@ while running do
             local id = pacDelWanted
             pacDelWanted = nil
             pcall(function() peer_bcast('/at_pacdel %d', id) end)
+        end
+        if potWanted then
+            local k = potWanted
+            potWanted = nil
+            atphase('group_pot')
+            pcall(function() group_pot(k) end)
+        end
+        if pacAddWanted then
+            local a = pacAddWanted
+            pacAddWanted = nil
+            atphase('pac_add')
+            -- Straight into the same queue the Pacify panel fills, so it is routed, assigned and
+            -- reported exactly as a mob added by any other route.
+            pcall(function() pac_add_spawn(a.id) end)
         end
         if cothSetWanted then
             local w = cothSetWanted
@@ -16224,6 +17070,7 @@ while running do
         -- It runs BEFORE di_tick so that when it is working, the old ladder sees a covered tank and never
         -- reaches for anything - the stand-down it broadcasts is the same one the ladder already honours.
         atphase('cothwatch'); pcall(coth_watch_tick)
+        atphase('di_verify'); pcall(di_rung_verify)
         atphase('diq')
         local oks, errs = pcall(diq_self_check)
         if not oks then log('\\ar[diq] self-check error: %s\\ax', tostring(errs)) end
@@ -16376,8 +17223,14 @@ while running do
 end
 
 pcall(function() mq.unbind('/at') end)
-pcall(function() mq.unbind('/atuie') end)
+pcall(function() mq.unbind('/atpop') end)
 pcall(function() mq.unbind('/atui') end)
+pcall(function() mq.unbind('/atinvis') end)
+pcall(function() mq.unbind('/atshimmer') end)
+pcall(function() mq.unbind('/atfleeting') end)
+pcall(function() mq.unbind('/atinferno') end)
+pcall(function() mq.unbind('/atpacify') end)
+pcall(function() mq.unbind('/atuie') end)
 pcall(function() mq.unbind('/at_expecttrade') end)
 pcall(function() mq.unbind('/at_close') end)
 pcall(function() mq.unbind('/at_give') end)
@@ -16425,6 +17278,8 @@ pcall(function() mq.unbind('/at_cothhere') end)
 pcall(function() mq.unbind('/at_cothcast') end)
 pcall(function() mq.unbind('/at_cothat') end)
 pcall(function() mq.unbind('/atcothwho') end)
+pcall(function() mq.unbind('/atinvistest') end)
+pcall(function() mq.unbind('/at_invisfired') end)
 pcall(function() mq.unbind('/at_cothmine') end)
 pcall(function() mq.unbind('/at_di') end)
 pcall(function() mq.unbind('/at_diauto') end)
