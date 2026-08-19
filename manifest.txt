@@ -1,2 +1,4 @@
-build 1.17
-file init.lua fbf7e2cc6d8622efdc120b26b0f14d20566f1d1979006b22e2d567dd17418742
+# AdventureTime manifest - generated 2026-08-19 07:11
+# Do not hand-edit the hashes; re-run make-manifest.ps1 instead.
+build	1.18
+file	init.lua	2f92433a8ecfdb627fe0f7207e639d9396784b299aeed0d854f7efab65ab37c1

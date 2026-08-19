@@ -67,8 +67,540 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --   BUILD_TAG which exact copy of the file is loaded. Moves on every change, and exists because "did
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
-VERSION = '1.17'
-local BUILD_TAG = '1.17'  -- bump on every change; prints on startup
+VERSION = '1.18'
+local BUILD_TAG = '1.18'  -- bump on every change; prints on startup
+
+-- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
+-- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
+-- wearing two shades is how a window stops reading as one thing.
+-- Named here so a panel written next month is consistent by default rather than by remembering.
+-- EVERY SECTION LOOKS THE SAME, WHICH IS THE PROBLEM. Nine panels stacked under nine identical grey
+-- titles, so finding "the rez one" means reading rather than glancing. Give each its own hue and a
+-- filled dot in front of the title, and the eye lands on the right band without reading anything.
+-- Hues are spread deliberately rather than picked prettily - adjacent sections must not share a family,
+-- or the band boundary disappears again. Anything not listed falls back to the neutral heading colour.
+UI_SECTION = {
+    rez        = { dot = {  95, 165, 230 }, label = { 0.52, 0.70, 0.90 } },  -- blue
+    di         = { dot = { 150, 120, 215 }, label = { 0.64, 0.56, 0.85 } },  -- violet
+    burns      = { dot = { 225, 120,  70 }, label = { 0.88, 0.56, 0.38 } },  -- ember
+    timeline   = { dot = { 235, 160,  90 }, label = { 0.92, 0.68, 0.46 } },  -- lighter ember: same family as burns
+    running    = { dot = {  90, 210, 255 }, label = { 0.42, 0.78, 0.94 } },  -- cyan: matches 'running' everywhere else
+    groupheals = { dot = {  80, 185, 130 }, label = { 0.45, 0.76, 0.58 } },  -- green
+    invis      = { dot = { 130, 140, 160 }, label = { 0.58, 0.62, 0.70 } },  -- slate
+    protect    = { dot = { 215, 170,  70 }, label = { 0.85, 0.72, 0.40 } },  -- gold
+    coth       = { dot = {  70, 180, 190 }, label = { 0.40, 0.76, 0.80 } },  -- teal
+    nightveil  = { dot = { 175, 105, 175 }, label = { 0.72, 0.50, 0.74 } },  -- magenta
+    pacify     = { dot = { 190, 195, 120 }, label = { 0.76, 0.78, 0.52 } },  -- pale olive
+}
+
+-- DRAW, DO NOT SPELL. ImGui hands out the window's draw list, so a dot can be an actual filled circle
+-- rather than a bullet character that depends on the font having one. Everything here is wrapped
+-- because a binding without draw lists must degrade to plain text, not to an error every frame.
+-- ============================================================================
+-- DRAWN PRIMITIVES. The binding reports all 29 draw list methods present and PathArcTo/PathStroke
+-- verified working, so these can be built rather than approximated with text.
+-- Every one is wrapped: a binding that loses a method degrades to plain text instead of throwing
+-- once per frame, which in a draw callback means an unusable window rather than a missing decoration.
+-- ============================================================================
+
+-- A COOLDOWN RING. The number tells you 41:12 but not whether that is nearly done or barely started -
+-- the ring answers that at a glance, and the glance is the whole point during a fight.
+-- Fraction is REMAINING/TOTAL, drawn clockwise from twelve so a full ring means "just used".
+-- DRAW THE LABEL, DO NOT LAY IT OUT. ui_ring and ui_pill placed their text with SetCursorScreenPos
+-- plus TextColored, which is a REAL WIDGET: its extent counts toward the window's content, and under
+-- AlwaysAutoResize the content IS the width. A ring label wider than its ring overhangs on both sides
+-- and quietly holds the window open - the same family as pop_align, arrived at from a different
+-- direction. AddText goes straight to the draw list and contributes nothing to layout.
+-- PROBED ONCE AND REMEMBERED. A binding whose AddText wants a different argument list would otherwise
+-- fail a pcall every frame in every widget; one failure switches to the old path for the session.
+-- Deliberately silent: log is a LOCAL declared several hundred lines below this, so calling it from
+-- here resolves to a nil global at runtime. /atdraw reports the state instead.
+uiDlTextOK = nil   -- nil = untried, true = AddText works, false = fall back to the cursor path
+
+function ui_dl_text(dl, x, y, rgb, text)
+    if text == nil or text == '' then return end
+    if uiDlTextOK ~= false then
+        local ok = pcall(function()
+            dl:AddText(ImVec2(x, y), IM_COL32(rgb[1], rgb[2], rgb[3], 255), text)
+        end)
+        if ok then uiDlTextOK = true; return end
+        uiDlTextOK = false
+    end
+    -- Exactly what these widgets did before. The caller restores the cursor either way.
+    ImGui.SetCursorScreenPos(x, y)
+    ImGui.TextColored(rgb[1] / 255, rgb[2] / 255, rgb[3] / 255, 1.0, text)
+end
+
+function ui_ring(frac, rgb, label, size, thick, centreDot)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local d  = size or math.floor(fs * 1.9)
+        local r  = d * 0.5
+        local w  = thick or 2.5
+        local cx, cy = ImGui.GetCursorScreenPos()
+        local mx, my = cx + r, cy + r
+        local dl = ImGui.GetWindowDrawList()
+        -- The track first: a full faint ring, so an almost-empty one still reads as a ring rather
+        -- than as a stray arc floating in the panel.
+        dl:AddCircle(ImVec2(mx, my), r - w * 0.6, IM_COL32(rgb[1], rgb[2], rgb[3], 55), 0, w)
+        frac = math.max(0, math.min(1, frac or 0))
+        if frac > 0.001 then
+            local a0 = -math.pi * 0.5
+            dl:PathClear()
+            dl:PathArcTo(ImVec2(mx, my), r - w * 0.6, a0, a0 + (math.pi * 2 * frac))
+            dl:PathStroke(IM_COL32(rgb[1], rgb[2], rgb[3], 235), 0, w)
+        end
+        if centreDot then
+            dl:AddCircleFilled(ImVec2(mx, my), math.max(1.5, r * 0.32),
+                               IM_COL32(rgb[1], rgb[2], rgb[3], 235), 0)
+        end
+        if label and label ~= '' then
+            local tw = ImGui.CalcTextSize(label)
+            ui_dl_text(dl, mx - tw * 0.5, my - fs * 0.5, rgb, label)
+        end
+        ImGui.SetCursorScreenPos(cx, cy)
+        -- Reserve the ring's WIDTH but only a text line's HEIGHT. A square Dummy makes every row it
+        -- appears in taller than the text beside it, which is what turns a tidy grid ragged.
+        ImGui.Dummy(d, math.max(d, fs))
+    end)
+    if not ok then ImGui.Text(label or '') end
+end
+
+-- HOW WIDE DOES THIS TEXT ACTUALLY NEED TO BE? Every fixed width in this file has been wrong at least
+-- once - 46 then 26 for the burn columns, 86 for the draught buttons that clipped "Group Shimmering".
+-- Ask the font instead, and keep a floor so short labels still line up with their neighbours.
+function ui_fit_w(text, minW)
+    local w = minW or 0
+    pcall(function()
+        local t = ImGui.CalcTextSize(text)
+        if t then w = math.max(w, math.ceil(t) + 14) end   -- frame padding either side
+    end)
+    return w
+end
+
+-- CENTRE THE NEXT MARK IN ITS TABLE CELL. Left-aligned discs and pills in a fixed-width column leave
+-- a ragged right edge and read as though they belong to the column rule beside them. ImGui has no
+-- per-cell alignment, so the cursor is nudged by half the leftover space before the mark is drawn.
+-- Clamped at zero: if the mark is wider than the cell, aligning left is the only option that does not
+-- push it into the neighbour.
+function ui_cell_centre(w)
+    pcall(function()
+        local avail = ImGui.GetContentRegionAvail()
+        if avail and avail > w then
+            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + (avail - w) * 0.5)
+        end
+    end)
+end
+
+-- WRAPPING ROWS. Every button panel here calls SameLine forever, so a six-character team with full
+-- names runs off the right edge - and because the mini window uses AlwaysAutoResize, it does not clip,
+-- it GROWS. That is why the window kept getting wider than the screen.
+-- Auto-resize also means there is no natural wrap point to measure against: the available region is
+-- whatever the content asked for. So the limit has to be a stated one, and UI_MAX_ROW is it - which
+-- doubles as the answer to "how wide is the mini window allowed to get".
+UI_MAX_ROW   = 420
+uiRowStarted = false
+uiChainNameLen = 4   -- set per frame by the rez table; how much name its scope buttons show
+
+-- ASK WHERE THE CURSOR ACTUALLY IS. The first version added up its own estimate of each item's width
+-- and compared that to the limit - and the estimate was wrong often enough that rows which plainly
+-- overran the window still measured as fitting. CalcTextSize plus a padding guess is not the same
+-- number ImGui uses to lay a button out.
+-- So: put the item on the line, ask ImGui where that leaves the cursor, and if it has gone past the
+-- limit, take it back to a new line. Ground truth rather than arithmetic.
+function ui_row_reset(_)
+    uiRowStarted = false
+end
+
+-- Call BEFORE drawing an item, with the width it is about to take.
+function ui_row_item(w)
+    if not uiRowStarted then uiRowStarted = true; return end
+    ImGui.SameLine(0, 6)
+    local x = 0
+    pcall(function() x = ImGui.GetCursorPosX() or 0 end)
+    -- Past the limit once this item is placed: undo the SameLine and let it fall to the next line.
+    if x + (w or 0) > UI_MAX_ROW then pcall(function() ImGui.NewLine() end) end
+end
+
+-- EXPERIMENT 3: THE SEGMENTED RING. Collapsing a burn tier to one mark answered "can this character
+-- burn" but threw away "how many", and the count is what tells you whether a tier is nearly spent.
+-- One arc per burn around the same circle: each has a dim track and fills clockwise as it comes back,
+-- so a five-burn tier with two up reads as two solid arcs and three partial ones - the count and the
+-- progress, in the footprint of a dot.
+-- Segments are separated by a small gap so four burns never read as one continuous ring.
+function ui_seg_ring(segs, size, thick)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local d  = size or math.floor(fs * 1.05)
+        local r  = d * 0.5
+        local w  = thick or 2.2
+        local cx, cy = ImGui.GetCursorScreenPos()
+        local mx, my = cx + r, cy + r
+        local dl = ImGui.GetWindowDrawList()
+        local n = #segs
+        if n < 1 then ImGui.Dummy(d, math.max(d, fs)); return end
+        local span = (math.pi * 2) / n
+        local gap  = math.min(span * 0.18, 0.25)
+        for i, sg in ipairs(segs) do
+            local a0 = -math.pi * 0.5 + (i - 1) * span + gap * 0.5
+            local a1 = a0 + span - gap
+            local c  = sg.rgb or { 150, 150, 160 }
+            dl:PathClear()
+            dl:PathArcTo(ImVec2(mx, my), r - w * 0.6, a0, a1)
+            dl:PathStroke(IM_COL32(c[1], c[2], c[3], 55), 0, w)
+            -- fill grows as the burn comes back: 0 remaining = the whole segment
+            local f = math.max(0, math.min(1, sg.fill or 0))
+            if f > 0.02 then
+                dl:PathClear()
+                dl:PathArcTo(ImVec2(mx, my), r - w * 0.6, a0, a0 + (a1 - a0) * f)
+                dl:PathStroke(IM_COL32(c[1], c[2], c[3], 240), 0, w)
+            end
+        end
+        ImGui.Dummy(d, math.max(d, fs))
+    end)
+    if not ok then ImGui.Text('o') end
+end
+
+-- EXPERIMENT 1: THE READY PULSE. A thing coming off cooldown is the single most actionable event this
+-- window has, and until now it announced itself by quietly changing colour - which you only see if you
+-- happen to be looking at that cell. A ring expanding out of it for a second and a half catches the eye
+-- anywhere in the window, then gets out of the way.
+-- Keyed by caller-supplied id. Anything that was NOT ready last frame and is ready now starts a pulse;
+-- the first sighting of an id never pulses, or opening the window would set the whole panel off.
+UI_PULSE    = true
+UI_PULSE_MS = 1500
+uiPulseSeen = {}   -- id -> true once it has been ready at least once
+uiPulseAt   = {}   -- id -> gettime when it became ready
+
+function ui_pulse_note(id, isReady)
+    if not id then return end
+    if isReady then
+        if uiPulseSeen[id] == false then uiPulseAt[id] = mq.gettime() end
+        uiPulseSeen[id] = true
+    else
+        uiPulseSeen[id] = false
+        uiPulseAt[id] = nil
+    end
+end
+
+-- Drawn AROUND whatever mark was just placed, so it works for a disc or a name button alike.
+function ui_pulse_draw(id, rgb, x, y, w, h)
+    if not (UI_PULSE and id and uiPulseAt[id]) then return end
+    local dt = mq.gettime() - uiPulseAt[id]
+    if dt > UI_PULSE_MS then uiPulseAt[id] = nil; return end
+    pcall(function()
+        local k = dt / UI_PULSE_MS
+        local a = math.floor(200 * (1 - k))
+        local grow = 2 + k * 7
+        ImGui.GetWindowDrawList():AddRect(
+            ImVec2(x - grow, y - grow), ImVec2(x + w + grow, y + h + grow),
+            IM_COL32(rgb[1], rgb[2], rgb[3], a), (h + grow * 2) * 0.5, 0, 1.5)
+    end)
+end
+
+-- The ready state: a filled disc, so it reads as louder than any partial ring beside it.
+function ui_disc(rgb, size, pulseId)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local d = size or math.floor(fs * 0.78)
+        local r = d * 0.5
+        local cx, cy = ImGui.GetCursorScreenPos()
+        local top = cy + math.floor(fs * 0.5) - r
+        if pulseId then
+            ui_pulse_note(pulseId, true)
+            ui_pulse_draw(pulseId, rgb, cx, top, d, d)
+        end
+        ImGui.GetWindowDrawList():AddCircleFilled(
+            ImVec2(cx + r, cy + math.floor(fs * 0.5)), r, IM_COL32(rgb[1], rgb[2], rgb[3], 240), 0)
+        ImGui.Dummy(d, fs)
+    end)
+    if not ok then ImGui.Text('*') end
+end
+
+burnPeak = {}   -- longest remaining seen per burn item; the ring's denominator
+
+-- A STOP SIGN. The one control here you reach for in a hurry, and a small text button that says
+-- "Wipe" is a poor thing to hunt for while a group is dying. An octagon with a bar through it is the
+-- road sign, and it reads as HALT before any word does.
+-- AddNgonFilled with eight sides rather than a polygon path: one call, and it is the same primitive
+-- the rest of this file already relies on.
+-- TWO STATES, ONE SHAPE. The first version only drew the octagon while the hold was ON, so in the
+-- normal case it was still a text button sitting next to another text button and there was nothing to
+-- tell them apart at a glance - which is the entire reason for drawing it.
+-- Off is an outline: the control is there, nothing is being held. On is filled and bright: rezzes are
+-- stopped. Same silhouette either way, so it is findable by shape before it is read.
+function ui_stop_button(id, on, size)
+    local clicked = false
+    local ok = pcall(function()
+        local d = size or math.floor(ImGui.GetFontSize() * 1.5)
+        local x, y = ImGui.GetCursorScreenPos()
+        ImGui.InvisibleButton(id, d, d)
+        clicked = ImGui.IsItemClicked()
+        local hov = ImGui.IsItemHovered()
+        local dl  = ImGui.GetWindowDrawList()
+        local cx, cy, r = x + d * 0.5, y + d * 0.5, d * 0.46
+        if on then
+            local red = hov and IM_COL32(224, 72, 64, 255) or IM_COL32(196, 48, 44, 255)
+            dl:AddNgonFilled(ImVec2(cx, cy), r, red, 8)
+            local bw, bh = r * 0.55, math.max(1.5, r * 0.14)
+            dl:AddRectFilled(ImVec2(cx - bw, cy - bh), ImVec2(cx + bw, cy + bh),
+                             IM_COL32(255, 248, 242, 255), 1.0)
+        else
+            local a = hov and 235 or 150
+            dl:AddNgon(ImVec2(cx, cy), r, IM_COL32(196, 92, 86, a), 8, 2.0)
+            local bw, bh = r * 0.45, math.max(1.2, r * 0.11)
+            dl:AddRectFilled(ImVec2(cx - bw, cy - bh), ImVec2(cx + bw, cy + bh),
+                             IM_COL32(196, 92, 86, a), 1.0)
+        end
+    end)
+    if not ok then clicked = ImGui.SmallButton((on and 'Clear wipe##' or 'Wipe##') .. id) end
+    return clicked
+end
+
+-- A RUNNING BURN SHOULD LOOK LIKE IT IS RUNNING. Colour alone says "active", which is the same amount
+-- of information as "ready" wearing a different hue - and active is the state you most want to spot,
+-- because it is the one with a clock on it. A short arc chasing its way round the disc says it without
+-- a word, and stops the moment the burn does.
+-- Phase comes from gettime, so every active mark in the window turns together rather than each keeping
+-- its own private rhythm, which would read as noise.
+function ui_spinner(rgb, size)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local d  = size or math.floor(fs * 1.05)
+        local r  = d * 0.5
+        local cx, cy = ImGui.GetCursorScreenPos()
+        local mx, my = cx + r, cy + r
+        local dl = ImGui.GetWindowDrawList()
+        dl:AddCircleFilled(ImVec2(mx, my), r - 3, IM_COL32(rgb[1], rgb[2], rgb[3], 90), 0)
+        local a0 = (mq.gettime() % 1400) / 1400 * math.pi * 2
+        dl:PathClear()
+        dl:PathArcTo(ImVec2(mx, my), r - 1.5, a0, a0 + math.pi * 0.7)
+        dl:PathStroke(IM_COL32(rgb[1], rgb[2], rgb[3], 250), 0, 2.2)
+        ImGui.Dummy(d, math.max(d, fs))
+    end)
+    if not ok then ImGui.Text('*') end
+end
+
+-- A REAL TOGGLE, not a checkbox. Reads as on/off from across the screen because the knob MOVES -
+-- a tick in a box is a mark you have to look at directly to resolve.
+function ui_toggle(id, isOn, w, h)
+    local clicked = false
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        w = w or math.floor(fs * 2.2)
+        h = h or math.floor(fs * 1.15)
+        local r = h * 0.5
+        local x, y = ImGui.GetCursorScreenPos()
+        ImGui.InvisibleButton(id, w, h)
+        clicked = ImGui.IsItemClicked()
+        local hov = ImGui.IsItemHovered()
+        local dl = ImGui.GetWindowDrawList()
+        local tr = isOn and { 60, 130, 85 } or { 58, 62, 74 }
+        if hov then tr = { math.min(255, tr[1] + 25), math.min(255, tr[2] + 25), math.min(255, tr[3] + 25) } end
+        dl:AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), IM_COL32(tr[1], tr[2], tr[3], 255), r)
+        local kx = isOn and (x + w - r) or (x + r)
+        dl:AddCircleFilled(ImVec2(kx, y + r), r - 2,
+            IM_COL32(isOn and 225 or 150, isOn and 240 or 152, isOn and 228 or 160, 255), 0)
+    end)
+    if not ok then
+        local v = ImGui.Checkbox(id, isOn)
+        clicked = (v ~= isOn)
+    end
+    return clicked
+end
+
+-- EXPERIMENT 2: HP AS BARS RATHER THAN DOTS. A dot can only say which band somebody is in - the bar
+-- says how far through it they are, which is the difference between "the tank is hurt" and "the tank is
+-- about to die". Same row of pixels either way.
+-- Drawn as a track plus a fill so an empty bar still occupies its slot; a corpse fills red.
+function ui_hp_strip(entries, w, h)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        w = w or 22
+        h = h or math.max(6, math.floor(fs * 0.42))
+        local gap = 4
+        local x, y = ImGui.GetCursorScreenPos()
+        local dl = ImGui.GetWindowDrawList()
+        local top = y + math.floor(fs * 0.5) - h * 0.5
+        for i, e in ipairs(entries) do
+            local bx = x + (i - 1) * (w + gap)
+            local c = e.rgb or { 120, 120, 130 }
+            dl:AddRectFilled(ImVec2(bx, top), ImVec2(bx + w, top + h), IM_COL32(38, 42, 52, 255), 2)
+            local frac = 0
+            if e.dead then frac = 1
+            elseif (e.hp or -1) >= 0 then frac = math.max(0, math.min(1, e.hp / 100)) end
+            if frac > 0 then
+                dl:AddRectFilled(ImVec2(bx, top), ImVec2(bx + w * frac, top + h),
+                                 IM_COL32(c[1], c[2], c[3], 235), 2)
+            end
+            dl:AddRect(ImVec2(bx, top), ImVec2(bx + w, top + h), IM_COL32(70, 76, 92, 255), 2)
+        end
+        ImGui.Dummy(#entries * (w + gap), fs)
+    end)
+    if not ok then ImGui.Text('') end
+end
+
+-- THE WHOLE GROUP IN ONE STRIP. Six dots, one per character, coloured by whatever the caller cares
+-- about. Sits above the panels so "is anyone in trouble" is answerable without reading a single row.
+function ui_dot_strip(entries, size)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local d  = size or math.floor(fs * 0.85)
+        local gap = 4
+        local x, y = ImGui.GetCursorScreenPos()
+        local dl = ImGui.GetWindowDrawList()
+        local cy = y + math.floor(fs * 0.5)
+        for i, e in ipairs(entries) do
+            local cx = x + (i - 1) * (d + gap) + d * 0.5
+            local c = e.rgb or { 120, 120, 130 }
+            if e.hollow then
+                dl:AddCircle(ImVec2(cx, cy), d * 0.5, IM_COL32(c[1], c[2], c[3], 200), 0, 1.5)
+            else
+                dl:AddCircleFilled(ImVec2(cx, cy), d * 0.5, IM_COL32(c[1], c[2], c[3], 235), 0)
+            end
+        end
+        ImGui.Dummy(#entries * (d + gap), fs)
+    end)
+    if not ok then ImGui.Text('') end
+end
+
+-- WINDOW CHROME, PUSHED ONCE AROUND Begin/End. AT has never styled the window itself - it wears
+-- whatever ImGui's default dark theme gives it, which is why it reads as a debug panel rather than as
+-- part of the group's kit. Rounder corners, a slightly cooler and darker ground, and a title bar that
+-- picks up the blue used everywhere else for "this is us".
+-- Counted rather than assumed: every push is tallied and only that many are popped, so a binding
+-- missing any one enum cannot unbalance the stack and corrupt every window drawn afterwards.
+UI_CHROME = true
+
+function ui_push_chrome()
+    if not UI_CHROME then return 0, 0 end
+    local cols, vars = 0, 0
+    local function col(slot, r, g, b, a)
+        if not slot then return end
+        if pcall(function() ImGui.PushStyleColor(slot, IM_COL32(r, g, b, a)) end) then cols = cols + 1 end
+    end
+    local function var(slot, a, b)
+        if not slot then return end
+        local ok = pcall(function()
+            if b then ImGui.PushStyleVar(slot, a, b) else ImGui.PushStyleVar(slot, a) end
+        end)
+        if ok then vars = vars + 1 end
+    end
+    col(ImGuiCol.WindowBg,       18,  20,  27, 242)
+    col(ImGuiCol.TitleBg,        24,  28,  40, 255)
+    col(ImGuiCol.TitleBgActive,  38,  54,  84, 255)
+    col(ImGuiCol.Border,         46,  54,  72, 255)
+    col(ImGuiCol.FrameBg,        32,  36,  48, 255)
+    col(ImGuiCol.FrameBgHovered, 48,  54,  72, 255)
+    col(ImGuiCol.Button,         44,  50,  66, 255)
+    col(ImGuiCol.ButtonHovered,  62,  72,  96, 255)
+    col(ImGuiCol.ButtonActive,   80,  95, 125, 255)
+    col(ImGuiCol.TableRowBg,     22,  24,  32, 255)
+    col(ImGuiCol.TableRowBgAlt,  26,  29,  39, 255)
+    var(ImGuiStyleVar.WindowRounding, 6)
+    var(ImGuiStyleVar.FrameRounding,  4)
+    var(ImGuiStyleVar.ChildRounding,  4)
+    var(ImGuiStyleVar.WindowBorderSize, 1)
+    return cols, vars
+end
+
+function ui_pop_chrome(cols, vars)
+    if (vars or 0) > 0 then pcall(function() ImGui.PopStyleVar(vars) end) end
+    if (cols or 0) > 0 then pcall(function() ImGui.PopStyleColor(cols) end) end
+end
+
+function ui_dot(rgb, scale)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local r  = math.max(3, math.floor(fs * (scale or 0.28)))
+        local cx, cy = ImGui.GetCursorScreenPos()
+        ImGui.GetWindowDrawList():AddCircleFilled(
+            ImVec2(cx + r + 2, cy + math.floor(fs * 0.5) + 1), r,
+            IM_COL32(rgb[1], rgb[2], rgb[3], 255), 0)
+        ImGui.Dummy(r * 2 + 6, 1)
+        ImGui.SameLine(0, 0)
+    end)
+    if not ok then ImGui.Text(' ') ; ImGui.SameLine(0, 4) end
+end
+
+-- The separator takes the section's own hue too, so the rule and the title read as one band rather
+-- than a grey line with something colourful after it.
+function ui_section_head(key, label)
+    local c = UI_SECTION[key]
+    local sep = c and c.dot or { 90, 95, 110 }
+    local okS = pcall(function()
+        ImGui.PushStyleColor(ImGuiCol.Separator, IM_COL32(sep[1], sep[2], sep[3], 90))
+        ImGui.Separator()
+        ImGui.PopStyleColor(1)
+    end)
+    if not okS then ImGui.Separator() end
+    if c then ui_dot(c.dot) end
+    ui_text(c and c.label or UI_HEAD, label)
+end
+
+-- A PILL, NOT A WORD. State currently rests on the text colour alone, which means it is invisible to a
+-- colourblind eye and easy to miss at a glance mid-fight. A small filled rounded rect behind the label
+-- carries the same information as shape and mass rather than hue alone.
+function ui_pill(text, rgb, w)
+    local ok = pcall(function()
+        local fs = ImGui.GetFontSize()
+        local pw = math.max(w or (UI_BTN_W or 62), ui_fit_w(text, 0))
+        local ph = fs + 4
+        local cx, cy = ImGui.GetCursorScreenPos()
+        local dl = ImGui.GetWindowDrawList()
+        dl:AddRectFilled(ImVec2(cx, cy), ImVec2(cx + pw, cy + ph),
+                         IM_COL32(rgb[1], rgb[2], rgb[3], 55), ph * 0.5)
+        dl:AddRect(ImVec2(cx, cy), ImVec2(cx + pw, cy + ph),
+                   IM_COL32(rgb[1], rgb[2], rgb[3], 160), ph * 0.5)
+        ui_dl_text(dl, cx + math.max(4, (pw - ImGui.CalcTextSize(text)) * 0.5), cy + 2, rgb, text)
+        ImGui.SetCursorScreenPos(cx, cy)
+        ImGui.Dummy(pw, ph)
+    end)
+    if not ok then ImGui.Text(text) end
+end
+
+UI_READY  = { 0.40, 0.82, 0.45 }   -- up, usable, go
+UI_WAIT   = { 0.95, 0.62, 0.25 }   -- on cooldown, counting down
+UI_LABEL  = { 0.85, 0.72, 0.35 }   -- row labels down the left
+UI_OFF    = { 0.55, 0.55, 0.55 }   -- not applicable, no report, unusable
+UI_HEAD   = { 0.52, 0.64, 0.80 }   -- section titles
+
+function ui_text(c, fmt, ...)
+    ImGui.TextColored(c[1], c[2], c[3], 1.0, (select('#', ...) > 0) and string.format(fmt, ...) or fmt)
+end
+
+function ui_push_text(c)
+    ImGui.PushStyleColor(ImGuiCol.Text, c[1], c[2], c[3], 1.0)
+end
+
+-- A NAME BUTTON OF A FIXED WIDTH. SmallButton sizes itself to its label, so a row of names is ragged
+-- and the same character sits in a different place on every row - which is what makes the rows hard to
+-- read downwards. Button() takes a size and SmallButton() does not, so this is Button with the frame
+-- padding squeezed to match SmallButton's height.
+-- Falls back to a plain SmallButton wherever the sizing calls are unavailable, so nothing depends on it.
+UI_BTN_W      = 62
+uiWideButtons = true
+
+function ui_name_button(label, id, colour)
+    local pushed = 0
+    if colour then
+        local ok = pcall(function() ui_push_text(colour) end)
+        if ok then pushed = 1 end
+    end
+    local clicked
+    if uiWideButtons then
+        local padded = pcall(function() ImGui.PushStyleVar(ImGuiStyleVar.FramePadding, 3, 1) end)
+        -- A FLOOR, NOT A CEILING. A fixed width lines the rows up, but only until a label is wider than
+        -- it - at which point it silently clips, which is worse than a ragged edge.
+        clicked = ImGui.Button(label .. '##' .. id, ui_fit_w(label, UI_BTN_W), 0)
+        if padded then pcall(function() ImGui.PopStyleVar(1) end) end
+    else
+        clicked = ImGui.SmallButton(label .. '##' .. id)
+    end
+    if pushed > 0 then pcall(function() ImGui.PopStyleColor(pushed) end) end
+    return clicked
+end
+
 -- Until when we will accept an incoming trade. Set by /at_expecttrade, which the giver sends just
 -- before it walks over. Outside that window trades are left alone so a human can use one.
 -- Global, not local: this chunk is at Lua's 200-local ceiling.
@@ -192,7 +724,9 @@ function atphase(name)
     -- Close the previous phase first: this is the only place we know it has ended.
     if AT_phaseAt and AT_phaseName then
         local took = mq.gettime() - AT_phaseAt
-        if took >= AT_SLOW_MS and (mq.gettime() - AT_slowSaid) > 3000 then
+        -- 'idle' is the loop WAITING, not the loop working - a long one means nothing needed doing, which
+        -- is the opposite of a problem. Flagging it buried the real ones in noise.
+        if AT_phaseName ~= 'idle' and took >= AT_SLOW_MS and (mq.gettime() - AT_slowSaid) > 3000 then
             AT_slowSaid = mq.gettime()
             -- RECORD IT, DO NOT LOG IT HERE. atphase sits near the top of the file and `log` is a LOCAL
             -- declared a hundred lines further down - so it is not in scope at this point and never will
@@ -365,13 +899,13 @@ end
 -- Globals, not locals: this chunk is at Lua's 200-local ceiling.
 -- ---------------------------------------------------------------------------
 GROUP_POTS = {
-    { key = 'shimmer',   base = 'Draught of Shimmering Reflection', label = 'Group Shimmering'           },
-    { key = 'fortitude', base = 'Draught of Fleeting Fortitude',    label = 'Group Fleeting'              },
+    { key = 'shimmer',   base = 'Draught of Shimmering Reflection', label = 'Grp Shimmering'             },
+    { key = 'fortitude', base = 'Draught of Fleeting Fortitude',    label = 'Grp Fleeting'                },
     -- Inferno Ward moved here from the INIs. As a burn line it fired on every 15 and 30 minute burn
     -- whether or not the fight warranted it; as a button it is spent when someone decides to spend it.
     -- Same shape as the two above, so it gets the tier picking, the per-toon inventory read and the
     -- carries/up/timer display for free.
-    { key = 'inferno',   base = 'Draught of Inferno Ward',        label = 'Group Inferno'               },
+    { key = 'inferno',   base = 'Draught of Inferno Ward',        label = 'Grp Inferno'                 },
 }
 function pot_base_for(key)
     for _, p in ipairs(GROUP_POTS) do if p.key == key then return p.base, p.label end end
@@ -1779,10 +2313,16 @@ DISC_TIME_LEFT = false
 -- Costs while off: the burn dashboard stops updating for that toon. Nothing else uses it.
 local DISC_TICK_SECS = 6   -- MQ spell durations are in ticks; if disc countdowns read 6x too long, set this to 1
 local function ability_state(name)
+    -- ONE INVENTORY SEARCH, NOT THREE. FindItem walks the bags looking for a name match, and this called
+    -- it three separate times for the SAME name - once for the id, once for the timer, once for the
+    -- spell. Multiply by thirty-odd burn entries and burn_poll held the whole loop for 4408ms on
+    -- 2026-08-17 21:50, which is four seconds during which no save, rez or invis could fire.
+    -- The handle can be held and read from repeatedly; only the LOOKUP is expensive.
+    local it = mq.TLO.FindItem('=' .. name)
     local isItem = false
-    pcall(function() isItem = (tonumber(mq.TLO.FindItem('=' .. name).ID()) or 0) > 0 end)
+    pcall(function() isItem = (tonumber(it.ID()) or 0) > 0 end)
     if isItem then
-        local t = 0; pcall(function() t = tonumber(mq.TLO.FindItem('=' .. name).TimerReady()) or 0 end)
+        local t = 0; pcall(function() t = tonumber(it.TimerReady()) or 0 end)
         -- ONLY LOOK FOR THE EFFECT WHILE THE THING THAT GRANTS IT IS ON COOLDOWN. A burn's effect cannot
         -- be running if the item has not been used, and an item that has not been used is READY. So a
         -- ready item needs no buff-table lookup at all - and ready is the normal state, most of the time,
@@ -1792,7 +2332,7 @@ local function ability_state(name)
         -- ends sooner than expected still updates on the next 2s tick. That is the case that mattered.
         local ds = 0
         if t > 0 then
-            ds = my_effect_secs(name, function() return mq.TLO.FindItem('=' .. name).Spell.Name() end, 'i')
+            ds = my_effect_secs(name, function() return it.Spell.Name() end, 'i')
         else
             buffLatch[name] = nil       -- ready again: whatever it granted is done
         end
@@ -2470,13 +3010,24 @@ local function save_settings()
             do
                 local parts = {}
                 for k, v in pairs(popOut) do
-                    if type(v) == 'number' then parts[#parts + 1] = k .. ':' .. v end
+                    if type(v) == 'number' then
+                        parts[#parts + 1] = k .. ':' .. v .. ':' .. (popSeq[k] or 0)
+                    end
                 end
                 table.sort(parts)
                 f:write('popOut=' .. table.concat(parts, ',') .. '\n')
             end
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
             f:write('uiLocked=' .. (uiLocked and '1' or '0') .. '\n')
+            f:write('uiWideButtons=' .. (uiWideButtons and '1' or '0') .. '\n')
+            f:write('uiHpBars=' .. (uiHpBars and '1' or '0') .. '\n')
+            f:write('uiGroupStrip=' .. (uiGroupStrip and '1' or '0') .. '\n')
+            f:write('miniTimeline=' .. (miniTimeline and '1' or '0') .. '\n')
+            f:write('miniRunning=' .. (miniRunning and '1' or '0') .. '\n')
+            f:write('uiSegRings=' .. (uiSegRings and '1' or '0') .. '\n')
+            f:write('uiMaxRow=' .. tostring(UI_MAX_ROW) .. '\n')
+            f:write('uiPulse=' .. (UI_PULSE and '1' or '0') .. '\n')
+            f:write('uiChrome=' .. (UI_CHROME and '1' or '0') .. '\n')
             do
                 local sk = {}
                 for nm, md in pairs(chainMode) do sk[#sk + 1] = nm .. ':' .. md end
@@ -2590,6 +3141,15 @@ local function load_settings()
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
             if k == 'uiLocked' then uiLocked = (v == '1' or v:lower() == 'true') end
+            if k == 'uiWideButtons' then uiWideButtons = (v == '1' or v:lower() == 'true') end
+            if k == 'uiHpBars' then uiHpBars = (v == '1' or v:lower() == 'true') end
+            if k == 'uiGroupStrip' then uiGroupStrip = (v == '1' or v:lower() == 'true') end
+            if k == 'miniTimeline' then miniTimeline = (v == '1' or v:lower() == 'true') end
+            if k == 'miniRunning' then miniRunning = (v == '1' or v:lower() == 'true') end
+            if k == 'uiSegRings' then uiSegRings = (v == '1' or v:lower() == 'true') end
+            if k == 'uiMaxRow' then UI_MAX_ROW = math.max(160, math.min(1200, tonumber(v) or 420)) end
+            if k == 'uiPulse' then UI_PULSE = (v == '1' or v:lower() == 'true') end
+            if k == 'uiChrome' then UI_CHROME = (v == '1' or v:lower() == 'true') end
             if k == 'chainMode' then
                 chainMode = {}
                 for ent in tostring(v or ''):gmatch('[^,]+') do
@@ -2624,8 +3184,16 @@ local function load_settings()
             if k == 'popOut' then
                 popOut = {}
                 for part in v:gmatch('[^,]+') do
-                    local sk, pn = part:match('^(.-):(%d+)$')
-                    if sk then popOut[sk] = tonumber(pn) end
+                    -- key:panel:seq, with key:panel still accepted so a settings file written before the
+                    -- ordering existed loads without complaint.
+                    local sk, pn, sq = part:match('^(.-):(%d+):(%d+)$')
+                    if not sk then sk, pn = part:match('^(.-):(%d+)$') end
+                    if sk then
+                        popOut[sk] = tonumber(pn)
+                        local n = tonumber(sq) or 0
+                        popSeq[sk] = n
+                        if n > popSeqN then popSeqN = n end
+                    end
                 end
             end
             if k == 'miniBurns' then miniBurns = (v == '1' or v:lower() == 'true') end
@@ -6649,7 +7217,7 @@ function draw_ports_tab()
         if list and #list > 0 then
             any = true
             ImGui.Spacing()
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, nm)
+            ui_text(UI_LABEL, nm)
 
             -- SPLIT BY WHO IT MOVES, INSIDE EACH CONTINENT. A flat list of thirty ports is a wall, and
             -- the first question is not "which continent" on its own - it is "am I moving the group or
@@ -7999,6 +8567,8 @@ miniMode        = false   -- compact window when minimized. NOT local: save_sett
 -- and the setting would silently never persist. rezAuto, showSec and DI are globals for this reason.
 -- (Also buys four back against the 200-local ceiling.)
 miniBurns       = true    -- show the burn dot matrix in the mini window
+miniTimeline    = false   -- show the five-minute burn timeline (experimental)
+miniRunning     = false   -- show what is running right now, counting down (experimental)
 miniRez         = true    -- show crown/token cooldowns in the mini window
 miniDI          = false   -- show the tank save line + DI staff cooldowns in the mini window
 miniPots        = false   -- show the group draught buttons in the mini window
@@ -8042,6 +8612,7 @@ charOrder       = {}
 miniBurnFilter  = 'All'   -- the mini burn view's own role filter, independent of the Burns tab
 miniSizeWanted  = false   -- one-shot: resize the mini window next frame (set when detail turns on)
 miniSizedOnce   = false   -- has the detail view been sized yet this session?
+miniShapeKey    = nil     -- view|peers|on|filter; a change means the window needs re-fitting
 -- Width the detail table actually needs: a column per reporting character at 250, plus room for the
 -- row labels and the window chrome. Clamped so it never asks for more than a sane screen width.
 function mini_table_size()
@@ -8052,6 +8623,14 @@ function mini_table_size()
         end
     end
     if n < 1 then n = 1 end
+    -- 300 PER CHARACTER WAS FOR THE FULL TABLE. The compact view is a name-wide column each, so the
+    -- window it asks for has to depend on which view is actually showing - sizing every view for the
+    -- widest one is what left the compact table floating in an over-wide window with its row labels
+    -- pushed off the left edge.
+    if miniBurnView == 0 then
+        local per = 46            -- a four-letter name plus padding and the column rule
+        return math.min(1800, n * per + 110), 620
+    end
     return math.min(1800, n * 300 + 60), 620   -- 300: comfortable, under the 400 ceiling
 end
 miniCoth        = false   -- show the CoTH Group button in the mini window
@@ -8379,7 +8958,7 @@ local function render_group(label, color, items, altCurrency)
                                 or (is_ruby(it) and not WANTS_RUBY[ck])) then
                         ImGui.TextDisabled(tostring(n))   -- holds this many but won't use them (grey = not needed)
                     elseif n >= tgt then
-                        ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(n))
+                        ui_text(UI_READY, tostring(n))
                     else
                         ImGui.TextColored(0.93, 0.42, 0.42, 1.0, tostring(n))
                     end
@@ -8415,7 +8994,7 @@ local function render_group(label, color, items, altCurrency)
                     -- No target set, or nobody in the group uses it. Nothing to be short OF.
                     ImGui.TextDisabled(tostring(total))
                 elseif total >= wanted then
-                    ImGui.TextColored(0.40, 0.82, 0.45, 1.0, tostring(total))
+                    ui_text(UI_READY, tostring(total))
                 else
                     ImGui.TextColored(0.93, 0.42, 0.42, 1.0, tostring(total))
                 end
@@ -8669,6 +9248,84 @@ POP_ICON = (ICONS_OK and type(ICO) == 'table'
             and (ICO.FA_EXTERNAL_LINK or ICO.MD_OPEN_IN_NEW or ICO.FA_WINDOW_RESTORE)) or '>>'
 -- The grab handle. Six dots is the near-universal 'drag me' and, unlike an arrow, it says the row moves
 -- rather than that something happens when you click.
+-- WHERE THE POP ICON SITS, measured from the LABELS rather than from the window.
+-- Right-aligning it against the available region fed the window's own size back into its layout: placing
+-- the icon at the right edge sets the content width, an auto-resizing window then resizes to that, the
+-- available region changes, and the icon moves again - the mini flickered between two sizes several
+-- times a second, worst while it was still small at startup.
+-- The longest section label cannot change while the script runs, so a column derived from it is stable
+-- by construction. It looks aligned and it cannot oscillate.
+POP_COL = nil
+function pop_column()
+    if POP_COL then return POP_COL end
+    local w = 0
+    pcall(function()
+        for _, s in ipairs(MINI_SECTIONS) do
+            -- MEASURE WHAT IS ACTUALLY DRAWN, not the bare label. A foldable section's title is a BUTTON
+            -- reading 'v Label' - the caret and the button's own padding make it noticeably wider than
+            -- the same text drawn plain, so a column measured from labels alone left the two kinds of
+            -- row out of line with each other.
+            local plain = ImGui.CalcTextSize(s.label or '') or 0
+            local folded = (ImGui.CalcTextSize('v ' .. (s.label or '')) or 0) + 12   -- button padding
+            local lw = (folded > plain) and folded or plain
+            if lw > w then w = lw end
+        end
+    end)
+    POP_COL = w + 16      -- a little air between the widest title and the icon
+    return POP_COL
+end
+
+-- THE ICON'S OWN WIDTH, measured from the real button rather than guessed.
+-- pop_align has to subtract it EXACTLY (see below), and a SmallButton is text plus the style's frame
+-- padding - which is a theme setting, not a constant. So pop_grip records GetItemRectSize the first
+-- time it draws one and that measurement is used from then on. The CalcTextSize+12 fallback matches
+-- the constant pop_column already uses, and only ever applies to the first frame or a binding without
+-- GetItemRectSize.
+POP_ICON_W = nil
+function pop_icon_width()
+    if POP_ICON_W then return POP_ICON_W end
+    local w = 0
+    pcall(function() w = (ImGui.CalcTextSize(POP_ICON) or 0) + 12 end)
+    return (w > 0) and w or 24
+end
+
+-- HOW FAR RIGHT THE ICON MAY SIT, per window. Keyed by window ('mini', or the panel number) because
+-- each one is a different width.
+POP_RIGHT = {}
+
+-- RIGHT-ALIGN WITHOUT THE FEEDBACK LOOP.
+-- The rule this file has broken before: in an auto-resizing window, nothing that affects the window's
+-- size may be computed from the window's size. Placing the icon at the content-region right edge does
+-- exactly that - the icon's right edge lands one icon-width PAST the old edge, the window auto-fits to
+-- the wider content, and it creeps wider every frame.
+--
+-- Subtracting the icon width exactly is what makes it stable instead: the icon's right edge lands ON
+-- the current edge, so the content width it produces is the content width it was given. A fixed point,
+-- not a loop. Nothing is added for padding - a single pixel of slack is a creep of a pixel per frame.
+--
+-- The one thing this cannot do is SHRINK. Once the icon is the widest thing on the line, it holds the
+-- window at that width even after the content that caused it goes away, because the natural width is no
+-- longer observable. So the latch is cleared on the structural changes - folding a section, moving one
+-- between windows - which lets the next frame re-measure the real content and re-latch. Between those,
+-- the position is constant by construction and cannot flicker.
+--
+-- pop_column() stays as the floor, so a window narrower than the labels still looks deliberate.
+-- 1.17.38: THE LATCH IS GONE, AND WITH IT THE RIGHT ALIGNMENT.
+-- Everything above describes a mechanism that is stable but one-way: it can only ever remember a wider
+-- edge, never a narrower one, so the window could not shrink below the widest thing it had contained at
+-- any point in the session. Clearing it on folding and moving covered the cases that existed when it was
+-- written; it did not cover the content itself getting smaller, which is now the common case.
+-- A timer-based re-measure was the obvious repair and is worse than the disease: the icon drops to the
+-- floor position for one frame every time it re-measures, which is a visible twitch on a loop.
+-- So the alignment goes. The icon follows the section title with a fixed gap - a position derived from
+-- nothing, which is the only kind that cannot argue with the size it affects. The icons no longer form
+-- a column down the right, and in exchange the window is free to be exactly as wide as its contents.
+-- If the column is missed, the honest way back is a fixed window width the user sets, not a latch that
+-- infers one.
+function pop_align(win)
+    ImGui.SameLine(0, 10)
+end
+
 POP_GRIP = (ICONS_OK and type(ICO) == 'table'
             and (ICO.FA_BARS or ICO.MD_DRAG_INDICATOR or ICO.FA_ELLIPSIS_V)) or '::'
 
@@ -8813,6 +9470,287 @@ end
 -- carries the ready count. That is the "quick glance" question answered - is this tier up for this
 -- toon - and the item-level detail is what the other two views are for. Hover names the items.
 -- Roughly a third the width, because a column now needs room for one glyph rather than six.
+-- WHAT IS RUNNING RIGHT NOW, AND HOW LONG IS LEFT OF IT. The mirror of the timeline: that one is about
+-- what is coming back, this is about what is burning down. Both matter and neither answers the other -
+-- "three burns return in ninety seconds" and "the disc you fired has eleven seconds left" are different
+-- questions asked at different moments.
+-- The data has always been here. A burn reports `dsecs`, its own duration, alongside `active` - it was
+-- carried across the wire, stored, and never once drawn. Everything below is arithmetic on numbers the
+-- driver already had.
+-- Bars rather than ticks, because a duration has a LENGTH: the bar drains left as it expires, so a
+-- glance says how much of it is left without reading the number beside it.
+function draw_burn_running()
+    -- GROUPED BY CHARACTER. The flat list repeated the name on every line, so a paladin running three
+    -- discs cost three copies of "Khulian" and the eye had to notice they were the same person. The
+    -- name is the heading now and its discs sit under it - one name, however many are up.
+    local byChar, order = {}, {}
+    for _, c in ipairs(ordered_members()) do
+        for it, st in pairs(burnState[c] or {}) do
+            if st.active and (st.dsecs or 0) > 0 then
+                local age  = math.floor((mq.gettime() - (st.updated or 0)) / 1000)
+                local left = math.max(0, (st.dsecs or 0) - age)
+                if left > 0 then
+                    if not byChar[c] then byChar[c] = {}; order[#order + 1] = c end
+                    byChar[c][#byChar[c] + 1] = { it = it, left = left, total = st.dsecs, st = st }
+                end
+            end
+        end
+    end
+    if #order == 0 then
+        -- Nothing running is the normal state, and it should read as calm rather than as an error.
+        ImGui.TextDisabled('nothing running')
+        return
+    end
+
+    local fs = 16
+    pcall(function() fs = ImGui.GetFontSize() or 16 end)
+    -- The bars line up across every character, so the label column is measured over ALL of them rather
+    -- than per group - otherwise each character's bars would start at a different x and the lengths
+    -- could not be compared by eye, which is the entire reason for drawing bars.
+    local labelW = 0
+    pcall(function()
+        for _, c in ipairs(order) do
+            for _, r in ipairs(byChar[c]) do
+                local w = ImGui.CalcTextSize(r.it) or 0
+                if w > labelW then labelW = w end
+            end
+        end
+    end)
+    labelW = math.min(math.ceil(labelW) + 24, 240)   -- 24: the indent under the name
+    local barW = 130
+    local barH = math.max(9, math.floor(fs * 0.6))
+
+    for ci, c in ipairs(order) do
+        if ci > 1 then ImGui.Dummy(1, 3) end
+        local rows = byChar[c]
+        -- Shortest first within the character: the one about to drop is the one you might re-fire.
+        table.sort(rows, function(a, b) return a.left < b.left end)
+        ui_text(UI_LABEL, c .. ':')
+        for _, r in ipairs(rows) do
+            local br, bg, bb = burn_colour(r.st)
+            local rgb = { math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) }
+            ImGui.Dummy(18, fs)          -- indent, so the discs read as belonging to the name above
+            ImGui.SameLine(24)
+            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, r.it)
+            ImGui.SameLine(labelW)
+            pcall(function()
+                local x, y = ImGui.GetCursorScreenPos()
+                local dl   = ImGui.GetWindowDrawList()
+                local top  = y + math.floor(fs * 0.5) - barH * 0.5
+                dl:AddRectFilled(ImVec2(x, top), ImVec2(x + barW, top + barH), IM_COL32(34, 38, 48, 255), 2)
+                local frac = math.max(0, math.min(1, r.left / math.max(1, r.total)))
+                if frac > 0 then
+                    dl:AddRectFilled(ImVec2(x, top), ImVec2(x + barW * frac, top + barH),
+                                     IM_COL32(rgb[1], rgb[2], rgb[3], 225), 2)
+                end
+                -- THE LAST TEN SECONDS GET AN EDGE. That is when re-firing becomes a decision rather
+                -- than a thing you would do later, so it should look different from merely running.
+                if r.left <= 10 then
+                    dl:AddRect(ImVec2(x, top), ImVec2(x + barW, top + barH),
+                               IM_COL32(255, 236, 160, 220), 2, 0, 1.5)
+                end
+                ImGui.Dummy(barW, fs)
+            end)
+            ImGui.SameLine()
+            ui_text((r.left <= 10) and UI_WAIT or UI_READY,
+                    string.format('%d:%02d', math.floor(r.left / 60), r.left % 60))
+        end
+    end
+end
+
+-- THE NEXT FIVE MINUTES, AS A PICTURE - PLUS EVERYTHING AFTER. Every other view answers "what is up
+-- right now"; none of them answer "when is this group ready to go again", which is the question you are
+-- actually asking between pulls. Six strips with the ticks bunched at the same place tell you the whole
+-- group comes back together, and that is a decision.
+--
+--   Khulian   |####    |  |     |        | ::  |
+--   Lunafeet  |##  |   |        |    |   | :   |
+--             now      1m      2m      3m      4m      5m   +
+--
+-- TWO ZONES, because one scale cannot serve both ends. The wide part is linear over five minutes and is
+-- the part you act on, so it stays precise. The narrow strip past the divider holds everything further
+-- out - a thirty minute burn lives there for twenty-five minutes and then slides across.
+-- Clamping everything beyond five minutes onto the right edge was the first attempt, and it made a six
+-- minute burn and a thirty minute burn identical, which is exactly the distinction worth having when
+-- deciding whether to wait. The beyond-zone marks are dimmer and thinner: present, positioned by nothing
+-- more than "not yet", and deliberately not competing with the ticks that carry a real time.
+TIMELINE_SECS = 300
+
+function draw_burn_timeline()
+    local chars = {}
+    for _, c in ipairs(ordered_members()) do
+        if burnState[c] then chars[#chars + 1] = c end
+    end
+    if #chars == 0 then ImGui.TextDisabled('no burn reports yet'); return end
+
+    local fs = 16
+    pcall(function() fs = ImGui.GetFontSize() or 16 end)
+    local labelW = 0
+    pcall(function()
+        for _, c in ipairs(chars) do
+            local w = ImGui.CalcTextSize(c) or 0
+            if w > labelW then labelW = w end
+        end
+    end)
+    labelW = math.ceil(labelW) + 10
+    local liveW  = 200                      -- the linear five minutes
+    local farW   = 34                       -- the beyond strip
+    local gap    = 5                        -- the divider between them
+    local barW   = liveW + gap + farW
+    local barH   = math.max(8, math.floor(fs * 0.55))
+
+    -- ONE PASS FOR THE WHOLE GROUP, so the aggregate strip and the soonest marker below are reading the
+    -- same numbers as the rows above them rather than recomputing and quietly disagreeing.
+    local allPending, soonest = {}, nil
+    for _, c in ipairs(chars) do
+        for it, st in pairs(burnState[c] or {}) do
+            if (st.tier or 0) > 0 and not st.active then
+                local r = burn_remain(st)
+                if (r or 0) > 0 then
+                    local br, bg, bb = burn_colour(st)
+                    allPending[#allPending + 1] = { r = r, rgb = {
+                        math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) } }
+                    if not soonest or r < soonest.r then soonest = { r = r, c = c, it = it } end
+                end
+            end
+        end
+    end
+
+    for _, c in ipairs(chars) do
+        ui_text(UI_LABEL, c)
+        ImGui.SameLine(labelW)
+        local ok = pcall(function()
+            local x, y = ImGui.GetCursorScreenPos()
+            local dl   = ImGui.GetWindowDrawList()
+            local top  = y + math.floor(fs * 0.5) - barH * 0.5
+            dl:AddRectFilled(ImVec2(x, top), ImVec2(x + liveW, top + barH), IM_COL32(34, 38, 48, 255), 2)
+            -- The beyond strip is drawn darker, so the divider reads without needing a line of its own.
+            dl:AddRectFilled(ImVec2(x + liveW + gap, top), ImVec2(x + barW, top + barH),
+                             IM_COL32(26, 29, 37, 255), 2)
+            for m = 1, 4 do
+                local gx = x + (m * 60 / TIMELINE_SECS) * liveW
+                dl:AddLine(ImVec2(gx, top), ImVec2(gx, top + barH), IM_COL32(70, 76, 92, 255), 1)
+            end
+
+            local readyN, farN = 0, 0
+            for it, st in pairs(burnState[c] or {}) do
+                if (st.tier or 0) > 0 then
+                    local r = burn_remain(st)
+                    local br, bg, bb = burn_colour(st)
+                    if st.active or (r or 0) <= 0 then
+                        readyN = readyN + 1          -- counted for the tooltip only; nothing is drawn
+                    elseif r <= TIMELINE_SECS then
+                        local tx = x + (r / TIMELINE_SECS) * (liveW - 3)
+                        dl:AddRectFilled(ImVec2(tx, top + 1), ImVec2(tx + 3, top + barH - 1),
+                                         IM_COL32(math.floor(br * 255), math.floor(bg * 255),
+                                                  math.floor(bb * 255), 235), 1)
+                    else
+                        -- Spread across the beyond strip by ORDER, not by time - the position means
+                        -- nothing and should not pretend to. It is a count you can see.
+                        farN = farN + 1
+                        local fx = x + liveW + gap + 3 + ((farN - 1) % 6) * 5
+                        dl:AddRectFilled(ImVec2(fx, top + 2), ImVec2(fx + 2, top + barH - 2),
+                                         IM_COL32(math.floor(br * 255), math.floor(bg * 255),
+                                                  math.floor(bb * 255), 120), 0)
+                    end
+                end
+            end
+            -- NOTHING FOR WHAT IS ALREADY UP. This strip is about the future, and a block of ready burns
+            -- at the left was the largest, brightest thing on it - a green wall in front of the marks
+            -- that carry the actual information. What is ready is already answered by the dot grid, and
+            -- answered better there.
+            -- An EMPTY strip is now the good state and reads as one: nothing pending, everything up.
+            -- The count still rides in the tooltip, where it costs nothing.
+            ImGui.Dummy(barW, fs)
+        end)
+        if not ok then ImGui.Text('') end
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            local rows, ready = {}, 0
+            for it, st in pairs(burnState[c] or {}) do
+                if (st.tier or 0) > 0 then
+                    local r = burn_remain(st)
+                    if st.active or (r or 0) <= 0 then ready = ready + 1
+                    else rows[#rows + 1] = { it = it, r = r } end
+                end
+            end
+            table.sort(rows, function(a, b) return a.r < b.r end)
+            local lines = { string.format('%s  -  %d ready now', c, ready) }
+            for i = 1, math.min(8, #rows) do
+                local m = math.floor(rows[i].r / 60)
+                lines[#lines + 1] = string.format('  %s  %s%d:%02d', rows[i].it,
+                    (rows[i].r > TIMELINE_SECS) and '' or '', m, rows[i].r % 60)
+            end
+            if #rows > 8 then lines[#lines + 1] = string.format('  ...and %d more', #rows - 8) end
+            pcall(function() ImGui.SetTooltip(table.concat(lines, '\n')) end)
+        end
+    end
+
+    -- EVERYONE AT ONCE. Six strips show you each character; this shows you the GROUP, which is the thing
+    -- the decision actually turns on - a cluster here is "we all come back together at 2:10", and that
+    -- is invisible when the same ticks are spread down six separate rows.
+    -- Taller marks than the per-character rows, because where they PILE UP is the whole point and a
+    -- stack of three needs to look different from a single.
+    if #allPending > 0 then
+        ImGui.Dummy(1, 3)
+        ui_text(UI_HEAD, 'all')
+        ImGui.SameLine(labelW)
+        pcall(function()
+            local x, y = ImGui.GetCursorScreenPos()
+            local dl   = ImGui.GetWindowDrawList()
+            local h    = math.max(10, math.floor(fs * 0.75))
+            local top  = y + math.floor(fs * 0.5) - h * 0.5
+            dl:AddRectFilled(ImVec2(x, top), ImVec2(x + liveW, top + h), IM_COL32(30, 34, 44, 255), 2)
+            dl:AddRectFilled(ImVec2(x + liveW + gap, top), ImVec2(x + barW, top + h),
+                             IM_COL32(24, 27, 35, 255), 2)
+            for m = 1, 4 do
+                local gx = x + (m * 60 / TIMELINE_SECS) * liveW
+                dl:AddLine(ImVec2(gx, top), ImVec2(gx, top + h), IM_COL32(70, 76, 92, 255), 1)
+            end
+            local far = 0
+            for _, e in ipairs(allPending) do
+                if e.r <= TIMELINE_SECS then
+                    local tx = x + (e.r / TIMELINE_SECS) * (liveW - 3)
+                    -- Additive-ish by overlap: several ticks at the same spot stack into a solid block.
+                    dl:AddRectFilled(ImVec2(tx, top + 1), ImVec2(tx + 3, top + h - 1),
+                                     IM_COL32(e.rgb[1], e.rgb[2], e.rgb[3], 150), 1)
+                else
+                    far = far + 1
+                    local fx = x + liveW + gap + 3 + ((far - 1) % 6) * 5
+                    dl:AddRectFilled(ImVec2(fx, top + 2), ImVec2(fx + 2, top + h - 2),
+                                     IM_COL32(e.rgb[1], e.rgb[2], e.rgb[3], 90), 0)
+                end
+            end
+            -- THE SOONEST THING, marked. "How long until anything happens" is the question you ask
+            -- first, and counting along a grid to answer it is slower than being told.
+            if soonest and soonest.r <= TIMELINE_SECS then
+                local sx = x + (soonest.r / TIMELINE_SECS) * (liveW - 3)
+                dl:AddLine(ImVec2(sx, top - 3), ImVec2(sx, top + h + 3), IM_COL32(235, 235, 245, 210), 1.5)
+            end
+            ImGui.Dummy(barW, fs)
+        end)
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() and soonest then
+            pcall(function() ImGui.SetTooltip(string.format(
+                'every burn still on cooldown, all six characters on one line\n\nsoonest: %s  %s  %d:%02d',
+                soonest.c, soonest.it, math.floor(soonest.r / 60), soonest.r % 60)) end)
+        end
+    end
+
+    -- The scale, once, under the last strip.
+    ImGui.Dummy(1, 2)
+    ImGui.SameLine(labelW)
+    if soonest and soonest.r <= TIMELINE_SECS then
+        ui_text(UI_READY, string.format('next %d:%02d', math.floor(soonest.r / 60), soonest.r % 60))
+    else
+        ImGui.TextDisabled('now')
+    end
+    for m = 1, 5 do
+        ImGui.SameLine(labelW + (m * 60 / TIMELINE_SECS) * liveW - 6)
+        ImGui.TextDisabled(m .. 'm')
+    end
+    ImGui.SameLine(labelW + liveW + gap + 6)
+    ImGui.TextDisabled('+')
+end
+
 function draw_burn_compact()
     local chars = {}
     for _, c in ipairs(ordered_members()) do
@@ -8822,80 +9760,120 @@ function draw_burn_compact()
     local tiers = burn_tiers_present(chars)
     if #tiers == 0 then ImGui.TextDisabled('no burns configured'); return end
 
+    -- A REAL TABLE AGAIN, names across the top. The hand-drawn grid was built to work around a width
+    -- that would not shrink, and the width was never the table's fault - pop_align latched a right edge
+    -- that could only grow, so every narrower table was silently widened back the next frame. With that
+    -- gone the table sizes itself sensibly, and it brings back the column rules and row striping that
+    -- the hand-drawn version had to fake.
+    -- No outer size passed, and no attempt to make the table narrower than its content: it fills the
+    -- window, and the window is now free to be as narrow as its widest element.
+    local tlabels = {}
+    for i, t in ipairs(tiers) do
+        tlabels[i] = (t.label:gsub('[Bb]urns?$', ''):gsub('%s+$', ''))
+    end
+
+    local fs = 16
+    pcall(function() fs = ImGui.GetFontSize() or 16 end)
+    local labelW, nameW = 0, 0
+    pcall(function()
+        for _, tl in ipairs(tlabels) do
+            local w = ImGui.CalcTextSize(tl) or 0
+            if w > labelW then labelW = w end
+        end
+        for _, c in ipairs(chars) do
+            local w = ImGui.CalcTextSize(c) or 0
+            if w > nameW then nameW = w end
+        end
+    end)
+    labelW = math.ceil(labelW) + 8
+    local colW = math.max(math.ceil(nameW), math.floor(fs * 1.2)) + 6
+
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
     if not ImGui.BeginTable('##burncompact', 1 + #chars, flags) then return end
-    ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, 58)
-    for _ = 1, #chars do ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, 46) end
-
-    ImGui.TableNextRow()
-    ImGui.TableNextColumn()
+    ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, labelW)
     for _, c in ipairs(chars) do
-        ImGui.TableNextColumn()
-        local total, ready = 0, 0
-        for _, st in pairs(burnState[c] or {}) do
-            if (st.tier or 0) > 0 then
-                total = total + 1
-                if st.active or burn_remain(st) == 0 then ready = ready + 1 end
-            end
-        end
-        -- NAME ONLY. The 18/18 totals were the least useful number on the row: nobody acts on "how many
-        -- burns does this character own", and every cell below already says what is up per tier.
-        ImGui.TextColored(0.80, 0.80, 0.80, 1.0, c:sub(1, 4))
-        local _ = ready + total   -- counted above; kept for the hover, not shown here
+        ImGui.TableSetupColumn(c, ImGuiTableColumnFlags.WidthFixed or 0, colW)
     end
+    ImGui.TableHeadersRow()
 
     for _, t in ipairs(tiers) do
         ImGui.TableNextRow()
         ImGui.TableNextColumn()
-        -- 'minBurn' on every label is noise when the column is only ever burns.
-        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, (t.label:gsub('[Bb]urns?$', ''):gsub('%s+$', '')))
+        ui_text(UI_LABEL, (t.label:gsub('[Bb]urns?$', ''):gsub('%s+$', '')))
         for _, c in ipairs(chars) do
             ImGui.TableNextColumn()
-            local n, up, soon, names = 0, 0, false, {}
+            local names = {}
             for it, st in pairs(burnState[c] or {}) do
-                if (st.tier or 0) > 0 and (st.tkey or '?') == t.key then
-                    n = n + 1
-                    local r = burn_remain(st)
-                    if st.active or r == 0 then up = up + 1
-                    elseif r > 0 and r < 60 then soon = true end
-                    names[#names + 1] = it
-                end
+                if (st.tier or 0) > 0 and (st.tkey or '?') == t.key then names[#names + 1] = it end
             end
-            if n == 0 then
+            if #names == 0 then
                 ImGui.TextDisabled('-')
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     pcall(function() ImGui.SetTooltip(c .. ' has nothing at ' .. t.label) end)
                 end
             else
-                -- ONE PLAIN DOT PER BURN, each coloured by its own state. Not the FontAwesome icons the
-                -- other views use - those carry the item KIND, which is detail this view is deliberately
-                -- dropping, and they are three or four times the width of a bullet. Not "3/5" either:
-                -- five dots with two of them red says the same thing and reads without parsing.
-                -- ONE TOOLTIP FOR THE WHOLE CELL, attached to every dot in it. A bullet is a tiny hover
-                -- target and there is no point making them bigger - the size is the feature - so instead
-                -- each dot answers for the cell. Hovering anywhere in the run gives the same full list,
-                -- which makes the effective target the whole group of dots rather than one of them.
-                -- Built once per cell rather than per dot: same string, and it is not free to assemble.
                 table.sort(names)
+                -- ONE TOOLTIP FOR THE WHOLE CELL. A mark is a small hover target and the size is the
+                -- feature, so the whole list answers from wherever the cursor lands on it.
                 local lines = { c .. '  ' .. t.label }
+                local worstItem, worstLeft, anyReady = nil, -1, false
                 for _, it in ipairs(names) do
                     local st = burnState[c][it]
-                    local r = burn_remain(st)
+                    local r  = burn_remain(st)
                     if st.active then      lines[#lines + 1] = '  ' .. it .. '  (running)'
                     elseif r == 0 then     lines[#lines + 1] = '  ' .. it .. '  ready'
                     elseif r < 0 then      lines[#lines + 1] = '  ' .. it
                     else lines[#lines + 1] = string.format('  %s  %d:%02d', it, math.floor(r / 60), r % 60) end
+                    if st.active or (r or 0) == 0 then anyReady = true end
+                    if (r or 0) > worstLeft then worstItem, worstLeft = it, (r or 0) end
                 end
                 local tip = table.concat(lines, '\n')
-                for i, it in ipairs(names) do
-                    local st = burnState[c][it]
-                    local cr, cg, cb = burn_colour(st)
-                    if i > 1 then ImGui.SameLine(0, 2) end
-                    ImGui.TextColored(cr, cg, cb, 1.0, '\226\128\162')
-                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
-                        pcall(function() ImGui.SetTooltip(tip) end)
+                local pid = 'burn:' .. c .. ':' .. t.key
+
+                if uiSegRings and worstLeft > 0 then
+                    ui_pulse_note(pid, false)
+                    local segs = {}
+                    for _, it in ipairs(names) do
+                        local st2 = burnState[c][it]
+                        local r2  = burn_remain(st2)
+                        local br, bg, bb = burn_colour(st2)
+                        local pk = math.max(burnPeak[it] or 0, r2 or 0, 1)
+                        burnPeak[it] = pk
+                        segs[#segs + 1] = {
+                            rgb  = { math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) },
+                            fill = (st2.active or (r2 or 0) <= 0) and 1 or (1 - (r2 / pk)),
+                        }
                     end
+                    local d = math.floor(fs * 1.15)
+                    ui_cell_centre(d)
+                    ui_seg_ring(segs, d, 2.2)
+                elseif worstLeft <= 0 then
+                    local cr, cg, cb = burn_colour(burnState[c][names[1]])
+                    local rgb = { math.floor(cr * 255), math.floor(cg * 255), math.floor(cb * 255) }
+                    -- RUNNING SPINS, READY SITS STILL. Both were a solid disc in a slightly different
+                    -- colour, which is the least distinguishable way to show the difference between
+                    -- "you can press this" and "this is already going" - and the second is the one with
+                    -- a clock on it.
+                    local anyActive = false
+                    for _, it in ipairs(names) do
+                        if burnState[c][it] and burnState[c][it].active then anyActive = true; break end
+                    end
+                    local d = math.floor(fs * (anyActive and 1.05 or 0.95))
+                    ui_cell_centre(d)
+                    if anyActive then ui_spinner(rgb, d) else ui_disc(rgb, d, pid) end
+                else
+                    ui_pulse_note(pid, false)
+                    local stw = burnState[c][worstItem]
+                    local cr, cg, cb = burn_colour(stw)
+                    local rgb = { math.floor(cr * 255), math.floor(cg * 255), math.floor(cb * 255) }
+                    burnPeak[worstItem] = math.max(burnPeak[worstItem] or 0, worstLeft, 1)
+                    local d = math.floor(fs * 1.05)
+                    ui_cell_centre(d)
+                    ui_ring(worstLeft / burnPeak[worstItem], rgb, '', d, 2.0, anyReady)
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(tip) end)
                 end
             end
         end
@@ -8917,7 +9895,7 @@ local function draw_tribute_mini()
     if on == tot then
         ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'Tribute ON')
     else
-        ImGui.TextColored(0.95, 0.62, 0.25, 1.0, string.format('Tribute ON  %d/%d', on, tot))
+        ui_text(UI_WAIT, string.format('Tribute ON  %d/%d', on, tot))
         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
             pcall(function() ImGui.SetTooltip('off: ' .. table.concat(off, ', ')) end)
         end
@@ -8928,17 +9906,30 @@ end
 -- is 'who can rez right now', not a full roster.
 -- One cooldown cell, shared by the rez rows and the DI staff row so they read identically:
 -- '-' when not carried, green 'ready', else the usual yellow -> orange -> red ramp.
-function rez_cell(base, updated)
+-- ONE READOUT FOR EVERY REZ ROW, so the shape below lands across the whole panel at once.
+-- Ready is a solid disc - the loudest mark available, and the only state anybody scans this table for.
+-- Counting down is a pill, which reads as a readout rather than as a control you are failing to press.
+-- The urgency ramp is unchanged: yellow inside a minute, amber inside five, red beyond.
+-- placed: the caller has already positioned the cursor (the hand-drawn grid does), so do not centre
+-- again - ui_cell_centre measures the remaining region, which outside a table is the rest of the row.
+function rez_cell(base, updated, pid, placed)
     if (base or -1) < 0 then ImGui.TextDisabled('-'); return end
     local left = math.max(0, base - math.floor((mq.gettime() - (updated or 0)) / 1000))
     if left == 0 then
-        ImGui.TextColored(0.36, 0.80, 0.46, 1.0, 'ready')
+        local d = math.floor(ImGui.GetFontSize() * 0.95)
+        if not placed then ui_cell_centre(d) end
+        ui_disc({ 92, 204, 117 }, d, pid)
+        if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+            pcall(function() ImGui.SetTooltip('ready') end)
+        end
     else
-        local cr, cg, cb
-        if left < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
-        elseif left < 300 then cr, cg, cb = 0.95, 0.62, 0.25
-        else                   cr, cg, cb = 0.85, 0.35, 0.35 end
-        ImGui.TextColored(cr, cg, cb, 1.0, string.format('%d:%02d', math.floor(left / 60), left % 60))
+        ui_pulse_note(pid, false)
+        local rgb
+        if left < 60 then      rgb = { 242, 217,  77 }
+        elseif left < 300 then rgb = { 242, 158,  64 }
+        else                   rgb = { 217,  89,  89 } end
+        if not placed then ui_cell_centre(46) end
+        ui_pill(string.format('%d:%02d', math.floor(left / 60), left % 60), rgb, 46)
     end
 end
 
@@ -9001,26 +9992,41 @@ end
 
 function draw_di_mini()
     -- Drawn on the header now, so the panel does not repeat it. See the mini render loop.
-
+    -- BACK ON A TABLE, like Burns and Rez. The hand-drawn version was built when the window would not
+    -- shrink and the table looked like the reason; it was not - see pop_align. Consistency is worth
+    -- more here than the pixel of control hand-placing bought, and the table brings its own rules and
+    -- row striping rather than drawing them.
     local cols = {}
     for _, nm in ipairs(rezPriority) do
         local ds = DI.state[nm]
         if ds and (ds.staff or -1) >= 0 then cols[#cols + 1] = nm end
     end
     if #cols == 0 then ImGui.TextDisabled('no DI staff reports'); return end
+
+    local labelW, nameW = ui_fit_w('Staff', 40), 0
+    pcall(function()
+        for _, nm in ipairs(cols) do
+            local w = ImGui.CalcTextSize(nm) or 0
+            if w > nameW then nameW = w end
+        end
+    end)
+    nameW = math.ceil(nameW) + 10
+
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
     if not ImGui.BeginTable('##dimini', 1 + #cols, flags) then return end
-    ImGui.TableSetupColumn('')
-    for _, nm in ipairs(cols) do ImGui.TableSetupColumn(nm:sub(1, 9)) end
+    ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, labelW)
+    for _, nm in ipairs(cols) do
+        ImGui.TableSetupColumn(nm, ImGuiTableColumnFlags.WidthFixed or 0, nameW)
+    end
     ImGui.TableHeadersRow()
     ImGui.TableNextRow()
     ImGui.TableNextColumn()
-    ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Staff')
+    ui_text(UI_LABEL, 'Staff')
     for _, nm in ipairs(cols) do
         ImGui.TableNextColumn()
         local ds = DI.state[nm]
-        rez_cell(ds and ds.staff or -1, ds and ds.updated)
+        rez_cell(ds and ds.staff or -1, ds and ds.updated, 'di:' .. nm)
     end
     ImGui.EndTable()
 end
@@ -9271,8 +10277,10 @@ function magic_click(key)
 end
 
 CURE_CLICKS = {
-    { key = 'radiant', label = 'Radiant Cure',   name = 'Radiant Cure' },
-    { key = 'band',    label = 'Cleansing Band', name = 'Cleansing Band of Twilight' },
+    -- LABEL is what the row is titled; NAME is the item the client looks up and must stay exact.
+    -- Shortened because these titles sit in front of a row of names and were a third of its width.
+    { key = 'radiant', label = 'Radiant',   name = 'Radiant Cure' },
+    { key = 'band',    label = 'Cleansing', name = 'Cleansing Band of Twilight' },
 }
 cureState = {}   -- driver: cureState[char][key] = { have, secs, updated }
 cureLast  = {}   -- worker: last-pushed key per source
@@ -9405,9 +10413,12 @@ function draw_magic_buttons()
         end
         if #btns > 0 then
             drewAny = true
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, g)
+            ui_text(UI_LABEL, g)
+            ui_row_reset()
+            ImGui.SameLine()
+            uiRowStarted = true
             for bi, b in ipairs(btns) do
-                ImGui.SameLine()
+                ui_row_item(ui_fit_w(b.nm .. ' 00:00', UI_BTN_W))
                 local age  = math.floor((mq.gettime() - (b.st.updated or 0)) / 1000)
                 local left = math.max(0, (b.st.dsecs or 0) - age)
                 local r    = b.st.secs or -1
@@ -9425,13 +10436,20 @@ function draw_magic_buttons()
                 end
                 local face = b.nm
                 if (perName[b.nm] or 0) > 1 then face = b.nm .. ' ' .. (b.e.short or b.e.key) end
-                local pushed = push_state_button(cr, cg, cb)
+                -- SAME SHAPE AS REZ AND NIGHTVEIL. Three states, three appearances: a name you can press
+                -- when it is up, a cyan pill while it is RUNNING - which is information the old greyed
+                -- button threw away entirely - and a countdown pill while it is cooling.
                 -- QUEUED, NOT CLICKED HERE. magic_click casts, and peer_cmdf can wait on channel
                 -- detection - both are yields, and a yield in an ImGui callback is a hard client crash.
-                if ImGui.SmallButton(face .. '##at_magic_' .. b.e.key .. '_' .. b.nm) then
-                    magicWanted = { key = b.e.key, nm = b.nm }
+                if b.st.up == 1 and left > 0 then
+                    ui_pill(string.format('%d:%02d', math.floor(left / 60), left % 60), { 90, 210, 255 }, UI_BTN_W)
+                elseif r <= 0 then
+                    if ui_name_button(face, 'at_magic_' .. b.e.key .. '_' .. b.nm, UI_READY) then
+                        magicWanted = { key = b.e.key, nm = b.nm }
+                    end
+                else
+                    ui_pill(string.format('%d:%02d', math.floor(r / 60), r % 60), { 217, 89, 89 }, UI_BTN_W)
                 end
-                pop_state_button(pushed)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     pcall(function()
                         ImGui.SetTooltip(string.format('%s - %s\n  %s', b.nm, b.e.label, tip))
@@ -9457,9 +10475,12 @@ function draw_cure_buttons()
         end
         if #owners > 0 then
             drewAny = true
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.label)
+            ui_text(UI_LABEL, e.label)
+            ui_row_reset()
+            ImGui.SameLine()
+            uiRowStarted = true   -- the label is already on this line
             for oi, o in ipairs(owners) do
-                ImGui.SameLine()
+                ui_row_item(ui_fit_w(o.nm, UI_BTN_W))
                 local r = o.st.secs or -1
                 if r > 0 then r = math.max(0, r - math.floor((mq.gettime() - (o.st.updated or 0)) / 1000)) end
                 local cr, cg, cb
@@ -9467,12 +10488,19 @@ function draw_cure_buttons()
                 elseif r < 60 then      cr, cg, cb = 0.95, 0.85, 0.30
                 elseif r < 300 then     cr, cg, cb = 0.95, 0.62, 0.25
                 else                    cr, cg, cb = 0.85, 0.35, 0.35 end
-                local pushed = push_state_button(cr, cg, cb)
-                if ImGui.SmallButton(o.nm .. '##at_cure_' .. e.key .. '_' .. o.nm) then
-                    if o.nm:lower() == myName:lower() then cure_click(e.key)
-                    else peer_cmdf(o.nm, '/at_cure %s', e.key) end
+                -- Same shape as the rest: a name while it can fire, a countdown pill while it cannot.
+                if r <= 0 then
+                    if ui_name_button(o.nm, 'at_cure_' .. e.key .. '_' .. o.nm, UI_READY) then
+                        if o.nm:lower() == myName:lower() then cure_click(e.key)
+                        else peer_cmdf(o.nm, '/at_cure %s', e.key) end
+                    end
+                else
+                    local rgb
+                    if r < 60 then      rgb = { 242, 217,  77 }
+                    elseif r < 300 then rgb = { 242, 158,  64 }
+                    else                rgb = { 217,  89,  89 } end
+                    ui_pill(string.format('%d:%02d', math.floor(r / 60), r % 60), rgb, UI_BTN_W)
                 end
-                pop_state_button(pushed)
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     pcall(function()
                         ImGui.SetTooltip(string.format('%s - %s\n  %s', o.nm, e.label,
@@ -9533,9 +10561,7 @@ end
 function draw_wipe_button(tag)
     local settled = (mq.gettime() - (rezWipeFlipAt or 0)) > 500
     if rezWipe then
-        ImGui.PushStyleColor(ImGuiCol.Button, 0.55, 0.32, 0.12, 1.0)
-        local hit = ImGui.SmallButton('Clear wipe##wipe' .. tag)
-        pop_state_button(1)
+        local hit = ui_stop_button('##wipe' .. tag, true)
         if hit and settled then
             rezWipe, rezWipeFlipAt = false, mq.gettime()
             pcall(function() peer_bcast('/at_wipe off') end)
@@ -9546,8 +10572,11 @@ function draw_wipe_button(tag)
                 'Rezzes are HELD. Clears itself when this character zones,\nor press this to start again now.') end)
         end
         ImGui.SameLine()
-        ImGui.TextColored(0.95, 0.62, 0.25, 1.0, 'WIPE - rezzes held')
+        ui_text(UI_WAIT, 'WIPE - rezzes held')
     else
+        -- TEXT WHEN IT IS OFF, the sign when it is on. A word is clearer for a control you are reading
+        -- calmly; the octagon earns its place as a STATE - rezzes are stopped - which is the thing you
+        -- need to spot from across the window without reading anything.
         if ImGui.SmallButton('Wipe##wipe' .. tag) and settled then
             rezWipe, rezWipeFlipAt = true, mq.gettime()
             pcall(function() peer_bcast('/at_wipe on') end)
@@ -9569,8 +10598,13 @@ function draw_chain_modes(names, wide)
         local md = chain_mode(nm)
         if md == 'off' then      ImGui.PushStyleColor(ImGuiCol.Text, 0.90, 0.35, 0.35, 1.0)
         elseif md == 'raid' then ImGui.PushStyleColor(ImGuiCol.Text, 0.74, 0.55, 0.96, 1.0)
-        else                     ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0) end
-        if ImGui.SmallButton(nm:sub(1, 9) .. '##skip_' .. (wide and 'w' or 'm') .. nm) then
+        else                     ui_push_text(UI_READY) end
+        -- AS MUCH NAME AS FITS IN THE MINI, NINE IN THE TAB. The mini's rez table puts six of these over
+        -- columns whose content is one dot, so nine letters each was setting the width of the entire
+        -- window. The Rez tab has the room and keeps the long form; the tooltip carries the full name
+        -- either way, and the colour - which is the actual state - is unaffected by the length.
+        if ImGui.SmallButton(nm:sub(1, wide and 9 or (uiChainNameLen or 4)) .. '##skip_'
+                             .. (wide and 'w' or 'm') .. nm) then
             local nxt = (md == 'group') and 'off' or ((md == 'off') and 'raid' or 'group')
             chainMode[nm:lower()] = (nxt ~= 'group') and nxt or nil
             save_settings()
@@ -9604,13 +10638,32 @@ local function draw_rez_mini()
     if #cols == 0 then ImGui.TextDisabled('rez: no crown/token reports'); return end
     local flags = (ImGuiTableFlags.BordersInnerV or 0) + (ImGuiTableFlags.RowBg or 0)
                 + (ImGuiTableFlags.SizingFixedFit or 0)
+    -- SAME TREATMENT AS BURNS. The truncation and the forced outer size both came from chasing a width
+    -- that would not shrink; that was pop_align's latched right edge, not this table. Full names, plain
+    -- BeginTable, columns measured from what actually goes in them.
+    -- The scope buttons are real buttons, so a column has to hold a frame around the name - ui_fit_w is
+    -- the same number the button itself will use. The dots underneath are smaller and fit either way.
+    uiChainNameLen = 99            -- draw_chain_modes shows the whole name in the mini again
+    local rLabelW = ui_fit_w('Crown', 44)
+    local rNameW = 0
+    pcall(function()
+        for _, nm in ipairs(cols) do
+            local w = ui_fit_w(nm, 0)
+            if w > rNameW then rNameW = w end
+        end
+    end)
+    if rNameW <= 0 then rNameW = 60 end
     if not ImGui.BeginTable('##rezmini', 1 + #cols, flags) then return end
-    ImGui.TableSetupColumn('')
-    for _, nm in ipairs(cols) do ImGui.TableSetupColumn('') end
+    ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, rLabelW)
+    for _, nm in ipairs(cols) do
+        ImGui.TableSetupColumn('', ImGuiTableColumnFlags.WidthFixed or 0, rNameW)
+    end
     -- Clickable scope buttons, one per character - see draw_chain_modes.
     ImGui.TableNextRow()
     ImGui.TableNextColumn()
-    ImGui.TextDisabled('click a name')
+    -- The 'click a name' hint is gone. It cost a full row of the densest panel in the window to say
+    -- something the buttons themselves already say by looking clickable, and it only ever needed
+    -- reading once. The Rez tab still carries the long form for anyone who wants it spelled out.
     for _, nm in ipairs(cols) do
         ImGui.TableNextColumn()
         draw_chain_modes({ nm }, false)
@@ -9618,11 +10671,11 @@ local function draw_rez_mini()
     local function row(which, label)
         ImGui.TableNextRow()
         ImGui.TableNextColumn()
-        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, label)
+        ui_text(UI_LABEL, label)
         for _, nm in ipairs(cols) do
             ImGui.TableNextColumn()
             local rr = rezReady[nm]
-            rez_cell(rr and rr[which] or -1, rr and rr.updated)
+            rez_cell(rr and rr[which] or -1, rr and rr.updated, 'rez:' .. nm .. ':' .. which)
         end
     end
     -- CotW on top: it fires first, so it reads first. rez_cell already renders -1 as 'doesn't own',
@@ -9634,7 +10687,7 @@ local function draw_rez_mini()
     if rezDivine or rezCotw then
         ImGui.TableNextRow()
         ImGui.TableNextColumn()
-        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'AA Rez')
+        ui_text(UI_LABEL, 'AA')   -- 'Rez' on a row inside the Rez panel was saying it twice
         for _, nm in ipairs(cols) do
             ImGui.TableNextColumn()
             local rr = rezReady[nm]
@@ -9725,7 +10778,7 @@ function draw_rez_tab()
             draw_wipe_button('tab')
             ImGui.Separator()
             ImGui.Spacing()
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Who rezzes')
+            ui_text(UI_LABEL, 'Who rezzes')
             ImGui.TextDisabled('click a name: green group only, red none, purple group AND raid')
             draw_chain_modes(rezPriority, true)
             ImGui.Separator()
@@ -9800,7 +10853,7 @@ function draw_rez_tab()
             end
             -- Rezzer Order: the reorderable slot list that DRIVES the baton. Arrows reorder; unowned slots are hidden.
             -- Green = ready, red + M:SS = on cooldown. Token-before-crown, tank last is just the default - rearrange freely.
-            ImGui.Spacing(); ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Rezzer Order')
+            ImGui.Spacing(); ui_text(UI_LABEL, 'Rezzer Order')
             if #rezOrder == 0 then load_rez_order() end
             -- PINNED, so no arrows: these sit ahead of the list by rule, not by arrangement. Showing them
             -- here anyway matters - the order that actually runs is what you want to be looking at.
@@ -9833,7 +10886,7 @@ function draw_rez_tab()
             end
             if ImGui.SmallButton('Reset order to default') then rezOrder = default_rez_order(); save_rez_order(); bcast_rez_order() end
             if #rezLog > 0 then
-                ImGui.Spacing(); ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Recent rezzes')
+                ImGui.Spacing(); ui_text(UI_LABEL, 'Recent rezzes')
                 for _, l in ipairs(rezLog) do ImGui.TextDisabled(l) end
             end
 
@@ -9905,6 +10958,11 @@ function mgb_button_state(nm, cfg)
     if not st then return 'unknown', {} end
     local age  = math.floor((mq.gettime() - (st.updated or 0)) / 1000)
     local rows, down = {}, false
+    -- THE LONGEST REMAINING AMONG THE THINGS THAT GATE THE PRESS. Every one of these numbers was already
+    -- being computed and then spent only on a tooltip line; the button itself said nothing but "red".
+    -- Worst rather than shortest, because the press needs ALL of them - the same reasoning as the group
+    -- draughts, where the number that matters is when the whole thing is available.
+    local worst = 0
     -- gates=false: shown in the tooltip but NOT counted against the colour. MGB out of raid is the
     -- only case - the press will not use it, so it should be visible without turning the button red.
     local function add(label, s, gates, note)
@@ -9916,7 +10974,7 @@ function mgb_button_state(nm, cfg)
             local r = math.max(0, s - age)
             if r > 0 then
                 txt = string.format('%s  %d:%02d', label, math.floor(r / 60), r % 60)
-                if gates then down = true end
+                if gates then down = true; if r > worst then worst = r end end
             else
                 txt = label .. '  ready'
             end
@@ -9925,7 +10983,7 @@ function mgb_button_state(nm, cfg)
     end
     add(MGB_AA, st.mgb or -1, st.raid, st.raid and '' or '   (unused - not in raid)')
     for i, ab in ipairs(cfg.abils) do add(ab, (st.aas or {})[i] or -1, true) end
-    return (down and 'down' or 'ready'), rows, st.raid
+    return (down and 'down' or 'ready'), rows, st.raid, worst
 end
 
 -- Mini: one button per configured combo. Colour is the WORST of its members - green only when every
@@ -9935,6 +10993,7 @@ function draw_combo_buttons()
     for ci, c in ipairs(COMBOS) do
         if #(c.members or {}) > 0 then
             local worst, rows, present = 'ready', {}, 0
+            local worstSecs = 0
             for _, m in ipairs(c.members) do
                 local cls, key = combo_parse(m)
                 local e = key and mgb_entry(key)
@@ -9948,9 +11007,13 @@ function draw_combo_buttons()
                     rows[#rows + 1] = ((cls and e) and mgb_label(cls, e) or m) .. '  not in group'
                 else
                     present = present + 1
-                    local st, srows = mgb_button_state(who, e)
+                    local st, srows, _, ws = mgb_button_state(who, e)
                     if st == 'down' then worst = 'down'
                     elseif st == 'unknown' and worst ~= 'down' then worst = 'unknown' end
+                    -- THE COMBO IS ONLY AS READY AS ITS SLOWEST MEMBER. Each member already knows its
+                    -- own longest cooldown; the combo takes the largest of those, which is when the
+                    -- whole press actually lands rather than when the first of them is up.
+                    if (ws or 0) > worstSecs then worstSecs = ws end
                     rows[#rows + 1] = who .. '  (' .. mgb_label(cls, e) .. ')'
                     for _, r in ipairs(srows) do rows[#rows + 1] = '   ' .. r end
                 end
@@ -9962,8 +11025,14 @@ function draw_combo_buttons()
             elseif worst == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
             elseif worst == 'unknown' then cr, cg, cb = 0.55, 0.55, 0.55
             else                        cr, cg, cb = 0.36, 0.80, 0.46 end
+            local clabel = combo_label(c)
+            local cface = clabel
+            if worstSecs > 0 then
+                cface = string.format('%s %d:%02d', clabel, math.floor(worstSecs / 60), worstSecs % 60)
+            end
             local pushed = push_state_button(cr, cg, cb)
-            if ImGui.SmallButton(combo_label(c) .. '##at_combo_' .. ci) and present > 0 then combo_fire(c) end
+            if ImGui.Button(cface .. '##at_combo_' .. ci, ui_fit_w(clabel .. ' 00:00', UI_BTN_W), 0)
+               and present > 0 then combo_fire(c) end
             pop_state_button(pushed)
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 local lines = { combo_label(c) }
@@ -9991,13 +11060,21 @@ function draw_mgb_buttons()
                 if not first then ImGui.SameLine() end
                 first = false
                 local label = mgb_label(cls, e) .. ((seen[cls] or 0) > 1 and (' (' .. nm .. ')') or '')
-                local state, rows, raiding = mgb_button_state(nm, e)
+                local state, rows, raiding, worst = mgb_button_state(nm, e)
                 local cr, cg, cb
                 if state == 'unknown'  then cr, cg, cb = 0.55, 0.55, 0.55
                 elseif state == 'down' then cr, cg, cb = 0.85, 0.35, 0.35
                 else                        cr, cg, cb = 0.36, 0.80, 0.46 end
+                -- STAYS A BUTTON. Like the group draughts and unlike a cure, a press here is still worth
+                -- making while something is down - so the countdown rides on the label rather than
+                -- replacing the control with a readout.
+                local face = label
+                if (worst or 0) > 0 then
+                    face = string.format('%s %d:%02d', label, math.floor(worst / 60), worst % 60)
+                end
                 local pushed = push_state_button(cr, cg, cb)
-                if ImGui.SmallButton(label .. '##at_mgb_' .. nm .. '_' .. e.key) then
+                if ImGui.Button(face .. '##at_mgb_' .. nm .. '_' .. e.key,
+                                ui_fit_w(label .. ' 00:00', UI_BTN_W), 0) then
                     if nm:lower() == myName:lower() then mgb_click(e.key)
                     else peer_cmdf(nm, '/at_mgbclick %s', e.key) end
                 end
@@ -10014,8 +11091,14 @@ function draw_mgb_buttons()
 end
 
 function draw_pot_buttons()
+    -- ONE WIDTH FOR THE ROW, measured once from the widest label plus room for a timer. Sizing each
+    -- button to its own text would make them jump as countdowns appear and vanish, and sizing them all
+    -- to a guess is what clipped "Group Shimmering" down to "Group Shimm".
+    local potW = 0
+    for _, p in ipairs(GROUP_POTS) do potW = ui_fit_w(p.label .. ' 00:00', potW) end
+    ui_row_reset()
     for i, p in ipairs(GROUP_POTS) do
-        if i > 1 then ImGui.SameLine() end
+        ui_row_item(potW)
         local total, upN, readyN, worst, rows, none, unknown = pot_group_state(p.key)
         local cr, cg, cb
         if total == 0 then                     cr, cg, cb = 0.55, 0.55, 0.55   -- grey: nothing known / nobody carries any
@@ -10026,8 +11109,23 @@ function draw_pot_buttons()
         elseif worst < 300 then                cr, cg, cb = 0.95, 0.62, 0.25   -- orange
         else                                   cr, cg, cb = 0.85, 0.35, 0.35   -- red: a long way out
         end
+        -- ONE BUTTON FOR THE WHOLE GROUP, so the readout has to be the whole group's answer. pot_group_
+        -- state already returns `worst` - the longest remaining across everyone - and that is the right
+        -- number: it is when the group can ALL click, which is what a group button is for. Showing the
+        -- shortest, or nothing, would invite a press that only half the group answers.
+        -- Cyan while it is running on everyone, because "already up" and "ready to press" are different
+        -- answers and the old colour-only version made you read the tooltip to tell them apart.
+        -- THE LABEL CARRIES THE WORST COOLDOWN, and the button stays pressable. pot_group_state already
+        -- returns `worst` - the longest remaining across everyone - and that is the right number for a
+        -- group button: it says when the whole group can click, which is the thing you are waiting for.
+        -- NOT a pill. A cure on cooldown genuinely cannot fire, so a readout is honest there; this one
+        -- still fires for everybody who IS ready, and turning it into a readout would take that away.
+        local face = p.label
+        if total > 0 and (worst or 0) > 0 and readyN < total then
+            face = string.format('%s %d:%02d', p.label, math.floor(worst / 60), worst % 60)
+        end
         local pushed = push_state_button(cr, cg, cb)
-        if ImGui.SmallButton(p.label .. '##at_pot_' .. p.key) then group_pot(p.key) end
+        if ImGui.Button(face .. '##at_pot_' .. p.key, potW, 0) then group_pot(p.key) end
         pop_state_button(pushed)
         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
             local lines = { string.format('%s  %d/%d up, %d/%d can click', p.label, upN, total, readyN, total) }
@@ -13346,6 +14444,79 @@ end
 -- names makes you find the healers by reading rather than by looking.
 -- Colour is the state: green ready, amber counting down, grey unusable (no emblem in a charm). A name
 -- that is grey is not a missing button, it is a character whose emblem is in the wrong place.
+-- WHAT CAN THIS BINDING ACTUALLY DRAW? Set by /atdraw, consumed on the next frame inside a real window
+-- so GetWindowDrawList() returns something valid - it cannot be answered from a command line, because
+-- outside a draw callback there is no list to ask.
+-- Prints once and clears itself.
+uiDrawProbe = false
+
+function ui_draw_probe()
+    if not uiDrawProbe then return end
+    uiDrawProbe = false
+    local dl = nil
+    local ok = pcall(function() dl = ImGui.GetWindowDrawList() end)
+    if not ok or not dl then log('\\ar[draw] no draw list available in this binding\\ax'); return end
+    local names = { 'AddLine', 'AddRect', 'AddRectFilled', 'AddCircle', 'AddCircleFilled',
+                    'AddTriangle', 'AddTriangleFilled', 'AddQuad', 'AddQuadFilled',
+                    'AddNgon', 'AddNgonFilled', 'AddText', 'AddBezierCubic', 'AddBezierQuadratic',
+                    'AddPolyline', 'AddConvexPolyFilled', 'AddImage', 'AddImageRounded',
+                    'PathClear', 'PathLineTo', 'PathArcTo', 'PathArcToFast', 'PathBezierCubicCurveTo',
+                    'PathStroke', 'PathFillConvex', 'PathRect',
+                    'PushClipRect', 'PopClipRect', 'AddRectFilledMultiColor' }
+    local have, missing = {}, {}
+    for _, n in ipairs(names) do
+        local present = false
+        pcall(function() present = (dl[n] ~= nil) end)
+        if present then have[#have + 1] = n else missing[#missing + 1] = n end
+    end
+    log('\\ag[draw] AVAILABLE (%d): %s\\ax', #have, table.concat(have, ', '))
+    log('\\ay[draw] missing (%d): %s\\ax', #missing, table.concat(missing, ', '))
+    -- The arc is the one worth knowing about - a cooldown RING needs PathArcTo + PathStroke, and a
+    -- present-but-broken binding is common enough that existing is not the same as working.
+    local arcOK = false
+    pcall(function()
+        local cx, cy = ImGui.GetCursorScreenPos()
+        dl:PathClear()
+        dl:PathArcTo(ImVec2(cx + 30, cy + 30), 10, 0, 3.14159)
+        dl:PathStroke(IM_COL32(120, 180, 255, 255), 0, 2)
+        arcOK = true
+    end)
+    log('%s[draw] PathArcTo + PathStroke actually ran: %s\\ax', arcOK and '\\ag' or '\\ar', tostring(arcOK))
+    -- Same question for ImVec2/IM_COL32 themselves, since a missing helper looks identical to a
+    -- missing draw method from the caller's side.
+    log('[draw] ImVec2=%s IM_COL32=%s GetFontSize=%s',
+        tostring(ImVec2 ~= nil), tostring(IM_COL32 ~= nil), tostring(ImGui.GetFontSize ~= nil))
+    -- EXERCISE THE LABEL PATH RATHER THAN WAITING FOR ONE. Pills are the WAITING state - they only
+    -- render when something is on cooldown, so on a quiet group the probe would report 'not drawn yet'
+    -- indefinitely and say nothing about whether AddText works. Draw one here, then read the flag.
+    pcall(function() ui_pill('probe', { 120, 180, 255 }) end)
+    log('[draw] label path: %s', uiDlTextOK == nil and 'not drawn yet'
+        or (uiDlTextOK and 'draw list (AddText)' or 'FALLBACK - text widgets, labels count toward width'))
+end
+
+-- IS THERE A NIGHTVEIL SECTION TO DRAW AT ALL? A group where nobody carries an emblem got a title, a
+-- separator, a hue dot, a fold caret and a pop grip wrapped around one line of grey text saying so -
+-- five pieces of chrome to report an absence. On a team without one that is permanent furniture.
+-- NOT THE SAME AS 'NOBODY IS REPORTING'. The empty-state message inside draw_nightveil distinguishes
+-- three kinds of empty on purpose, and two of them are faults worth seeing: a group that has not
+-- answered is a sync problem, not a quiet section. So this hides the section ONLY when the group is
+-- talking and the answer is genuinely 'none held'. Silence still draws, and still explains itself.
+function nv_has_rows()
+    local reporting = false
+    for _, nm in ipairs(ordered_members()) do
+        local st = nvState[nm]
+        if st and st.items then
+            reporting = true
+            for i = 1, #NV_SPLIT do
+                local s = st.items[i]
+                if s ~= nil and s >= 0 then return true end
+            end
+        end
+    end
+    -- Nobody has reported: keep the section so its message can say which kind of empty this is.
+    return not reporting
+end
+
 function draw_nightveil()
     -- FOUR FIXED ROWS, ONE PER ITEM. A character can hold all four, so membership is per ITEM rather
     -- than per character - somebody carrying the lot appears in every row and can be sent whichever one
@@ -13376,7 +14547,7 @@ function draw_nightveil()
         end
         if #holders > 0 then
             any = true
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.role .. ':')
+            ui_text(UI_LABEL, e.role .. ':')
             ImGui.SameLine()
             local nReady = 0
             for _, nm in ipairs(holders) do if ready[nm] then nReady = nReady + 1 end end
@@ -13392,13 +14563,25 @@ function draw_nightveil()
                 ImGui.SameLine()
             end
             for _, nm in ipairs(holders) do
-                local rdy = ready[nm]
-                if rdy then ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
-                else        ImGui.PushStyleColor(ImGuiCol.Text, 0.62, 0.62, 0.62, 1.0) end
-                if ImGui.SmallButton(nm:sub(1, 8) .. '##nv_' .. i .. '_' .. nm) then
-                    if rdy then click(nm, i) end
+                local rdy = nm and ready[nm]
+                -- READY SHOWS THE NAME, WAITING SHOWS THE CLOCK. A name you cannot click tells you
+                -- nothing new; the time left is the thing you actually want, and the tooltip carries
+                -- the name either way. Fixed width so the rows read as columns.
+                -- FULL NAME. It was cut to seven to fit a fixed-width button; the button measures
+                -- itself now, so there is nothing to cut it for.
+                local face = nm
+                if not rdy then
+                    local left = nvState[nm] and nvState[nm].items and nvState[nm].items[i]
+                    if (left or 0) > 0 then face = nv_hms(left) end
                 end
-                ImGui.PopStyleColor()
+                -- READY IS A BUTTON, WAITING IS A PILL. A clickable thing and an unclickable thing
+                -- should not look the same; the pill reads as a readout rather than a control you are
+                -- failing to press, and it carries the state as shape as well as colour.
+                if rdy then
+                    if ui_name_button(face, 'nv_' .. i .. '_' .. nm, UI_READY) then click(nm, i) end
+                else
+                    ui_pill(face, { 210, 140, 60 })
+                end
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     local s = nvState[nm] and nvState[nm].items and nvState[nm].items[i]
                     pcall(function() ImGui.SetTooltip(string.format('%s - %s\n%s', nm, e.item,
@@ -13472,7 +14655,7 @@ function draw_pacify()
         -- remembering not to queue mobs in their band.
         local off = pacOff[nm:lower()] and true or false
         if off then ImGui.PushStyleColor(ImGuiCol.Text, 0.90, 0.35, 0.35, 1.0)
-        else        ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0) end
+        else        ui_push_text(UI_READY) end
         if ImGui.SmallButton(string.format('%s %d##pacoff_%s', nm:sub(1, 6), c.cap or 0, nm)) then
             pacOff[nm:lower()] = (not off) or nil
             save_settings()
@@ -13575,9 +14758,12 @@ function draw_arcane_buttons()
     -- the space it was meant to save and tells you something you cannot act on. The section already
     -- hides rows nobody owns; this line was defeating that for the one row it applied to.
     if #btns == 0 then return end
-    ImGui.TextColored(0.85, 0.72, 0.35, 1.0, ARCANE)
+    ui_text(UI_LABEL, ARCANE)
+    ui_row_reset()
+    ImGui.SameLine()
+    uiRowStarted = true
     for _, b in ipairs(btns) do
-        ImGui.SameLine()
+        ui_row_item(ui_fit_w(b.nm, UI_BTN_W))
         local age = math.floor((mq.gettime() - (b.st.updated or 0)) / 1000)
         local r   = b.st.secs or -1
         if r > 0 then r = math.max(0, r - age) end
@@ -13590,12 +14776,19 @@ function draw_arcane_buttons()
             cr, cg, cb = 0.85, 0.35, 0.35
             tip = string.format('cooling, %d:%02d', math.floor(r / 60), r % 60)
         end
-        local pushed = push_state_button(cr, cg, cb)
-        if ImGui.SmallButton(b.nm .. '##at_arc_' .. b.nm) then
-            if b.nm:lower() == myName:lower() then arc_click()
-            else peer_cmdf(b.nm, '/at_arcane') end
+        -- Same three states as the magic clickies: a name while it can fire, a cyan pill while it is
+        -- RUNNING, a countdown pill while it cools. Running was already known here and only reached
+        -- the tooltip.
+        if b.st.up == 1 then
+            ui_pill(b.nm, { 90, 210, 255 })
+        elseif r <= 0 then
+            if ui_name_button(b.nm, 'at_arc_' .. b.nm, UI_READY) then
+                if b.nm:lower() == myName:lower() then arc_click()
+                else peer_cmdf(b.nm, '/at_arcane') end
+            end
+        else
+            ui_pill(string.format('%d:%02d', math.floor(r / 60), r % 60), { 217, 89, 89 })
         end
-        pop_state_button(pushed)
         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
             pcall(function() ImGui.SetTooltip(string.format('%s - %s\n  %s', b.nm, ARCANE, tip)) end)
         end
@@ -13678,7 +14871,7 @@ function draw_commands_tab()
     for _, e in ipairs(AT_COMMANDS) do
         if e.group then
             ImGui.Spacing()
-            ImGui.TextColored(0.85, 0.72, 0.35, 1.0, e.group)
+            ui_text(UI_LABEL, e.group)
             ImGui.Separator()
         else
             -- The command IS the button. Clicking copies it, because the thing you want after finding a
@@ -14280,27 +15473,40 @@ function draw_invis_picks()
         local hs = invis_holders(grp)
         if #hs > 0 then
             ImGui.TextDisabled('   ' .. grp .. ':')
+            -- STACKED THREE PER LINE, not one long row. Six holders at full-name width ran past the
+            -- edge - and since the mini auto-resizes, that widened the WINDOW rather than clipping.
+            -- Done by hand rather than through ui_row_item because the break here is a fixed count,
+            -- not a width: the columns should line up between the two rows regardless of name length.
             ImGui.SameLine()
-            for _, h in ipairs(hs) do
+            local perLine = 3
+            for hi, h in ipairs(hs) do
+                -- No SameLine on the first of each line; ImGui starts a new line by default.
+                if hi > 1 and ((hi - 1) % perLine) ~= 0 then ImGui.SameLine(0, 6) end
                 local picked = (invisPick[grp] == h.nm)
                 local ready  = (h.secs or 0) <= 0
-                if picked then      ImGui.PushStyleColor(ImGuiCol.Text, 0.40, 0.82, 0.45, 1.0)
-                elseif ready then   ImGui.PushStyleColor(ImGuiCol.Text, 0.78, 0.78, 0.78, 1.0)
-                else                ImGui.PushStyleColor(ImGuiCol.Text, 0.52, 0.52, 0.52, 1.0) end
-                if ImGui.SmallButton(h.nm:sub(1, 8) .. '##inv_' .. grp .. '_' .. h.nm) then
-                    -- ONE PICK PER ROW. Clicking the picked one clears it, so a row can be left out of
-                    -- the combo without having to pick somebody else instead.
-                    invisPick[grp] = (picked and nil) or h.nm
-                    save_settings()
+                -- SAME SHAPE AS NIGHTVEIL: a name you can press, or a pill counting down that you
+                -- cannot. A greyed-out name still looks like a button, so the old version invited a
+                -- click that did nothing; the pill reads as a readout instead.
+                if ready then
+                    if ui_name_button(h.nm, 'inv_' .. grp .. '_' .. h.nm,
+                                      picked and UI_READY or nil) then
+                        -- ONE PICK PER ROW. Clicking the picked one clears it, so a row can be left out
+                        -- of the combo without having to pick somebody else instead.
+                        invisPick[grp] = (picked and nil) or h.nm
+                        save_settings()
+                    end
+                else
+                    ui_pill(nv_hms(h.secs), { 150, 150, 158 })
                 end
-                ImGui.PopStyleColor()
                 if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                     pcall(function() ImGui.SetTooltip(string.format('%s - %s\n%s\nClick to %s',
                         h.nm, h.e.aa or h.e.name or h.e.spell or '?',
                         ready and 'ready' or (nv_hms(h.secs) .. ' left'),
                         picked and 'unpick' or 'pick for the combo')) end)
                 end
-                ImGui.SameLine()
+                -- The trailing SameLine that used to sit here forced every button onto one line and
+                -- would have defeated the wrap above. Spacing is decided at the TOP of the loop now,
+                -- which is the only place that knows whether this item starts a new line.
             end
             ImGui.NewLine()
         end
@@ -14320,19 +15526,23 @@ function draw_invis()
     -- everybody can make quickly - so the tooltip always spells it out in words, and a character with
     -- neither is dimmed as well as grey so "no invis" reads differently even if the hue does not.
     if miniInvisRows then
-        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Covered:')
+        ui_text(UI_LABEL, 'Covered:')
         ImGui.SameLine()
+        -- NAMES, BUT NOT BUTTONS. These were six full-width SmallButtons whose click result was thrown
+        -- away - controls that do nothing, paying a frame and its padding around every name for the
+        -- privilege. Dots were too far the other way: you had to count along the row to work out whose
+        -- was whose. Coloured text keeps the name and drops the chrome, which is most of the width.
         for _, nm in ipairs(ordered_members()) do
             local st = invisState[nm]
             local n  = (st and st.norm == 1)
             local u  = (st and st.und  == 1)
-            if n and u then      ImGui.PushStyleColor(ImGuiCol.Text, 0.72, 0.51, 0.90, 1.0)   -- purple
-            elseif u then        ImGui.PushStyleColor(ImGuiCol.Text, 0.95, 0.95, 0.95, 1.0)   -- white
-            elseif n then        ImGui.PushStyleColor(ImGuiCol.Text, 0.42, 0.66, 0.95, 1.0)   -- blue
-            else                 ImGui.PushStyleColor(ImGuiCol.Text, 0.48, 0.48, 0.48, 1.0)   -- dim grey
+            local rgb
+            if n and u then      rgb = { 184, 130, 230 }   -- purple: both
+            elseif u then        rgb = { 242, 242, 242 }   -- white:  invis to undead
+            elseif n then        rgb = { 107, 168, 242 }   -- blue:   invis
+            else                 rgb = { 100, 100, 106 }   -- dim:    nothing
             end
-            ImGui.SmallButton(nm:sub(1, 8) .. '##invst_' .. nm)
-            ImGui.PopStyleColor()
+            ImGui.TextColored(rgb[1] / 255, rgb[2] / 255, rgb[3] / 255, 1.0, nm:sub(1, 4))
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 local what = (n and u) and 'invis AND invis to undead'
                           or u and 'invis to undead only'
@@ -14340,7 +15550,7 @@ function draw_invis()
                           or (st and 'not invis' or 'no report yet')
                 pcall(function() ImGui.SetTooltip(nm .. ': ' .. what) end)
             end
-            ImGui.SameLine()
+            ImGui.SameLine(0, 5)
         end
         ImGui.NewLine()
     end
@@ -14449,12 +15659,19 @@ MINI_SECTIONS = {
       get = function() return miniRez end,    set = function(v) miniRez = v end },
     { key = 'di',     label = 'DI staff',              draw = draw_di_mini,
       get = function() return miniDI end,     set = function(v) miniDI = v end },
+    { key = 'running', label = 'Running now',      draw = draw_burn_running,
+      get = function() return miniRunning end,  set = function(v) miniRunning = v end },
+    { key = 'timeline', label = 'Burn timeline',   draw = draw_burn_timeline,
+      get = function() return miniTimeline end, set = function(v) miniTimeline = v end },
     { key = 'burns',  label = 'Burns',
       draw = function()
           -- THREE VIEWS, smallest first: compact (name + ready count + dots), the tier matrix, then
           -- the full table. miniBurnView supersedes the old miniBurnTable boolean, which could only
           -- say "matrix or table"; the loader below migrates the old value so nobody loses their choice.
-          if miniBurnView == 0 then draw_burn_compact(); return end
+          if miniBurnView == 0 then
+              draw_burn_compact()
+              return
+          end
           if miniBurnView == 1 then draw_burn_dots(); return end
           for i, f in ipairs({ 'All', 'Tank', 'DPS', 'Healer' }) do
               if i > 1 then ImGui.SameLine() end
@@ -14468,8 +15685,6 @@ MINI_SECTIONS = {
               end
               pop_state_button(pushed)
           end
-          ImGui.SameLine()
-          if ImGui.SmallButton('fit##at_minifit') then miniSizeWanted = true end
           draw_burn_table(miniBurnFilter)
       end,
       get = function() return miniBurns end,  set = function(v) miniBurns = v end },
@@ -14495,7 +15710,8 @@ MINI_SECTIONS = {
     { key = 'coth',   label = 'CoTH Group button',     draw = draw_coth_mini,
       get = function() return miniCoth end,   set = function(v) miniCoth = v end },
     { key = 'nightveil', label = 'Nightveil Emblems',    draw = draw_nightveil,
-      get = function() return miniNightveil end, set = function(v) miniNightveil = v end },
+      get = function() return miniNightveil end, set = function(v) miniNightveil = v end,
+      has = nv_has_rows },
     { key = 'pacify',  label = 'Pacify',                  draw = draw_pacify,
       get = function() return miniPacify end, set = function(v) miniPacify = v end },
 }
@@ -14515,6 +15731,10 @@ function mini_order_normalise()
     -- only placate view, so an old layout keeps its position rather than losing the entry.
     local MERGED = { cures = 'protect', magic = 'protect', arcane = 'protect', pots = 'protect',
                      mgb = 'groupheals', combos = 'groupheals', placate = 'pacify',
+                     -- 'track' was the merged burn axis, tried in 1.17.55 and reverted. Anyone whose
+                     -- settings were written while it existed has it in their order; map it back to
+                     -- 'running' so that slot is kept rather than dropped as an unknown key.
+                     track = 'running',
                      -- The monk phantom panel was the same thing as the manual placate panel:
                      -- an add-target button and a clear, for a queue Pacify already fills.
                      phantom = 'pacify' }
@@ -14828,7 +16048,7 @@ function draw_burn_table(filter)
                     end
                     local frac = (tot > 0) and (rdy / tot) or 0
                     if frac >= 0.66 then      ImGui.TextColored(0.36, 0.80, 0.46, 1.0, string.format('%d/%d ready', rdy, tot))
-                    elseif frac >= 0.33 then  ImGui.TextColored(0.95, 0.62, 0.25, 1.0, string.format('%d/%d ready', rdy, tot))
+                    elseif frac >= 0.33 then  ui_text(UI_WAIT, string.format('%d/%d ready', rdy, tot))
                     else                      ImGui.TextColored(0.85, 0.35, 0.35, 1.0, string.format('%d/%d ready', rdy, tot)) end
                 end
 
@@ -14842,7 +16062,7 @@ function draw_burn_table(filter)
                         -- - four tiers meant 24 repetitions of text that says nothing new.
                         ImGui.TableNextRow()
                         ImGui.TableNextColumn()
-                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, tinfo.label)
+                        ui_text(UI_LABEL, tinfo.label)
                         ImGui.TableNextRow()
                         for _, c in ipairs(chars) do
                             ImGui.TableNextColumn()
@@ -14887,6 +16107,25 @@ end
 -- 'build your own layout' means. Nothing else had to change, because every place that asked 'is this
 -- popped' was really asking 'is this somewhere other than the mini'.
 popOut = {}          -- section key -> panel number, or nil for the mini
+-- THE ORDER YOU BUILT IT IN. A panel used to draw its sections in miniOrder, which is the order they sit
+-- in the mini window - fine as a default, wrong once somebody has deliberately assembled a window.
+-- Dropping Pacify onto a panel that already holds Rez should put it UNDER Rez, because that is what the
+-- gesture said; re-sorting it above because the mini happens to list it first ignores the instruction.
+-- A counter that only goes up, stamped when a section is placed, gives that for nothing.
+popSeq = {}
+popSeqN = 0
+function pop_place(key, panel)
+    popOut[key] = panel
+    if panel then
+        popSeqN = popSeqN + 1
+        popSeq[key] = popSeqN
+    else
+        popSeq[key] = nil     -- back in the mini: it follows miniOrder again
+    end
+    -- Every window involved just changed what it contains, so the latched right edge is stale. Drop it
+    -- all and let the next frame measure the real content again - see pop_align.
+    POP_RIGHT = {}
+end
 POP_PANELS = 8       -- room to pop several out individually and still merge some together
 
 -- DRAG A SECTION FROM ONE WINDOW TO ANOTHER, the way a browser tab moves between windows.
@@ -14931,6 +16170,14 @@ end
 -- Returns true if it was CLICKED, so the caller decides what a click means in its context.
 function pop_grip(key, panel)
     local clicked = ImGui.SmallButton(POP_ICON .. '##grip_' .. tostring(key))
+    -- Measure it once, here, where the real button exists. pop_align needs the exact footprint and
+    -- guessing at the theme's frame padding is what a creeping panel is made of.
+    if not POP_ICON_W then
+        pcall(function()
+            local iw = ImGui.GetItemRectSize()
+            if iw and iw > 0 then POP_ICON_W = iw end
+        end)
+    end
     if ImGui.IsItemHovered and ImGui.IsItemHovered() then
         pcall(function() ImGui.SetTooltip(panel
             and 'Click: send this back to the mini\nDrag: move it onto another window'
@@ -15015,7 +16262,9 @@ function pop_drop_target(panel)
             -- Said once with the type, so a shape we do not handle names itself instead of failing mute.
             local key = pop_payload_key(payload)
             if key and mini_section(key) then
-                popOut[key] = panel
+                -- Through pop_place, so a dropped section is stamped and lands at the BOTTOM of the
+                -- window it was dropped on - which is where the gesture pointed.
+                pop_place(key, panel)
                 save_settings()
                 log('[pop] %s moved to %s', key, panel and ('panel ' .. panel) or 'the mini')
             elseif not POP_SAID_PAYLOAD then
@@ -15034,8 +16283,15 @@ local function draw_popouts()
         local mine = {}
         for _, k in ipairs(miniOrder) do
             local sec = mini_section(k)
-            if sec and sec.draw and popOut[k] == p then mine[#mine + 1] = sec end
+            if sec and sec.draw and popOut[k] == p then
+                mine[#mine + 1] = sec
+                sec._seq = popSeq[k] or 0
+            end
         end
+        -- In the order they were placed here. A section with no stamp - loaded from an older settings
+        -- file - sorts first and keeps its relative miniOrder position, so an existing layout is not
+        -- shuffled by the upgrade.
+        table.sort(mine, function(a, b) return (a._seq or 0) < (b._seq or 0) end)
         if #mine > 0 then
             -- TITLED BY ITS CONTENTS. A window called 'Panel 2' tells you nothing once you have three of
             -- them; one called 'Pacify + Rez' is self-describing and updates itself as you move things.
@@ -15061,7 +16317,7 @@ local function draw_popouts()
             if not show then
                 -- Closing a panel sends everything in it home, rather than leaving sections in a window
                 -- that is not on screen - which would look exactly like they had vanished.
-                for _, s in ipairs(mine) do popOut[s.key] = nil end
+                for _, s in ipairs(mine) do pop_place(s.key, nil) end
                 save_settings()
             else
                 -- The zone sits at the TOP, where the cursor already is after dragging onto the window.
@@ -15080,16 +16336,9 @@ local function draw_popouts()
                     -- Title first, control at the right - the same arrangement as the mini, so a section
                     -- looks and behaves identically wherever it happens to be living.
                     ImGui.TextDisabled(s.label)
-                    ImGui.SameLine()
-                    pcall(function()
-                        local availW = ImGui.GetContentRegionAvail()
-                        local w = ImGui.CalcTextSize(POP_ICON) + 14
-                        if availW and availW > w + 20 then
-                            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + availW - w)
-                        end
-                    end)
+                    pop_align(p)
                     if pop_grip(s.key, p) then
-                        popOut[s.key] = nil
+                        pop_place(s.key, nil)
                         save_settings()
                     end
                     pop_drag_source(s.key, s.label)
@@ -15098,10 +16347,21 @@ local function draw_popouts()
                 end
                 -- WHOLE-WINDOW DROP ZONE. An invisible button over the remaining space, so anywhere in
                 -- the window accepts a drop rather than only the exact title text.
-                local availX, availY = ImGui.GetContentRegionAvail()
-                if availY and availY > 4 then
-                    ImGui.InvisibleButton('##at_drop_' .. p, math.max(availX or 40, 40), availY)
-                    pop_drop_target(p)
+                -- ONLY WHILE SOMETHING IS BEING DRAGGED - and that is not a nicety, it is the whole
+                -- reason this window could not shrink. GetContentRegionAvail in an AlwaysAutoResize
+                -- window reports the space the CURRENT size leaves over, and the button then claimed
+                -- every pixel of it; so the content was always exactly as large as the window, and the
+                -- window is sized from its content. Grow it once - open Pacify - and it stayed there
+                -- forever, re-asserting its own width every frame. The same one-way ratchet as
+                -- pop_align, in a different disguise: a size computed from the size it decides.
+                -- pop_drop_zone above already had the answer. There is nothing to drop when nothing is
+                -- being dragged, so at rest this draws nothing and the window is free to fall in.
+                if pop_dragging() then
+                    local availX, availY = ImGui.GetContentRegionAvail()
+                    if availY and availY > 4 then
+                        ImGui.InvisibleButton('##at_drop_' .. p, math.max(availX or 40, 40), availY)
+                        pop_drop_target(p)
+                    end
                 end
             end
             ImGui.End()
@@ -15110,6 +16370,19 @@ local function draw_popouts()
 end
 
 local function render()
+    -- NOT WHILE THE CLIENT IS ZONING.
+    -- The main loop is guarded by client_ready(), but this is not the main loop - ImGui calls this on the
+    -- client's own frame, so it keeps drawing straight through a zone while the loop is correctly asleep.
+    -- Everything it draws is read from the client: spawn names, distances, buff timers, item ids. During a
+    -- zone the client is tearing those structures down and rebuilding them, and asking for them then is
+    -- the one thing AT does that could plausibly hand it a null.
+    -- The crash on 2026-08-18 20:49 was a null write inside eqgame.exe on a zone, with AT otherwise idle -
+    -- which is exactly what this would look like from the outside.
+    -- Drawing nothing for the second or two of a zone costs nothing: there is nothing to look at anyway.
+    -- `client_ready and` because the callback is registered at line ~15818 and the function is defined
+    -- further down, and there ARE yields in between - so a frame can be drawn before it exists. Without
+    -- the nil check that would throw on exactly the startup frames this is meant to protect.
+    if client_ready and not client_ready() then return end
     -- The pop-outs stand on their own: they are drawn even when the main window is closed, which is the
     -- entire point of popping something out.
     draw_popouts()
@@ -15134,15 +16407,85 @@ local function render()
         if (miniBurns and miniBurnView == 2) and not miniSizedOnce then
             miniSizedOnce = true; miniSizeWanted = true
         end
+        -- NO 'fit' BUTTON. Asking the user to press something because the window got the wrong size is
+        -- making them do the program's job. The size depends on the view and on how many characters are
+        -- reporting, so watch exactly those and re-fit when either moves - which covers every case the
+        -- button was there to paper over, without a control to look at.
+        do
+            local n = 0
+            for _, c in ipairs(ordered_members()) do
+                if burnState[c] and (miniBurnFilter == 'All' or role_of(burnClass[c]) == miniBurnFilter) then
+                    n = n + 1
+                end
+            end
+            -- A SECTION APPEARING OR VANISHING IS A SHAPE CHANGE. has() can remove the widest thing in
+            -- the window between one frame and the next, and the latched right edge cannot see that on
+            -- its own - the same blind spot that kept the window from shrinking after a fold.
+            local hidden = ''
+            for _, s in ipairs(MINI_SECTIONS) do
+                if s.has then hidden = hidden .. (s.has() and '1' or '0') end
+            end
+            local shape = string.format('%d|%d|%s|%s|%s', miniBurnView, n, tostring(miniBurns),
+                                        miniBurnFilter, hidden)
+            if shape ~= miniShapeKey then
+                miniShapeKey = shape
+                if miniShapeKey ~= nil then miniSizeWanted = true end
+                POP_RIGHT = {}
+            end
+        end
         if miniSizeWanted then
             miniSizeWanted = false
-            local w, h = mini_table_size()
-            local okS = pcall(function() ImGui.SetNextWindowSize(w, h, ImGuiCond.Always or 1) end)
-            if not okS then pcall(function() ImGui.SetNextWindowSize(w, h) end) end
+            -- ONLY WHEN AUTO-RESIZE IS OFF. Every view except the full burn table runs with
+            -- AlwaysAutoResize, which already fits the window to its contents exactly - forcing a
+            -- computed size on top of that is how a six-character B team opened at 1800 wide with
+            -- acres of empty space. mini_table_size is a guess; auto-resize is a measurement, and the
+            -- measurement wins wherever it is available.
+            if miniBurns and miniBurnView == 2 then
+                local w, h = mini_table_size()
+                local okS = pcall(function() ImGui.SetNextWindowSize(w, h, ImGuiCond.Always or 1) end)
+                if not okS then pcall(function() ImGui.SetNextWindowSize(w, h) end) end
+            end
         end
+        local chromeC, chromeV = ui_push_chrome()
         local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime_mini', windowOpen, mflags)
         windowOpen = show
         if show then
+            ui_draw_probe()
+            -- THE GROUP IN ONE LINE, above everything. Green alive, red dead, hollow means out of
+            -- range or not reporting. Answers "is anyone down" without reading a single panel, and it
+            -- costs one row of pixels.
+            -- OFF BY DEFAULT. The strip is a good idea that is not earning its place yet: at full health
+            -- six bars are six identical blocks, and it sits on the same line as Expand / Close all /
+            -- CoTH Group - which is the row that sets the window width. Removing it gives that width
+            -- back to the tables underneath, which have a real use for it.
+            -- Kept whole rather than deleted, behind a switch, for when it has something to say.
+            if uiGroupStrip then
+                local dots = {}
+                for _, nm in ipairs(ordered_members()) do
+                    local hp, dead = -1, false
+                    pcall(function()
+                        local sp = mq.TLO.Spawn('pc ' .. nm)
+                        if (sp.ID() or 0) > 0 then hp = tonumber(sp.PctHPs()) or -1 end
+                    end)
+                    pcall(function() dead = (mq.TLO.Spawn(nm .. "'s corpse").ID() or 0) > 0 end)
+                    local e = { hollow = false, hp = hp, nm = nm, dead = dead }
+                    if dead then                e.rgb = { 200,  70,  70 }
+                    elseif hp < 0 then          e.rgb = { 110, 110, 120 }; e.hollow = true
+                    elseif hp <= 35 then        e.rgb = { 215, 100,  60 }
+                    elseif hp <= 70 then        e.rgb = { 220, 185,  70 }
+                    else                        e.rgb = { 100, 190, 120 } end
+                    dots[#dots + 1] = e
+                end
+                if #dots > 0 then
+                    if uiHpBars then ui_hp_strip(dots) else ui_dot_strip(dots) end
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        local bits = {}
+                        for _, nm in ipairs(ordered_members()) do bits[#bits + 1] = nm end
+                        pcall(function() ImGui.SetTooltip(table.concat(bits, ', ')) end)
+                    end
+                    ImGui.SameLine()
+                end
+            end
             -- Padlock: closed when locked, open when not. A glyph rather than a word because both title
             -- strips are already tight, and the state is legible at a glance either way.
             if ImGui.SmallButton((uiLocked and '\240\159\148\146' or '\240\159\148\147') .. '##at_lock') then
@@ -15170,10 +16513,16 @@ local function render()
             -- neighbours where a mis-click swaps one for the other.
             -- SameLine takes an absolute X, so this is measured from the window rather than guessed. If
             -- the window is too narrow to place it, it falls back to simply following on.
+            -- PLAIN SameLine. Placing this at GetWindowWidth() - 100 extends the content out to that
+            -- point, and under AlwaysAutoResize the window's width IS its content - so the button
+            -- pinned the window at whatever width it already had and nothing underneath could ever
+            -- shrink it. Tables were measured, names were shortened, the strip was removed, and the
+            -- window stayed the same size because this one line kept re-asserting it.
+            -- The file already warns about exactly this next to the DI off switch: do not derive a
+            -- position from the size that the position affects.
+            -- The gap it was buying is not worth a window that cannot get smaller.
             if miniCoth then
-                local ww = 0
-                pcall(function() ww = tonumber(ImGui.GetWindowWidth()) or 0 end)
-                if ww > 220 then ImGui.SameLine(ww - 100) else ImGui.SameLine() end
+                ImGui.SameLine(0, 12)
                 draw_coth_mini()
             end
             -- The Burns and Rez toggles that used to sit here are gone. They predated Settings owning
@@ -15198,15 +16547,39 @@ local function render()
                 -- duplicate it. Closing the pop-out clears the flag and it appears here again, which is
                 -- the same rule read backwards and needs no separate handling.
                 if sec and popOut[k] then sec = nil end
+                -- NOTHING TO SAY, SO NOTHING DRAWN - not even the title. Optional and per section: only
+                -- ones where an empty panel is genuinely uninformative define has(). A section whose
+                -- emptiness IS the message (no burns ready) must never get one.
+                if sec and sec.has and not sec.has() then sec = nil end
                 if sec and sec.get and sec.get() and sec.draw then
-                    ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                    -- The grey rule is gone. ui_section_head draws one in the section's own hue, and two
+                    -- separators a line apart is just a thicker grey band with a title lost in it.
+                    ImGui.Spacing()
                     local folded = false
                     if MINI_FOLDABLE[k] then
+                        local sepc = (UI_SECTION[k] or {}).dot or { 90, 95, 110 }
+                        local okS = pcall(function()
+                            ImGui.PushStyleColor(ImGuiCol.Separator, IM_COL32(sepc[1], sepc[2], sepc[3], 90))
+                            ImGui.Separator()
+                            ImGui.PopStyleColor(1)
+                        end)
+                        if not okS then ImGui.Separator() end
+                        ImGui.Spacing()
                         folded = miniFold[k] and true or false
                         -- The caret IS the button, so the title line is the hit target rather than a
                         -- separate widget crowding the row.
-                        if ImGui.SmallButton((folded and '> ' or 'v ') .. (sec.label or k) .. '##fold_' .. k) then
+                        -- The dot sits OUTSIDE the button so the hit target stays the caret and title,
+                        -- and so a folded section still shows its colour.
+                        local sc = UI_SECTION[k]
+                        if sc then ui_dot(sc.dot) end
+                        ui_push_text(sc and sc.label or UI_HEAD)
+                        local foldClicked = ImGui.SmallButton((folded and '> ' or 'v ') .. (sec.label or k) .. '##fold_' .. k)
+                        pcall(function() ImGui.PopStyleColor(1) end)
+                        if foldClicked then
                             miniFold[k] = (not folded) or nil
+                            -- Folding usually removes the widest thing in the window, and the latched
+                            -- right edge cannot see that on its own. Drop it - see pop_align.
+                            POP_RIGHT = {}
                             save_settings()
                         end
                         if ImGui.IsItemHovered and ImGui.IsItemHovered() then
@@ -15239,29 +16612,18 @@ local function render()
                     if MINI_FOLDABLE[k] then
                         -- the fold caret was drawn above; stay on its line
                     else
-                        ImGui.TextDisabled(sec.label or k)
+                        ui_section_head(k, sec.label or k)
                     end
-                    -- OVER AT THE RIGHT. The fold caret is on the left and is clicked constantly;
-                    -- popping a section out is neither frequent nor casual, so the two live at opposite
-                    -- ends of the row and cannot be hit in mistake for one another.
-                    -- Measured from the CONTENT REGION, never GetWindowWidth: positioning at
-                    -- window-width-minus-something extends the content to that point, which grows the
-                    -- window, which moves the target next frame - the panel crept wider every frame on
-                    -- 1.10.9 for exactly that reason.
-                    ImGui.SameLine()
-                    pcall(function()
-                        local availW = ImGui.GetContentRegionAvail()
-                        local w = ImGui.CalcTextSize(POP_ICON) + 14
-                        if availW and availW > w + 20 then
-                            ImGui.SetCursorPosX(ImGui.GetCursorPosX() + availW - w)
-                        end
-                    end)
+                    -- Over to the right of the labels, at a fixed column. The fold caret is on the left
+                    -- and is clicked constantly; popping a section out is neither frequent nor casual, so
+                    -- they sit at opposite ends and cannot be hit in mistake for one another.
+                    pop_align('mini')   -- SameLine is inside pop_align now; two would double the gap
                     if pop_grip(k) then
                         local used = {}
                         for _, v in pairs(popOut) do if type(v) == 'number' then used[v] = true end end
                         local slot
                         for pnum = 1, POP_PANELS do if not used[pnum] then slot = pnum; break end end
-                        if slot then popOut[k] = slot; save_settings()
+                        if slot then pop_place(k, slot); save_settings()
                         else log('\\ay[pop] all %d panels are in use - drag it onto one instead\\ax', POP_PANELS) end
                     end
                     pop_drag_source(k, sec.label)
@@ -15275,10 +16637,12 @@ local function render()
             pop_drop_zone(nil, 'drop here to put a section back in the mini')
         end
         ImGui.End()
+        ui_pop_chrome(chromeC, chromeV)
         return
     end
     ImGui.SetNextWindowSize(560, 500, ImGuiCond.FirstUseEver)
     local wflags = uiLocked and ((ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)) or 0
+    local chromeC, chromeV = ui_push_chrome()
     local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime', windowOpen, wflags)
     windowOpen = show
     if show then
@@ -15379,7 +16743,7 @@ local function render()
                     end
                     if #casters > 0 then
                         table.sort(casters)
-                        ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Pacify gems')
+                        ui_text(UI_LABEL, 'Pacify gems')
                         ImGui.TextDisabled('which gem holds each caster\'s pacify spell')
                         for _, nm in ipairs(casters) do
                             ImGui.SetNextItemWidth(70)
@@ -15400,7 +16764,53 @@ local function render()
                         ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                     end
                 end
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Sections')
+                ui_text(UI_LABEL, 'Appearance')
+                ImGui.Spacing()
+                -- DRAWN TOGGLES rather than checkboxes. The knob moving is legible from further away
+                -- than a tick mark, and this is the one panel where a wrong setting is easy to miss.
+                do
+                    if ui_toggle('##ui_chrome', UI_CHROME) then UI_CHROME = not UI_CHROME; save_settings() end
+                    ImGui.SameLine(); ImGui.Text('Themed window')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(
+                            'Darker ground, rounded corners, coloured section bands.\nOff returns both windows to stock ImGui.') end)
+                    end
+                end
+                do
+                    if ui_toggle('##ui_segring', uiSegRings) then uiSegRings = not uiSegRings; save_settings() end
+                    ImGui.SameLine(); ImGui.Text('Burn tiers as one arc per burn')
+                end
+                do
+                    -- The mini window auto-resizes to its contents, so this is what actually decides how
+                    -- wide it gets: rows wrap here rather than growing the window forever.
+                    ImGui.SetNextItemWidth(120)
+                    local v, changed = ImGui.SliderInt('Max row width##ui_maxrow', UI_MAX_ROW, 200, 900)
+                    if changed and v ~= UI_MAX_ROW then UI_MAX_ROW = v; save_settings() end
+                end
+                do
+                    if ui_toggle('##ui_pulse', UI_PULSE) then UI_PULSE = not UI_PULSE; save_settings() end
+                    ImGui.SameLine(); ImGui.Text('Flash when something comes up')
+                end
+                do
+                    if ui_toggle('##ui_gstrip', uiGroupStrip) then uiGroupStrip = not uiGroupStrip; save_settings() end
+                    ImGui.SameLine(); ImGui.Text('Group health strip')
+                end
+                if uiGroupStrip then
+                    if ui_toggle('##ui_hpbars', uiHpBars) then uiHpBars = not uiHpBars; save_settings() end
+                    ImGui.SameLine(); ImGui.Text('   ...as bars rather than dots')
+                end
+                do
+                    if ui_toggle('##ui_wide', uiWideButtons) then
+                        uiWideButtons = not uiWideButtons; save_settings(); POP_RIGHT = {}
+                    end
+                    ImGui.SameLine(); ImGui.Text('Line up name buttons')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(
+                            'Pads every name button to the same width so the rows read as columns.\nOff lets each button size to its own name.') end)
+                    end
+                end
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                ui_text(UI_LABEL, 'Sections')
                 ImGui.TextDisabled('Turn off anything you do not use - hidden sections stop rendering.')
                 ImGui.Spacing()
                 local dirty = false
@@ -15416,7 +16826,7 @@ local function render()
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 -- Was 'Raid chat', which named the MECHANISM of the one setting under it rather than the
                 -- feature. Both settings here are about tank XTargets, so the heading says that.
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Auto-XTarget')
+                ui_text(UI_LABEL, 'Auto-XTarget')
                 ImGui.Spacing()
                 do
                     -- MOVED OFF THE TOP BUTTON ROW. It sat there as a bare 'Auto' next to the Tank XT
@@ -15447,7 +16857,7 @@ local function render()
                 -- two controls for one flag, under two different names, is just a way to be unsure
                 -- which one you last changed.
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Mini window')
+                ui_text(UI_LABEL, 'Mini window')
                 do
                     -- One row per section: arrows set the order, the checkbox sets visibility. Both
                     -- persist, so the mini window can be laid out without touching the code.
@@ -15565,9 +16975,12 @@ local function render()
                                 end
                                 local nowT = (miniBurnView == 2)
                                 if miniBurnView ~= wasV then
-                                    -- One-shot: give the window a usable size the moment detail goes on,
-                                    -- rather than leaving it at whatever the compact view had shrunk to.
-                                    if nowT then miniSizeWanted = true end
+                                    -- RESIZE ON EVERY SWITCH, not only on the way into detail. The three
+                                    -- views differ hugely in width now that compact is a name-wide column
+                                    -- each, so coming BACK from the full table left the compact table
+                                    -- rattling around in a window sized for eighteen columns.
+                                    miniSizeWanted = true
+                                    POP_RIGHT = {}
                                     dirty = true
                                 end
                             end
@@ -15577,7 +16990,7 @@ local function render()
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
 
                 -- Character order: who reads left-to-right in the burn views.
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Character order')
+                ui_text(UI_LABEL, 'Character order')
                 ImGui.TextDisabled('Left to right in the burn views.')
                 do
                     local ord = ordered_members()
@@ -15601,7 +17014,7 @@ local function render()
                 -- Combo editor. Every configured class is offered, not just the ones grouped right
                 -- now, so a combo can be built before the character it needs is online. Members that
                 -- are not in the group are simply skipped when the button is pressed.
-                ImGui.TextColored(0.85, 0.72, 0.35, 1.0, 'Combos')
+                ui_text(UI_LABEL, 'Combos')
                 ImGui.TextDisabled('One button that presses several class buttons.')
                 -- Only classes actually in the group get a checkbox. The catch: a combo built earlier
                 -- can hold a class that has since left, and that member would be invisible here while
@@ -15720,6 +17133,7 @@ local function render()
 
     end
     ImGui.End()
+    ui_pop_chrome(chromeC, chromeV)
 end
 
 -- MUTE THE RELAY ECHO, AND KEEP TRYING UNTIL IT TAKES.
@@ -15819,7 +17233,7 @@ pcall(function()
         local k = tostring(key):lower()
         for _, s in ipairs(MINI_SECTIONS) do
             if s.key == k then
-                popOut[k] = popOut[k] and nil or 1
+                pop_place(k, popOut[k] and nil or 1)
                 save_settings()
                 log('[pop] %s %s', s.label,
                     popOut[k] and ('moved to panel ' .. popOut[k]) or 'back in the mini')
@@ -15835,6 +17249,13 @@ end)
 -- lost the window and wants it back; a toggle would half the time close it again.
 -- Bound here rather than with the rest because windowOpen and miniMode are locals declared far below
 -- that block, and a bind up there would close over nothing.
+-- Ask on the NEXT FRAME, because the answer only exists inside a window's draw callback - there is no
+-- draw list to interrogate from a command line.
+pcall(function() mq.bind('/atdraw', function()
+    uiDrawProbe = true
+    log('[draw] probing on the next frame - the mini window needs to be open')
+end) end)
+
 pcall(function() mq.bind('/atui', function(what)
     local arg = what and tostring(what):lower() or ''
     -- PUT IT ALL BACK. A layout you can rearrange is a layout you can wreck - drag six sections into
