@@ -68,7 +68,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.18'
-local BUILD_TAG = '1.18'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.18.01'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -3462,6 +3462,25 @@ function coth_summoners()
     return out
 end
 
+-- HOW MANY EMBLEMS ARE IN THIS GROUP AT ALL? Deliberately not coth_summoners, which answers a different
+-- question - who could fire one THIS SECOND, here and off cooldown. That number swings with every summon
+-- and would have the bard stepping in and out mid-gather.
+-- Carrying one is a fact about the group's gear, so it is read loosely: a minute of staleness is fine
+-- because nobody gains or loses an emblem during a gather, and the 6s window used for readiness would
+-- undercount anyone who happened to be quiet.
+function coth_emblem_holders()
+    local n, now = 0, mq.gettime()
+    for _, nm in ipairs(group_members()) do
+        if nm:lower() == myName:lower() then
+            if coth_emblem() >= 0 then n = n + 1 end
+        else
+            local st = COTH.state[nm]
+            if st and (st.emblem or -1) >= 0 and (now - (st.updated or 0)) < 60000 then n = n + 1 end
+        end
+    end
+    return n
+end
+
 function coth_set(on, at)
     if on then
         -- CAPTURE THE POINT, not the person. Whoever starts it fixes the spot; if they wander off
@@ -3480,6 +3499,7 @@ function coth_set(on, at)
         COTH.active, COTH.startedAt, COTH.pending = true, mq.gettime(), nil
         COTH.skip, COTH.grey, COTHW = {}, {}, nil
         COTH.saidDone, COTH.quietAt, COTH.saidWait = nil, nil, nil
+        COTH.saidScarce = nil
         COTH.mine = 0
         pcall(function() peer_bcast('/at_cothgo on') end)
         rezlog('[coth] gather started - anchor point %d,%d,%d',
@@ -3617,6 +3637,15 @@ COTH_SUMMONER_GRACE = 8000
 COTH_BARD_CAST = 11000
 -- How many summons a bard does before handing over, if anyone else can take it.
 COTH_BARD_MAX  = 2
+-- ...UNLESS THE EMBLEM IS SCARCE. Standing back assumes handing over is an upgrade, and with four or
+-- five emblems in the group it is: a blind cast becomes a verified one. With two it is not - the bard
+-- benches itself and the whole gather runs on one summoner at ten seconds a head, which is slower than
+-- an unverified cast by a wide margin.
+-- Counted over who CARRIES an emblem, not who is ready to fire right now, because scarcity is a fact
+-- about the group's gear and should not flicker with cooldowns.
+-- At or below this many holders, the bard keeps working. Two by intent: three carriers means two can
+-- cover for each other while the third is on cooldown, which is the point at which handing over pays.
+COTH_BARD_SCARCE = 2
 -- How long a fired rung stays assumed-spent before the client's own timers are believed again.
 -- Long enough to cover a read that lies immediately after casting, short enough that it cannot mask a
 -- cooldown that has genuinely finished.
@@ -3750,13 +3779,28 @@ local function coth_tick()
     -- cast is one we cannot verify - so a bard does the opening summons to get real summoners on their
     -- feet, then leaves the rest to them.
     if iAmBard and (COTH.mine or 0) >= COTH_BARD_MAX then
-        local others = 0
-        for _, nm in ipairs(coth_summoners()) do
-            if nm:lower() ~= myName:lower() then others = others + 1 end
-        end
-        if others > 0 then
-            COTH.dbg = string.format('bard: %d others can summon now, standing back', others)
-            return
+        -- ONE OTHER SUMMONER IS NOT ENOUGH WHEN IT IS THE ONLY OTHER SUMMONER. The old test was
+        -- 'others > 0', which benched the bard the moment a single character could take over - and with
+        -- two emblems in the group that leaves one summoner doing every remaining head at ten seconds
+        -- each. Standing back is meant to trade a blind cast for a verified one, not to trade two
+        -- summoners for one.
+        local holders = coth_emblem_holders()
+        if holders > COTH_BARD_SCARCE then
+            local others = 0
+            for _, nm in ipairs(coth_summoners()) do
+                if nm:lower() ~= myName:lower() then others = others + 1 end
+            end
+            if others > 0 then
+                COTH.dbg = string.format('bard: %d others can summon now, standing back', others)
+                return
+            end
+        else
+            COTH.dbg = string.format('bard: only %d emblem(s) in the group - carrying on', holders)
+            if not COTH.saidScarce then
+                COTH.saidScarce = true
+                rezlog('[coth] only %d emblem(s) between us - the bard keeps summoning rather than standing back',
+                       holders)
+            end
         end
     end
 
@@ -4595,10 +4639,36 @@ end
 DIQ_GIVEUP_MS = 8000    -- whole-emergency ceiling; past this, let the old ladder have it
 
 -- What to ask for, best first. Ordering only - the asked character has the final word.
+-- OUT OF ZONE IS THE ONE EXCLUSION THAT IS SAFE, and it is the exception to "order, never exclude"
+-- below rather than a softening of it. That rule exists because a poor REPORT is not proof a character
+-- cannot help - its save may have come back since. Being in another zone is different in kind: no cast
+-- reaches across a zone line, so asking cannot succeed, and every unanswerable ask costs the tank
+-- DIQ_ANSWER_MS of silence while it has no save. Five elsewhere is six seconds of standing uncovered.
+-- FRESH POSITIVE EVIDENCE ONLY. The test is not "we don't know where they are" - it is "they told us
+-- recently, and it was somewhere else". Missing, stale or zero zone all fall through and get asked, so
+-- the failure mode is a wasted question rather than a skipped character with a save.
+-- The asked character checks this locally too, in /at_dineed, which is the authoritative half; this is
+-- only here to avoid spending the round trip to be told what we already knew.
+function diq_zone_elsewhere(nm)
+    local myZone = 0
+    pcall(function() myZone = tonumber(mq.TLO.Zone.ID()) or 0 end)
+    if myZone <= 0 then return false end                       -- I don't know where I am: ask everyone
+    local rr = rezReady[nm]
+    if not rr then return false end                            -- never reported: ask
+    if (rr.zone or 0) <= 0 then return false end               -- reported no zone: ask
+    if (mq.gettime() - (rr.updated or 0)) >= 30000 then return false end   -- stale: ask
+    return rr.zone ~= myZone
+end
+
 function diq_candidates()
-    local out = {}
+    local out, elsewhere = {}, 0
     for nm, s in pairs(DI.state or {}) do
+        local skipZone = false
         if nm:lower() ~= myName:lower() and not DIQ.tried[nm:lower()] then
+            skipZone = diq_zone_elsewhere(nm)
+            if skipZone then elsewhere = elsewhere + 1 end
+        end
+        if nm:lower() ~= myName:lower() and not DIQ.tried[nm:lower()] and not skipZone then
             local age = (mq.gettime() - (s.updated or 0)) / 1000
             -- A report older than a minute is not evidence of anything; ask anyway, but last.
             local stale = (age > 60) and 1 or 0
@@ -4619,11 +4689,11 @@ function diq_candidates()
         if a.rank ~= b.rank then return a.rank > b.rank end
         return a.nm < b.nm
     end)
-    return out
+    return out, elsewhere
 end
 
 function diq_ask_next(tank)
-    local list = diq_candidates()
+    local list, elsewhere = diq_candidates()
     if #list == 0 then
         -- BACK OFF, DO NOT SPIN. Clearing active here let the next tick see no save, reset the tried
         -- list, and ask all five again - twice in two seconds on 2026-08-14 05:31:37.
@@ -4631,7 +4701,10 @@ function diq_ask_next(tank)
         -- pause also gives the old ladder and the staff chain room to do their work without this talking
         -- over them.
         DIQ.exhaustedUntil = mq.gettime() + DIQ_EXHAUST_MS
-        rezlog('[diq] nobody has a save - standing back %.0fs and letting the staff chain work',
+        -- SAY IF ZONE WAS THE REASON. "Nobody has a save" and "nobody is in this zone" want completely
+        -- different responses from the person reading the log, and they used to print the same line.
+        rezlog('[diq] nobody has a save%s - standing back %.0fs and letting the staff chain work',
+               ((elsewhere or 0) > 0) and string.format(' (%d out of zone, not asked)', elsewhere) or '',
                DIQ_EXHAUST_MS / 1000)
         DIQ.active = false
         return false
@@ -7593,6 +7666,25 @@ end
             pcall(function() peer_cmdf(tank, '/at_diack %s no invis', myName) end)
             rezlog('[diq] %s asked for a save - invis, not dropping it', tank)
             return
+        end
+        -- NOT IN MY ZONE: DECLINE AT ONCE. No save crosses a zone line, so this ask can only ever end in
+        -- silence - and silence costs the tank DIQ_ANSWER_MS while it has nothing on it. Answering 'no'
+        -- immediately sends it to the next candidate in a relay hop instead.
+        -- THIS IS THE AUTHORITATIVE HALF. The tank filters on a pushed zone that may be seconds old and
+        -- deliberately fails open; this is a local read of what is actually in front of me, so a stale
+        -- report costs one round trip rather than a skipped save.
+        -- Spawn, not the reported zone: it answers "can I see the tank from here", which is the real
+        -- question, and it is the same test the CoTH summoner uses on its target.
+        -- A dead tank is out of zone too, which is correct - it is at its bind, and a save on a corpse
+        -- is not a thing.
+        do
+            local tankHere = 0
+            pcall(function() tankHere = tonumber(mq.TLO.Spawn('pc =' .. tank).ID()) or 0 end)
+            if tankHere <= 0 then
+                pcall(function() peer_cmdf(tank, '/at_diack %s no out-of-zone', myName) end)
+                rezlog('[diq] %s asked for a save - not in my zone, declining', tank)
+                return
+            end
         end
         -- CLERIC RUNGS ARE FOR CLERICS. di_rung_list proves ownership per rung - AA rank, item id, gem -
         -- but ownership is not the same as being the right character to use it: a necro carrying a pair
