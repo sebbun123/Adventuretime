@@ -68,7 +68,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.18'
-local BUILD_TAG = '1.18.01'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.18.39'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -79,12 +79,16 @@ local BUILD_TAG = '1.18.01'  -- bump on every change; prints on startup
 -- filled dot in front of the title, and the eye lands on the right band without reading anything.
 -- Hues are spread deliberately rather than picked prettily - adjacent sections must not share a family,
 -- or the band boundary disappears again. Anything not listed falls back to the neutral heading colour.
+-- Group draughts drawn in Running now. A deliberate outlier from the burn ramp: the same draught is up
+-- on everyone at once, so it should not read as one character's own cooldown.
+UI_POT_RGB = { 150, 130, 230 }
 UI_SECTION = {
     rez        = { dot = {  95, 165, 230 }, label = { 0.52, 0.70, 0.90 } },  -- blue
     di         = { dot = { 150, 120, 215 }, label = { 0.64, 0.56, 0.85 } },  -- violet
     burns      = { dot = { 225, 120,  70 }, label = { 0.88, 0.56, 0.38 } },  -- ember
     timeline   = { dot = { 235, 160,  90 }, label = { 0.92, 0.68, 0.46 } },  -- lighter ember: same family as burns
     running    = { dot = {  90, 210, 255 }, label = { 0.42, 0.78, 0.94 } },  -- cyan: matches 'running' everywhere else
+    aggro      = { dot = { 225, 150,  70 }, label = { 0.88, 0.59, 0.27 } },  -- the colour a climbing line goes
     groupheals = { dot = {  80, 185, 130 }, label = { 0.45, 0.76, 0.58 } },  -- green
     invis      = { dot = { 130, 140, 160 }, label = { 0.58, 0.62, 0.70 } },  -- slate
     protect    = { dot = { 215, 170,  70 }, label = { 0.85, 0.72, 0.40 } },  -- gold
@@ -383,6 +387,27 @@ end
 
 -- A REAL TOGGLE, not a checkbox. Reads as on/off from across the screen because the knob MOVES -
 -- a tick in a box is a mark you have to look at directly to resolve.
+-- A CHECKBOX-SHAPED CALL THAT DRAWS A TOGGLE. Same signature and same return as ImGui.Checkbox - takes
+-- 'Label##id' and the current value, gives back the new one - so every call site keeps its own logic and
+-- only the thing on screen changes.
+-- The point is uniformity: Settings had a drawn switch for some options and a stock ImGui tick box for
+-- the rest, which reads as two different programs sharing a window.
+-- The id is taken from the ## suffix where there is one, and made from the label where there is not.
+-- ui_toggle needs a unique id and two options with the same visible text would otherwise share one.
+-- LABEL AFTER THE SWITCH, like the hand-written rows above: the switch is the thing you click and it
+-- lines up down the column when the text does not.
+function ui_check(label, on)
+    local text = tostring(label or ''):gsub('##.*$', '')
+    local id   = tostring(label or ''):match('##.*$') or ('##chk_' .. text)
+    local v = on and true or false
+    if ui_toggle(id, v) then v = not v end
+    if text ~= '' then
+        ImGui.SameLine()
+        ImGui.Text(text)
+    end
+    return v
+end
+
 function ui_toggle(id, isOn, w, h)
     local clicked = false
     local ok = pcall(function()
@@ -472,41 +497,204 @@ end
 -- missing any one enum cannot unbalance the stack and corrupt every window drawn afterwards.
 UI_CHROME = true
 
+-- FIVE FRAMES, ONE SWITCH. The chrome was a single hardcoded look behind an on/off toggle, which meant
+-- the only opinion available was "themed" or "stock ImGui". These are the same eleven colour slots and
+-- four style vars, named and collected, so trying one costs a dropdown rather than an edit.
+-- Everything here is ImGui's own styling - no drawing. The frame treatments that need a draw list
+-- (hue rails, corner brackets, a border that changes with state) are a separate job; this is the part
+-- that is four lines of table per look and changes every window including the pop-outs.
+-- ORDER MATTERS ONLY FOR THE DROPDOWN. uiTheme is stored by NAME, so inserting one does not silently
+-- move somebody onto a different look.
+AT_THEMES = {
+    { name = 'Midnight',                       -- the original: deep blue-black, soft corners
+      cols = { WindowBg = { 18, 20, 27, 242 }, TitleBg = { 24, 28, 40, 255 },
+               ResizeGrip = { 0, 0, 0, 0 }, ResizeGripHovered = { 62, 72, 96, 140 },
+               ResizeGripActive = { 80, 95, 125, 190 },
+               ScrollbarBg = { 0, 0, 0, 0 }, ScrollbarGrab = { 44, 50, 66, 200 },
+               ScrollbarGrabHovered = { 62, 72, 96, 230 }, Separator = { 46, 54, 72, 200 },
+               TitleBgActive = { 38, 54, 84, 255 }, Border = { 46, 54, 72, 255 },
+               FrameBg = { 32, 36, 48, 255 }, FrameBgHovered = { 48, 54, 72, 255 },
+               Button = { 44, 50, 66, 255 }, ButtonHovered = { 62, 72, 96, 255 },
+               ButtonActive = { 80, 95, 125, 255 },
+               TableRowBg = { 22, 24, 32, 255 }, TableRowBgAlt = { 26, 29, 39, 255 } },
+      vars = { WindowRounding = 6, FrameRounding = 4, ChildRounding = 4, WindowBorderSize = 1 , WindowTitleAlign = 0.5, ScrollbarSize = 10, ScrollbarRounding = 5, GrabRounding = 4, PopupRounding = 6} },
+
+    { name = 'Slate',                          -- neutral grey, square, hairline border. Quiet.
+      cols = { WindowBg = { 26, 27, 30, 240 }, TitleBg = { 34, 35, 39, 255 },
+               ResizeGrip = { 0, 0, 0, 0 }, ResizeGripHovered = { 72, 75, 82, 140 },
+               ResizeGripActive = { 92, 96, 104, 190 },
+               ScrollbarBg = { 0, 0, 0, 0 }, ScrollbarGrab = { 52, 54, 60, 200 },
+               ScrollbarGrabHovered = { 72, 75, 82, 230 }, Separator = { 70, 72, 78, 200 },
+               TitleBgActive = { 52, 54, 60, 255 }, Border = { 70, 72, 78, 255 },
+               FrameBg = { 40, 42, 46, 255 }, FrameBgHovered = { 56, 58, 64, 255 },
+               Button = { 52, 54, 60, 255 }, ButtonHovered = { 72, 75, 82, 255 },
+               ButtonActive = { 92, 96, 104, 255 },
+               TableRowBg = { 30, 31, 35, 255 }, TableRowBgAlt = { 34, 35, 40, 255 } },
+      vars = { WindowRounding = 0, FrameRounding = 0, ChildRounding = 0, WindowBorderSize = 1 , WindowTitleAlign = 0.5, ScrollbarSize = 9,  ScrollbarRounding = 0, GrabRounding = 0, PopupRounding = 0} },
+
+    { name = 'Ember',                           -- near-black ground, warm edges. Matches the burn ramp.
+      cols = { WindowBg = { 22, 18, 16, 244 }, TitleBg = { 36, 26, 20, 255 },
+               ResizeGrip = { 0, 0, 0, 0 }, ResizeGripHovered = { 84, 58, 34, 140 },
+               ResizeGripActive = { 122, 80, 40, 190 },
+               ScrollbarBg = { 0, 0, 0, 0 }, ScrollbarGrab = { 54, 38, 26, 200 },
+               ScrollbarGrabHovered = { 84, 58, 34, 230 }, Separator = { 96, 62, 34, 200 },
+               TitleBgActive = { 92, 54, 24, 255 }, Border = { 96, 62, 34, 255 },
+               FrameBg = { 40, 30, 24, 255 }, FrameBgHovered = { 62, 44, 30, 255 },
+               Button = { 54, 38, 26, 255 }, ButtonHovered = { 84, 58, 34, 255 },
+               ButtonActive = { 122, 80, 40, 255 },
+               TableRowBg = { 26, 21, 18, 255 }, TableRowBgAlt = { 31, 25, 21, 255 } },
+      vars = { WindowRounding = 8, FrameRounding = 6, ChildRounding = 6, WindowBorderSize = 1 , WindowTitleAlign = 0.5, ScrollbarSize = 10, ScrollbarRounding = 6, GrabRounding = 6, PopupRounding = 8} },
+
+    { name = 'Glass',                           -- barely there: heavy transparency, no border, no corners
+      cols = { WindowBg = { 12, 14, 20, 170 }, TitleBg = { 16, 20, 30, 190 },
+               ResizeGrip = { 0, 0, 0, 0 }, ResizeGripHovered = { 255, 255, 255, 40 },
+               ResizeGripActive = { 255, 255, 255, 70 },
+               ScrollbarBg = { 0, 0, 0, 0 }, ScrollbarGrab = { 255, 255, 255, 40 },
+               ScrollbarGrabHovered = { 255, 255, 255, 70 }, Separator = { 255, 255, 255, 45 },
+               TitleBgActive = { 30, 42, 66, 210 }, Border = { 0, 0, 0, 0 },
+               FrameBg = { 30, 34, 46, 160 }, FrameBgHovered = { 48, 54, 72, 190 },
+               Button = { 40, 46, 62, 170 }, ButtonHovered = { 60, 70, 94, 200 },
+               ButtonActive = { 78, 92, 122, 220 },
+               TableRowBg = { 0, 0, 0, 0 }, TableRowBgAlt = { 255, 255, 255, 10 } },
+      vars = { WindowRounding = 10, FrameRounding = 8, ChildRounding = 8, WindowBorderSize = 0 , WindowTitleAlign = 0.5, ScrollbarSize = 8,  ScrollbarRounding = 6, GrabRounding = 6, PopupRounding = 10} },
+}
+uiTheme = 'Midnight'
+
+function at_theme()
+    for _, t in ipairs(AT_THEMES) do if t.name == uiTheme then return t end end
+    return AT_THEMES[1]
+end
+
 function ui_push_chrome()
     if not UI_CHROME then return 0, 0 end
+    local th = at_theme()
     local cols, vars = 0, 0
-    local function col(slot, r, g, b, a)
-        if not slot then return end
-        if pcall(function() ImGui.PushStyleColor(slot, IM_COL32(r, g, b, a)) end) then cols = cols + 1 end
+    local function col(slot, rgba)
+        if not slot or not rgba then return end
+        if pcall(function() ImGui.PushStyleColor(slot, IM_COL32(rgba[1], rgba[2], rgba[3], rgba[4])) end) then
+            cols = cols + 1
+        end
     end
     local function var(slot, a, b)
-        if not slot then return end
+        if not slot or a == nil then return end
         local ok = pcall(function()
             if b then ImGui.PushStyleVar(slot, a, b) else ImGui.PushStyleVar(slot, a) end
         end)
         if ok then vars = vars + 1 end
     end
-    col(ImGuiCol.WindowBg,       18,  20,  27, 242)
-    col(ImGuiCol.TitleBg,        24,  28,  40, 255)
-    col(ImGuiCol.TitleBgActive,  38,  54,  84, 255)
-    col(ImGuiCol.Border,         46,  54,  72, 255)
-    col(ImGuiCol.FrameBg,        32,  36,  48, 255)
-    col(ImGuiCol.FrameBgHovered, 48,  54,  72, 255)
-    col(ImGuiCol.Button,         44,  50,  66, 255)
-    col(ImGuiCol.ButtonHovered,  62,  72,  96, 255)
-    col(ImGuiCol.ButtonActive,   80,  95, 125, 255)
-    col(ImGuiCol.TableRowBg,     22,  24,  32, 255)
-    col(ImGuiCol.TableRowBgAlt,  26,  29,  39, 255)
-    var(ImGuiStyleVar.WindowRounding, 6)
-    var(ImGuiStyleVar.FrameRounding,  4)
-    var(ImGuiStyleVar.ChildRounding,  4)
-    var(ImGuiStyleVar.WindowBorderSize, 1)
+    -- Counted, not assumed. A slot the binding does not have simply is not pushed, and the caller pops
+    -- exactly what went on - which is the difference between a missing colour and an ImGui stack assert.
+    local c = th.cols or {}
+    col(ImGuiCol.WindowBg,       c.WindowBg)
+    col(ImGuiCol.TitleBg,        c.TitleBg)
+    col(ImGuiCol.TitleBgActive,  c.TitleBgActive)
+    col(ImGuiCol.Border,         c.Border)
+    col(ImGuiCol.FrameBg,        c.FrameBg)
+    col(ImGuiCol.FrameBgHovered, c.FrameBgHovered)
+    col(ImGuiCol.Button,         c.Button)
+    col(ImGuiCol.ButtonHovered,  c.ButtonHovered)
+    col(ImGuiCol.ButtonActive,   c.ButtonActive)
+    col(ImGuiCol.TableRowBg,     c.TableRowBg)
+    col(ImGuiCol.TableRowBgAlt,  c.TableRowBgAlt)
+    -- THE TELLS. The corner grip and the scrollbar are Dear ImGui's signature and were never styled, so
+    -- however the rest of the window looked, those two said 'debug tool' on every theme. The grip is
+    -- transparent at rest and only appears under the cursor - it still works, it just stops announcing
+    -- itself. Separator is set here rather than left at the default grey so a divider belongs to its
+    -- theme instead of being the one stock-coloured thing on screen.
+    col(ImGuiCol.ResizeGrip,           c.ResizeGrip)
+    col(ImGuiCol.ResizeGripHovered,    c.ResizeGripHovered)
+    col(ImGuiCol.ResizeGripActive,     c.ResizeGripActive)
+    col(ImGuiCol.ScrollbarBg,          c.ScrollbarBg)
+    col(ImGuiCol.ScrollbarGrab,        c.ScrollbarGrab)
+    col(ImGuiCol.ScrollbarGrabHovered, c.ScrollbarGrabHovered)
+    col(ImGuiCol.Separator,            c.Separator)
+    -- THE SLOTS THAT ONLY SHOW UP ONCE WINDOWS ARE MERGED. Dragging one pop-out onto another docks them
+    -- into a tab bar, and the tabs, headers and docking preview are all separate colour slots. None were
+    -- in the table, so a merged window came out half themed - correct background, stock everything else,
+    -- which reads worse than not theming it at all.
+    -- DERIVED, not another eighteen lines per theme. Every one of these has an obvious relative already
+    -- defined: a tab is a title bar, a header is a button, a popup is a window. A theme can still name
+    -- any of them explicitly and that wins - this is the floor, not the ceiling.
+    local function pick(named, fallback) return named or fallback end
+    col(ImGuiCol.Tab,                pick(c.Tab,                c.TitleBg))
+    col(ImGuiCol.TabHovered,         pick(c.TabHovered,         c.ButtonHovered))
+    col(ImGuiCol.TabActive,          pick(c.TabActive,          c.TitleBgActive))
+    col(ImGuiCol.TabUnfocused,       pick(c.TabUnfocused,       c.TitleBg))
+    col(ImGuiCol.TabUnfocusedActive, pick(c.TabUnfocusedActive, c.FrameBg))
+    col(ImGuiCol.TitleBgCollapsed,   pick(c.TitleBgCollapsed,   c.TitleBg))
+    col(ImGuiCol.Header,             pick(c.Header,             c.Button))
+    col(ImGuiCol.HeaderHovered,      pick(c.HeaderHovered,      c.ButtonHovered))
+    col(ImGuiCol.HeaderActive,       pick(c.HeaderActive,       c.ButtonActive))
+    col(ImGuiCol.PopupBg,            pick(c.PopupBg,            c.WindowBg))
+    col(ImGuiCol.MenuBarBg,          pick(c.MenuBarBg,          c.TitleBg))
+    col(ImGuiCol.CheckMark,          pick(c.CheckMark,          c.ButtonActive))
+    col(ImGuiCol.SliderGrab,         pick(c.SliderGrab,         c.Button))
+    col(ImGuiCol.SliderGrabActive,   pick(c.SliderGrabActive,   c.ButtonActive))
+    col(ImGuiCol.DockingPreview,     pick(c.DockingPreview,     c.TitleBgActive))
+    col(ImGuiCol.DockingEmptyBg,     pick(c.DockingEmptyBg,     c.WindowBg))
+    local v = th.vars or {}
+    var(ImGuiStyleVar.WindowRounding,   v.WindowRounding)
+    var(ImGuiStyleVar.FrameRounding,    v.FrameRounding)
+    var(ImGuiStyleVar.ChildRounding,    v.ChildRounding)
+    var(ImGuiStyleVar.WindowBorderSize, v.WindowBorderSize)
+    var(ImGuiStyleVar.ScrollbarSize,     v.ScrollbarSize)
+    var(ImGuiStyleVar.ScrollbarRounding, v.ScrollbarRounding)
+    var(ImGuiStyleVar.GrabRounding,      v.GrabRounding)
+    var(ImGuiStyleVar.PopupRounding,     v.PopupRounding)
+    -- A CENTRED TITLE, which is a two-float var - the only one here that is. Left-aligned is the stock
+    -- setting and reads as a debug window more than anything else a single line can change.
+    if v.WindowTitleAlign then var(ImGuiStyleVar.WindowTitleAlign, v.WindowTitleAlign, 0.5) end
+    -- WHAT ACTUALLY LANDED. Every push here is wrapped in pcall so a binding without a slot degrades
+    -- instead of throwing - which also means a slot silently doing nothing looks identical to one that
+    -- worked. Reading the result off the screen is guesswork; this says it. Once per theme change.
+    if AT_chromeSaid ~= uiTheme then
+        AT_chromeSaid = uiTheme
+        AT_chromeNote = string.format('[ui] theme "%s": %d/%d colours and %d/%d style vars accepted',
+                                      uiTheme, cols, 34, vars, 9)
+    end
     return cols, vars
 end
 
 function ui_pop_chrome(cols, vars)
     if (vars or 0) > 0 then pcall(function() ImGui.PopStyleVar(vars) end) end
     if (cols or 0) > 0 then pcall(function() ImGui.PopStyleColor(cols) end) end
+end
+
+-- A DRAWN PADLOCK, because the lock was an emoji sitting in the chrome of both windows - and an emoji
+-- is the one glyph guaranteed to be rendered by a different font than everything around it, at a size
+-- nothing else uses. A shackle is an arc and a body is a rounded rect, both of which the binding has.
+-- Open and shut differ by where the arc sits, not by colour: the shape carries it, so it still reads
+-- when the theme changes the palette out from under it.
+-- Same button semantics as before - returns true on click - so callers do not change.
+function ui_lock_button(id, locked, size)
+    local fs = 16
+    pcall(function() fs = ImGui.GetFontSize() or 16 end)
+    local d  = size or math.floor(fs * 0.95)
+    local pressed = false
+    local ok = pcall(function()
+        local x, y = ImGui.GetCursorScreenPos()
+        pressed = ImGui.InvisibleButton(id, d, d)
+        local hov = ImGui.IsItemHovered and ImGui.IsItemHovered()
+        local dl  = ImGui.GetWindowDrawList()
+        local col = locked and IM_COL32(225, 195, 110, hov and 255 or 220)
+                            or IM_COL32(150, 155, 170, hov and 255 or 190)
+        local bw, bh = d * 0.72, d * 0.46
+        local bx, by = x + (d - bw) * 0.5, y + d - bh - 1
+        dl:AddRectFilled(ImVec2(bx, by), ImVec2(bx + bw, by + bh), col, 2)
+        -- The shackle: a half arc above the body. Shut sits centred and closed; open is lifted and
+        -- swung off to one side, which is legible at this size where a colour change is not.
+        local r  = bw * 0.34
+        local cx = locked and (bx + bw * 0.5) or (bx + bw * 0.72)
+        local cy = by - (locked and 1 or 3)
+        dl:PathClear()
+        dl:PathArcTo(ImVec2(cx, cy), r, math.pi, math.pi * 2, 12)
+        dl:PathStroke(col, 0, math.max(1.5, d * 0.11))
+    end)
+    if not ok then
+        -- No draw list, no arcs: fall back to something that is at least a button.
+        pressed = ImGui.SmallButton((locked and '[L]' or '[ ]') .. id)
+    end
+    return pressed
 end
 
 function ui_dot(rgb, scale)
@@ -913,6 +1101,11 @@ function pot_base_for(key)
 end
 -- driver: potState[char][key] = { carries, up, secs, dsecs, updated }. Worker: last-pushed key per pot.
 potState = {}
+-- Buffs are handed out on the server's own tick, so a draught read four times between two of them
+-- returns the same answer three times over. The click poll runs at 2s because MGB and cures want that;
+-- draughts do not, and they were the ones doing the reading.
+POT_POLL_MS = 6000
+lastPotPoll = 0
 
 -- ===== NIGHTVEIL EMBLEMS =====
 -- REBUILT AROUND THE SPLIT ITEMS. These used to be augs socketed in a charm, and an aug reports
@@ -2259,6 +2452,21 @@ end
 -- Auto-detect an entry's type and return have, ready(bool), secs (0=ready, >0=item countdown, -1=down w/o timer).
 local buffNameOf = {}   -- watched item/AA name -> the buff/song it applies ('' = none/unresolvable)
 local buffLatch  = {}   -- name -> seconds remaining captured when it went up (held so the push key is stable)
+-- WHERE DOES THIS EFFECT ACTUALLY LIVE? Resolved by observation, once per name, then remembered - the
+-- same pattern as buffNameOf above it and potBuffName below.
+-- The song read used to be skipped outright for items and AAs, on the reasoning that their granted
+-- effects land in the buff window. That is not a rule the client honours: the short-duration window
+-- takes SHORT-DURATION buffs, whatever cast them, so a clicky or an AA with a brief effect sits in the
+-- song table and every one of those read as never-up. The dashboard was not wrong about them, it could
+-- not see them.
+-- The cost that narrowing was protecting against is still real, so this pays it once instead of
+-- reverting to paying it forever: probe both tables until the effect is seen somewhere, remember which,
+-- and from then on read only that one. Unresolved names are throttled so a burn that never runs cannot
+-- cost more than one extra read every few seconds.
+burnEffectWhere   = {}   -- watched name -> 'b' (buff table) or 's' (song table)
+burnEffectProbeAt = {}   -- watched name -> last time we paid to look in the song table
+BURN_SONG_PROBE_MS = 5000
+
 -- Seconds left on the buff a watched thing applies, or 0. Looks on ME only: a debuff lands on the mob and
 -- so never shows here, which is exactly the filter we want - no TargetType table to keep in step.
 local function my_effect_secs(name, resolver, kind)
@@ -2289,10 +2497,32 @@ local function my_effect_secs(name, resolver, kind)
     -- Five of six toons logged past that crash; Stylin logged nothing after it.
     -- This does not change what the dashboard shows for items and AAs, because their effects were never
     -- in the song table to find.
+    -- READ THE TABLE THE EFFECT IS IN, once we know which that is. Until we have seen it up somewhere,
+    -- look in both - a name that has never resolved is exactly the one we cannot make assumptions about.
+    -- Discs and spells always probe the song table: they genuinely can be in either, and they are the
+    -- case the original narrowing was written for.
+    local where = burnEffectWhere[name]
     local rem = 0
-    pcall(function() rem = tonumber(mq.TLO.Me.Buff(bn).Duration.TotalSeconds()) or 0 end)
-    if rem <= 0 and (kind == nil or kind == 'd' or kind == 's') then
-        pcall(function() rem = tonumber(mq.TLO.Me.Song(bn).Duration.TotalSeconds()) or 0 end)
+    if where ~= 's' then
+        pcall(function() rem = tonumber(mq.TLO.Me.Buff(bn).Duration.TotalSeconds()) or 0 end)
+        if rem > 0 then burnEffectWhere[name] = 'b' end
+    end
+    if rem <= 0 and where ~= 'b' then
+        local look = (where == 's') or (kind == nil or kind == 'd' or kind == 's')
+        -- An unresolved item or AA still gets looked for, just not on every single poll.
+        if not look and (mq.gettime() - (burnEffectProbeAt[name] or 0)) >= BURN_SONG_PROBE_MS then
+            burnEffectProbeAt[name] = mq.gettime()
+            look = true
+        end
+        if look then
+            pcall(function() rem = tonumber(mq.TLO.Me.Song(bn).Duration.TotalSeconds()) or 0 end)
+            if rem > 0 and burnEffectWhere[name] ~= 's' then
+                burnEffectWhere[name] = 's'
+                -- SAY IT ONCE. These are precisely the burns that were invisible before, so name them -
+                -- it is the difference between "the fix works" and "nothing looks different".
+                rezlog('[burns] %s lands in the short-duration window (%s) - now tracked', name, bn)
+            end
+        end
     end
     if rem <= 0 then buffLatch[name] = nil; return 0 end
     if not buffLatch[name] then buffLatch[name] = rem end   -- latch so dsecs doesn't churn the push key
@@ -2442,7 +2672,21 @@ function buff_slot_max(fallback)
     end
     return fallback
 end
+-- LATCHED, NOT LIVE - the same thing buffLatch does for burns, and for the same reason. This returned
+-- the buff's remaining seconds as read, so the number fell by one every read, the push key moved with
+-- it, and a draught that was simply sitting there re-broadcast itself for its whole duration. Three
+-- draughts across six characters is a steady trickle of messages that carry nothing new.
+-- Capture the remaining time once when it goes up and hold it; the driver already counts down from
+-- `updated` on its own, exactly as it does for burns, so nothing on the receiving side changes.
+potBuffLatch = {}
 function pot_buff_secs(base)
+    local rem = pot_buff_read(base)
+    if rem <= 0 then potBuffLatch[base] = nil; return 0 end
+    if not potBuffLatch[base] then potBuffLatch[base] = math.floor(rem) end
+    return potBuffLatch[base]
+end
+
+function pot_buff_read(base)
     local function dur(n)
         local r = 0
         pcall(function() r = tonumber(mq.TLO.Me.Buff(n).Duration.TotalSeconds()) or 0 end)
@@ -3019,6 +3263,15 @@ local function save_settings()
             end
             f:write('miniMode=' .. (miniMode and '1' or '0') .. '\n')
             f:write('uiLocked=' .. (uiLocked and '1' or '0') .. '\n')
+            f:write('uiTheme=' .. tostring(uiTheme or 'Midnight') .. '\n')
+            f:write('miniAggro=' .. (miniAggro and '1' or '0') .. '\n')
+            f:write('cothSwap=' .. (cothSwap and '1' or '0') .. '\n')
+            do   -- which pop-out panels are pinned. Numbers only, so an empty list is an empty line.
+                local pl = {}
+                for n, on in pairs(popLocked or {}) do if on then pl[#pl + 1] = tostring(n) end end
+                table.sort(pl)
+                f:write('popLocked=' .. table.concat(pl, ',') .. '\n')
+            end
             f:write('uiWideButtons=' .. (uiWideButtons and '1' or '0') .. '\n')
             f:write('uiHpBars=' .. (uiHpBars and '1' or '0') .. '\n')
             f:write('uiGroupStrip=' .. (uiGroupStrip and '1' or '0') .. '\n')
@@ -3141,6 +3394,17 @@ local function load_settings()
             if k == 'miniMagic' then miniMagic  = (v == '1' or v:lower() == 'true') end
             if k == 'miniMode' then miniMode = (v == '1' or v:lower() == 'true') end
             if k == 'uiLocked' then uiLocked = (v == '1' or v:lower() == 'true') end
+            if k == 'miniAggro' then miniAggro = (v == '1' or v:lower() == 'true') end
+            if k == 'cothSwap' then cothSwap = (v == '1' or v:lower() == 'true') end
+            -- BY NAME, and validated against the table. A settings file naming a theme that no longer
+            -- exists falls back rather than leaving at_theme() to guess every frame.
+            if k == 'uiTheme' then
+                for _, t in ipairs(AT_THEMES) do if t.name == v then uiTheme = v end end
+            end
+            if k == 'popLocked' then
+                popLocked = {}
+                for part in v:gmatch('%d+') do popLocked[tonumber(part)] = true end
+            end
             if k == 'uiWideButtons' then uiWideButtons = (v == '1' or v:lower() == 'true') end
             if k == 'uiHpBars' then uiHpBars = (v == '1' or v:lower() == 'true') end
             if k == 'uiGroupStrip' then uiGroupStrip = (v == '1' or v:lower() == 'true') end
@@ -3403,7 +3667,21 @@ function coth_targets()
             end
         end
     end
-    table.sort(hold); table.sort(rest)
+    -- EMBLEM HOLDERS IN CASTING-SPEED ORDER. This is the more valuable half of the priority: pulling a
+    -- cleric in first turns them into a six second summoner immediately, while pulling a rogue in first
+    -- adds nothing to the group's summoning capacity at all. The first head fetched decides how fast
+    -- every head after it arrives.
+    -- Alphabetical before this, which on 2026-08-20 opened a gather by summoning a rogue.
+    -- Same COTH_CLASS_RANK the summoner order uses, so there is one table to correct rather than two
+    -- that can disagree.
+    -- Non-holders keep the alphabetical order: they do not become summoners, so nothing is gained by
+    -- ranking them and a stable order is easier to read in a log.
+    table.sort(hold, function(a, b)
+        local ra, rb = coth_rank(a), coth_rank(b)
+        if ra ~= rb then return ra < rb end
+        return a < b
+    end)
+    table.sort(rest)
     for _, nm in ipairs(rest) do hold[#hold + 1] = nm end
     -- A BARD GOES TO THE BACK. Every other emblem holder we pull becomes a summoner we can rely on;
     -- a bard becomes one we have to fire blind with. Fetch the dependable ones first and the bard last,
@@ -3500,7 +3778,15 @@ function coth_set(on, at)
         COTH.skip, COTH.grey, COTHW = {}, {}, nil
         COTH.saidDone, COTH.quietAt, COTH.saidWait = nil, nil, nil
         COTH.saidScarce = nil
+        -- Fresh gather, fresh answers: last run's charm reports say nothing about this one.
+        COTH.swapped, COTH.saidWaitSwap, COTH.saidSwapDone = {}, nil, nil
         COTH.mine = 0
+        -- AND SWAP MY OWN, EXPLICITLY. peer_bcast goes to the GROUP and I do not hear myself - relay echo
+        -- is muted, which the startup banner says out loud. So the driver set COTH.active by hand here and
+        -- never received the /at_cothgo that carries the swap, which left it the one character summoning
+        -- unhasted - and, since group_members() counts me, permanently in its own waiting list. That is
+        -- the twelve second stall before every gather: it was waiting for itself.
+        cothSwapWant = { auto = true }
         pcall(function() peer_bcast('/at_cothgo on') end)
         rezlog('[coth] gather started - anchor point %d,%d,%d',
                COTH.at and COTH.at.x or 0, COTH.at and COTH.at.y or 0, COTH.at and COTH.at.z or 0)
@@ -3508,7 +3794,16 @@ function coth_set(on, at)
         -- slow, and that is worth ten seconds of nobody understanding why nothing happened.
         local em = coth_emblem()
         if em < 0 then
-            log('\\ay[coth] I have no %s - I cannot summon anybody\\ax', COTH.ITEM)
+            -- ASK TWICE BEFORE SAYING NO. This runs at gather start, BEFORE the charm goes on, and
+            -- FindItem can also be a beat behind an inventory move - so a bare 'I have no emblem' here
+            -- has been wrong twice tonight while the charm was sitting in a bag the whole time.
+            -- The socket walk is the second opinion: if a charm holding one exists, say that instead.
+            local c = coth_find_charm()
+            if c then
+                log('[coth] my emblem is in %s - putting it on before I summon', c)
+            else
+                log('\\ay[coth] I have no %s - I cannot summon anybody\\ax', COTH.ITEM)
+            end
         elseif em > 0 then
             log('[coth] my emblem is %ds into reuse - I will summon when it is ready', em)
         end
@@ -3516,6 +3811,7 @@ function coth_set(on, at)
         COTH.active, COTH.pending, COTH.at, COTHW = false, nil, nil, nil
         COTH.dbg = ''
         pcall(function() peer_bcast('/at_cothgo off') end)
+        cothSwapWant = { back = true, auto = true }   -- same reason: I do not hear my own broadcast
         rezlog('[coth] gather stopped')
     end
 end
@@ -3646,6 +3942,37 @@ COTH_BARD_MAX  = 2
 -- At or below this many holders, the bard keeps working. Two by intent: three carriers means two can
 -- cover for each other while the third is on cooldown, which is the point at which handing over pays.
 COTH_BARD_SCARCE = 2
+
+-- WHO SHOULD SPEND THE EMBLEM WHEN MORE THAN ONE COULD. A caster with beneficial spell haste gets the
+-- click out in around six seconds; a melee eats the full twelve. Firing whoever happens to be free first
+-- means a coin flip between those two on every head, and over six summons that is most of a minute.
+-- The cap is 50% off - MyCastTime is floored at CastTime/2 in MacroQuest's own source - so the ceiling on
+-- this is exactly the 12 to 6 you have measured, and no ordering can do better than that.
+-- ORDERED BY WHO RELIABLY CARRIES THE FOCUS, not by raw casting stat: healers almost always have it,
+-- pure casters usually do, hybrids often do not.
+-- The client cannot tell us who actually has it. Every readable route is dead - the socketed aug reports
+-- nothing useful, exactly as the Nightveil emblem does not report its timer, and there is no
+-- Me.SpellHasteFocus member in MacroQuest at all. So this is a stated policy rather than a measurement,
+-- and it is a table so it can be corrected from what you watch happen.
+COTH_CLASS_RANK = {
+    DRU = 1, CLR = 1, SHM = 1,                 -- healers: beneficial spell haste is near universal
+    ENC = 2, NEC = 2, WIZ = 2, MAG = 2,        -- pure casters
+    RNG = 3, BST = 3, SHD = 3, PAL = 3,        -- hybrids
+    BRD = 4,                                   -- already stands back on its own; last if it does not
+}
+COTH_RANK_DEFAULT = 4
+-- How many the anchor takes before class order applies to it. It is the only summoner at the start
+-- anyway - everyone else is away, which is why there is a gather - so this mostly matters for the moment
+-- the first arrival lands and could otherwise outrank the character that pulled them in.
+COTH_ANCHOR_CASTS = 2
+
+function coth_rank(nm)
+    local c = (member_class(nm) or ''):upper()
+    return COTH_CLASS_RANK[c] or COTH_RANK_DEFAULT
+end
+-- How long the driver will hold the first summon waiting for charms to go on. Generous: the swap is
+-- cursor work behind an E3 pause that itself waits up to 2.5s for E3 to actually stop.
+COTH_SWAP_WAIT = 12000
 -- How long a fired rung stays assumed-spent before the client's own timers are believed again.
 -- Long enough to cover a read that lies immediately after casting, short enough that it cannot mask a
 -- cooldown that has genuinely finished.
@@ -3702,6 +4029,41 @@ local function coth_tick()
         pcall(function() peer_bcast('/at_coth %s %d %d %d %d', myName, em, d, los, here) end)
     end
 
+    -- NOBODY SUMMONS UNTIL EVERYONE HAS SWAPPED. The point of the swap is the hasted cast, and a
+    -- character that starts casting while still mid-swap gets neither - it casts unhasted AND has its
+    -- charm off. So the first summon waits for the group to report in.
+    -- TIMED OUT, NOT BLOCKING. One character that never answers - loading, zoning, script not up - must
+    -- not hold a gather forever. After COTH_SWAP_WAIT the run starts regardless: an unhasted gather is
+    -- slower, a gather that never begins is broken.
+    -- Only while nothing has been summoned yet: once the cascade is moving, a late report is irrelevant.
+    if (COTH.mine or 0) == 0 and (now - (COTH.startedAt or now)) < COTH_SWAP_WAIT then
+        local waiting = {}
+        COTH.swapped = COTH.swapped or {}
+        for _, nm in ipairs(group_members()) do
+            if not COTH.swapped[nm] then waiting[#waiting + 1] = nm end
+        end
+        if #waiting > 0 then
+            COTH.dbg = 'waiting for charms: ' .. table.concat(waiting, ', ')
+            if not COTH.saidWaitSwap then
+                COTH.saidWaitSwap = true
+                rezlog('[coth] holding the first summon until the charms are on (%s)',
+                       table.concat(waiting, ', '))
+            end
+            return
+        end
+        -- SAY WHEN THE HOLD LIFTS, and how long it took. Without this the release is invisible: the tick
+        -- simply stops returning here, and that looks exactly like the next guard down returning instead
+        -- - 'not at the anchor myself' produces the same silence. Two runs could not be told apart.
+        -- Elapsed against the timeout is the number that matters: under it means everyone answered, at it
+        -- means somebody never did and the name to chase was in the line above.
+        if COTH.saidWaitSwap and not COTH.saidSwapDone then
+            COTH.saidSwapDone = true
+            local el = (now - (COTH.startedAt or now)) / 1000
+            rezlog('[coth] charms are on after %.1fs%s - summoning can start',
+                   el, (el >= (COTH_SWAP_WAIT / 1000) - 0.5) and ' (TIMED OUT, somebody never reported)' or '')
+        end
+    end
+
     -- Am I waiting on somebody? Nothing else happens until that resolves.
     if COTH.pending then
         local p = COTH.pending
@@ -3731,6 +4093,12 @@ local function coth_tick()
             -- ultimately about.
             local secs = (now - (COTH.startedAt or now)) / 1000
             rezlog('[coth] gather complete in %.1fs - everyone is with the group', secs)
+            -- PUT THE CHARM BACK HERE, because this is where a gather really ends. coth_set(false) is
+            -- only reached by /atcoth off - a gather that simply finishes sets COTH.active false right
+            -- above and never sends anything, so nothing was ever told to restore.
+            -- Every character runs this branch on its own pass, so each restores itself and no broadcast
+            -- is needed. Anyone who never gets here still has the COTH_SWAP_MAX backstop.
+            cothSwapWant = { back = true, auto = true }
             if (COTH.at and COTH.at.by or ''):lower() == myName:lower() then
                 pcall(function()
                     mq.cmdf('/gsay CoTH: Everyone is here. Took %.0f seconds to summon the group.', secs)
@@ -3800,6 +4168,36 @@ local function coth_tick()
                 COTH.saidScarce = true
                 rezlog('[coth] only %d emblem(s) between us - the bard keeps summoning rather than standing back',
                        holders)
+            end
+        end
+    end
+
+    -- LET THE FASTER CASTER TAKE IT. Same shape as the bard stand-back above and safe for the same
+    -- reason: the test is against coth_summoners(), which lists only who could fire THIS SECOND - here,
+    -- holding an emblem, off cooldown. Anyone away, empty-handed or cooling is not in it, so a better
+    -- class that cannot actually help never blocks anybody. There is no deadlock to guard against.
+    -- MID-CAST COUNTS AS UNAVAILABLE TOO: firing starts the emblem's reuse, which drops them out of the
+    -- list on their next report - so a summoner already working does not hold up the next one.
+    -- THE ANCHOR GOES FIRST FOR ITS FIRST FEW. It is the only summoner until it pulls somebody in, and
+    -- when that arrival lands with a ready emblem it could otherwise outrank the character that just
+    -- brought it here - leaving the anchor idle with its own emblem up, which is the waste this avoids.
+    do
+        local iAmAnchor = ((COTH.at and COTH.at.by) or ''):lower() == myName:lower()
+        if not (iAmAnchor and (COTH.mine or 0) < COTH_ANCHOR_CASTS) then
+            local myRank, better = coth_rank(myName), nil
+            for _, nm in ipairs(coth_summoners()) do
+                if nm:lower() ~= myName:lower() and coth_rank(nm) < myRank then
+                    better = nm; break
+                end
+            end
+            if better then
+                COTH.dbg = string.format('%s casts faster and is ready - standing back', better)
+                if not COTH.saidRank or (now - COTH.saidRank) > 8000 then
+                    COTH.saidRank = now
+                    rezlog('[coth] %s (%s) is ready and casts faster than me (%s) - letting them take it',
+                           better, member_class(better) or '?', member_class(myName) or '?')
+                end
+                return
             end
         end
     end
@@ -3894,6 +4292,11 @@ local function coth_tick()
     -- Bards get no cast bar from the emblem - Me.Casting stays at zero throughout - so waiting for that
     -- alone concluded 'never started casting' every time, on a character that was summoning perfectly
     -- well. The emblem's own reuse timer starting is the other proof, and it is true for everybody.
+    -- HOW LONG DOES THIS ACTUALLY TAKE? Not from the item - the socketed emblem is the same shape as the
+    -- Nightveil aug, whose TimerReady reads 0 forever once it is in a charm, so its CastTime is not to be
+    -- trusted either. Measured from the cast bar instead, which is the only number that includes whatever
+    -- haste is really applying.
+    local castFrom = mq.gettime()
     local started, sawBar = false, false
     mq.delay(3000, function()
         sawBar = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0
@@ -3937,10 +4340,25 @@ local function coth_tick()
     COTH.grey[mine] = mq.gettime()
     COTH.pending = nil
     COTH.mine = (COTH.mine or 0) + 1
-    rezlog('[coth]   cast finished for %s - assuming they made it, moving on', mine)
+    -- Only meaningful when a cast bar was seen: without one the wait above was a fixed sleep and timing
+    -- it would just measure our own delay.
+    local took = (mq.gettime() - castFrom) / 1000
+    if sawBar then
+        COTH.castSecs = took
+        -- READ THE SLOT, NOT OUR OWN BOOKKEEPING. This said 'charm off' whenever cothCharmSaved was nil -
+        -- which is true when we DID NOT SWAP, and that includes the case where the emblem was already in
+        -- the worn charm and no swap was needed. Nityrc cast six times at 6.1s with the charm on and every
+        -- line claimed it was off, which nearly got the whole swap written off as useless.
+        -- The question is whether the emblem is worn AT THIS MOMENT. Ask the charm slot.
+        local wornNow = false
+        pcall(function() wornNow = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
+        rezlog('[coth]   cast finished for %s in %.1fs (emblem %s) - assuming they made it, moving on',
+               mine, took, wornNow and 'WORN' or 'in a bag')
+    else
+        rezlog('[coth]   cast finished for %s - assuming they made it, moving on', mine)
+    end
 end
 
--- ===== DI staff: the tank's last-ditch death save, fired once the cleric's own options are spent =====
 -- Same baton idea as the rez, but simpler: fixed target (the tank), no corpse, no handshake. Kept in ONE
 -- global table rather than a dozen locals - this chunk is at Lua's 200-local ceiling.
 DI = {
@@ -4658,6 +5076,336 @@ function diq_zone_elsewhere(nm)
     if (rr.zone or 0) <= 0 then return false end               -- reported no zone: ask
     if (mq.gettime() - (rr.updated or 0)) >= 30000 then return false end   -- stale: ask
     return rr.zone ~= myZone
+end
+
+-- ===========================================================================
+--  AGGRO SAMPLING - data only, nothing drawn yet
+-- ===========================================================================
+-- WHY THIS HAS TO BE A GROUP THING. A client is told two facts about threat: its OWN percentage, and
+-- who is currently top. It is never told anybody else's number. So no single character can see the
+-- group's threat picture, and no standalone tool can build one either - which is exactly the shape of
+-- problem the peer network exists for. Six characters each hold one number nobody else can see; collect
+-- them on the driver and it has a picture the game shows to no one.
+--
+-- THE TARGET ID IS NOT OPTIONAL. Two characters on different mobs report percentages of different
+-- things, and averaged together they are meaningless. Every report carries the id it was measured
+-- against and the driver discards anything that is not its own target.
+--
+-- AND IT CHECKS ITSELF. The mob also names whoever is top. If the collected percentages say Khulian is
+-- highest and the client says the holder is Sebbun, the reports are stale or the ids disagree - and we
+-- find that out rather than trusting a wrong picture. That cross-check is the reason this is worth
+-- building before any drawing: a dataset that can catch itself being wrong is rare.
+--
+-- NOTHING ACTS ON THIS. It samples, pushes, and logs. Two questions decide whether a sparkline is worth
+-- drawing at all, and neither can be answered from outside the game: how often the number actually
+-- moves, and how often a character is on a different mob. Off by default; /ataggro on.
+AGG = {
+    on     = false,     -- sampling and pushing
+    state  = {},        -- [name] = { pct =, tid =, top =, updated = }
+    key    = '',
+    lastPush = 0,
+    lastRead = 0,
+    lastLog  = 0,
+    moves    = 0,       -- how many times MY OWN percentage changed since the last summary
+    samples  = 0,
+}
+AGG_READ_MS   = 250      -- how often to look, in combat
+AGG_PUSH_MS   = 1000     -- ceiling on how often to send, in combat
+AGG_IDLE_MS   = 5000     -- and out of it
+AGG_LOG_MS    = 5000     -- how often the driver prints the collected picture
+-- KEEPALIVE, exactly as the DI push has. Sending only on change looked right and was wrong in the first
+-- session: a character whose number is steady never sends again, so it aged past the staleness window
+-- and dropped out of the picture - which is why the first log showed '[4 stale]' with everyone present
+-- and reporting fine. Steady is not silent, and the summary has no way to tell them apart on its own.
+AGG_KEEP_MS   = 3000     -- resend an unchanged number this often, in combat
+AGG_KEEP_IDLE = 10000    -- and out of it
+-- Comfortably past the in-combat keepalive, so a steady character is never called stale.
+AGG_STALE_MS  = 8000
+-- WHAT COUNTS AS A REAL PERCENTAGE. The first session logged 'Sebbun 999', which is not a percentage of
+-- anything - so the reads have at least one sentinel for "no answer" that is not NULL and not negative.
+-- Anything outside the range is recorded raw for the probe and reported as unknown rather than plotted.
+AGG_PCT_MAX   = 100
+
+-- EVERY WAY OF ASKING, SIDE BY SIDE - the same approach as di_staff_reads, and for the same reason: the
+-- accessor names here are not something to be confident about from outside the client, and a read that
+-- is absent looks identical to one that returns nothing. Print them all and let the numbers say which
+-- ones this build actually answers. /ataggro probe.
+function agg_reads()
+    local f = {}
+    local function get(label, fn)
+        local v = 'n/a'
+        pcall(function() v = tostring(fn() or 'NULL') end)
+        f[#f + 1] = label .. '=' .. v
+    end
+    get('Me.PctAggro',              function() return mq.TLO.Me.PctAggro() end)
+    get('Target.PctAggro',          function() return mq.TLO.Target.PctAggro() end)
+    get('Me.SecondaryPctAggro',     function() return mq.TLO.Me.SecondaryPctAggro() end)
+    get('Target.SecondaryPctAggro', function() return mq.TLO.Target.SecondaryPctAggro() end)
+    get('Target.AggroHolder',       function() return mq.TLO.Target.AggroHolder() end)
+    get('Me.SecondaryAggroPlayer',  function() return mq.TLO.Me.SecondaryAggroPlayer() end)
+    get('Target.ID',                function() return mq.TLO.Target.ID() end)
+    get('Target.Name',              function() return mq.TLO.Target.Name() end)
+    return table.concat(f, '  ')
+end
+
+-- MY OWN NUMBER, and what it was measured against. Returns -1 for the percentage when there is nothing
+-- to measure, which is different from 0 - zero aggro on a mob is a fact, no target is not.
+function agg_read_self()
+    local tid = 0
+    pcall(function() tid = tonumber(mq.TLO.Target.ID()) or 0 end)
+    if tid <= 0 then return -1, 0, '' end
+    local pct = -1
+    pcall(function() pct = tonumber(mq.TLO.Me.PctAggro()) or -1 end)
+    -- Fall back rather than assume. If this build answers on the Target side and not on Me, the first
+    -- read is NULL and this one carries it; if neither answers, the probe says so plainly.
+    if pct < 0 then pcall(function() pct = tonumber(mq.TLO.Target.PctAggro()) or -1 end) end
+    -- OUT OF RANGE IS NOT A NUMBER. 999 appeared in the first session and would have been plotted as a
+    -- spike ten times taller than the panel. Kept raw so /ataggro can say what the sentinel actually is,
+    -- reported as -1 so nothing downstream treats it as a measurement.
+    if pct > AGG_PCT_MAX then
+        AGG.badRaw, AGG.bad = pct, (AGG.bad or 0) + 1
+        pct = -1
+    end
+    local top = ''
+    pcall(function() top = tostring(mq.TLO.Target.AggroHolder() or '') end)
+    return pct, tid, top
+end
+
+-- THE COLLECTED PICTURE, once every AGG_LOG_MS while there is something to say. Driver only - it is the
+-- only character that has everyone's reports.
+-- Prints the disagreement explicitly rather than leaving it to be noticed: if the numbers name a
+-- different top holder than the client does, that line is the whole point of the exercise.
+-- WHAT THE CLIENT CALLS 'AggroHolder' IS SECOND PLACE, NOT FIRST. Measured 2026-08-19 over a long
+-- fight: on the tank, Me.PctAggro read 100 while Target.AggroHolder named Lunafeet, and the first
+-- version of this called that a contradiction and shouted DISAGREE on every single sample.
+-- It was not a contradiction, it was a wrong assumption about the name. In every dump
+-- Target.AggroHolder and Me.SecondaryAggroPlayer returned the SAME name, and Target.SecondaryPctAggro
+-- tracked that character's own reported number to the point: 33/33, 34/34, 36/36, 38/38, and when the
+-- monk feigned and dropped to 1 the client moved to Khulian at 26 while Khulian reported 26.
+-- So the comparison worth making is between the client's #2 and OUR #2 - and it is a genuinely strong
+-- check, because the two numbers come from completely independent places: one from this client's own
+-- hate readout, the other relayed from that character's machine.
+function agg_summary()
+    if not SHOW_UI then return end
+    local myTid = 0
+    pcall(function() myTid = tonumber(mq.TLO.Target.ID()) or 0 end)
+    if myTid <= 0 then return end
+    local now = mq.gettime()
+    local rows, off, stale, unread = {}, 0, 0, 0
+    for _, nm in ipairs(ordered_members()) do
+        local st = AGG.state[nm]
+        if not st then
+            -- nothing heard from them at all
+        elseif (now - (st.updated or 0)) > AGG_STALE_MS then
+            stale = stale + 1
+        elseif (st.tid or 0) ~= myTid then
+            off = off + 1
+        elseif (st.pct or -1) < 0 then
+            -- Reporting, on the right mob, but the client gave no usable number. Counted separately:
+            -- 'no answer' and 'not here' are different problems and want different fixes.
+            unread = unread + 1
+        else
+            rows[#rows + 1] = { nm = nm, pct = st.pct }
+        end
+    end
+    if #rows == 0 then return end
+    -- Highest first, so first and second place fall out of the sort rather than being tracked by hand.
+    table.sort(rows, function(x, y) return x.pct > y.pct end)
+    local parts = {}
+    for _, r in ipairs(rows) do parts[#parts + 1] = string.format('%s %d', r.nm, r.pct) end
+    local first  = rows[1]
+    local second = rows[2]
+
+    local holder, secPct = '', -1
+    pcall(function() holder = tostring(mq.TLO.Target.AggroHolder() or '') end)
+    pcall(function() secPct = tonumber(mq.TLO.Target.SecondaryPctAggro()) or -1 end)
+
+    -- Two checks, not one. The NAME says we agree on who is second; the NUMBER says the relayed value
+    -- matches what this client independently believes it to be. A tolerance of 4 because the reports are
+    -- up to a second old and the number moves while they travel - an exact match would cry wolf.
+    local verdict = '?'
+    if holder ~= '' and second then
+        if holder:lower() ~= second.nm:lower() then
+            verdict = 'MISMATCH - client says ' .. holder
+        elseif secPct >= 0 and math.abs(secPct - second.pct) > 4 then
+            verdict = string.format('name ok, value off by %d (client %d)',
+                                    math.abs(secPct - second.pct), secPct)
+        else
+            verdict = 'confirmed'
+        end
+    elseif holder ~= '' and not second then
+        verdict = 'client says ' .. holder .. ', nobody else reporting'
+    end
+
+    rezlog('[agg] tid=%d  %s  | top %s | second %s (%s)%s%s%s',
+           myTid, table.concat(parts, '  '),
+           first and first.nm or '?',
+           second and second.nm or '-', verdict,
+           (off > 0) and string.format('  [%d on another mob]', off) or '',
+           (stale > 0) and string.format('  [%d stale]', stale) or '',
+           (unread > 0) and string.format('  [%d no read]', unread) or '')
+
+    -- Only a real mismatch is worth the accessor dump now. The old test fired on every sample, which
+    -- buried the one thing it was there to catch under a copy of itself every five seconds.
+    if verdict:find('MISMATCH', 1, true) and (now - (AGG.lastWhy or 0)) > 15000 then
+        AGG.lastWhy = now
+        rezlog('[agg] ...accessors here at that moment: %s', agg_reads())
+    end
+end
+
+-- HISTORY, SAMPLED ON A CLOCK - not when messages arrive. This is the whole difference between a
+-- sparkline and a lie: pushes are change-driven and rate-limited, so a character whose number is steady
+-- sends nothing for seconds while a character who is climbing sends constantly. Plotting arrivals would
+-- draw the steady one as a short flat line and the climbing one as a long steep one, and the x-axis
+-- would mean 'messages' while looking like it means 'time'.
+-- So the driver reads its OWN state table on a fixed tick and writes one slot per character per second,
+-- whatever did or did not arrive in between. Time is then the same distance everywhere on the row.
+-- nil IS A VALUE. A character on another mob, or gone quiet, records a hole rather than being dropped
+-- or carried forward - a break in the line says 'not measurable here', which is true and is worth
+-- seeing. Carrying the last value forward would invent a flat stretch that never happened.
+AGG_HIST_N  = 40      -- slots kept per character
+AGG_HIST_MS = 1000    -- one slot this often
+
+function agg_hist_tick()
+    if not SHOW_UI then return end
+    if (mq.gettime() - (AGG.histAt or 0)) < AGG_HIST_MS then return end
+    AGG.histAt = mq.gettime()
+    local myTid = 0
+    pcall(function() myTid = tonumber(mq.TLO.Target.ID()) or 0 end)
+    AGG.hist = AGG.hist or {}
+    local now = mq.gettime()
+    for _, nm in ipairs(ordered_members()) do
+        local h = AGG.hist[nm]
+        if not h then h = {}; AGG.hist[nm] = h end
+        local st = AGG.state[nm]
+        local v = nil
+        if myTid > 0 and st and (st.tid or 0) == myTid
+           and (now - (st.updated or 0)) <= AGG_STALE_MS and (st.pct or -1) >= 0 then
+            v = st.pct
+        end
+        h[#h + 1] = v or false          -- false, not nil: a nil would collapse the array
+        while #h > AGG_HIST_N do table.remove(h, 1) end
+    end
+end
+
+-- ONE LINE PER CHARACTER, thirty seconds wide. A number tells you where somebody is; only the shape
+-- tells you where they are GOING, and those are different decisions. 79 and steady is fine; 79 and
+-- climbing for the last twenty seconds means they take it in about eight.
+-- SEGMENTS, NOT AddPolyline. The polyline call takes a point array and the binding's exact argument
+-- shape for that is the one thing /atdraw cannot confirm - it probes that the method EXISTS, not how it
+-- wants its points. AddLine is already proven in this file. Thirty segments a row is cheap next to a row
+-- that silently draws nothing.
+function draw_aggro()
+    if not AGG.on then
+        ImGui.TextDisabled('aggro sampling is off - /ataggro on')
+        return
+    end
+    local myTid = 0
+    pcall(function() myTid = tonumber(mq.TLO.Target.ID()) or 0 end)
+    if myTid <= 0 then ImGui.TextDisabled('no target'); return end
+    AGG.hist = AGG.hist or {}
+
+    local chars = {}
+    for _, nm in ipairs(ordered_members()) do
+        local h = AGG.hist[nm]
+        if h and #h > 0 then
+            for _, v in ipairs(h) do
+                if v ~= false then chars[#chars + 1] = nm; break end
+            end
+        end
+    end
+    if #chars == 0 then ImGui.TextDisabled('nothing on this target yet'); return end
+
+    local fs = 16
+    pcall(function() fs = ImGui.GetFontSize() or 16 end)
+    local labelW = 0
+    pcall(function()
+        for _, nm in ipairs(chars) do
+            local w = ImGui.CalcTextSize(nm) or 0
+            if w > labelW then labelW = w end
+        end
+    end)
+    labelW = math.ceil(labelW) + 10
+    local sw, sh = 140, math.max(12, math.floor(fs * 0.9))
+
+    for _, nm in ipairs(chars) do
+        local h = AGG.hist[nm] or {}
+        local cur = nil
+        for i = #h, 1, -1 do if h[i] ~= false then cur = h[i]; break end end
+        ui_text(UI_LABEL, nm)
+        ImGui.SameLine(labelW)
+        pcall(function()
+            local x, y = ImGui.GetCursorScreenPos()
+            local dl   = ImGui.GetWindowDrawList()
+            local top  = y + math.floor(fs * 0.5) - sh * 0.5
+            dl:AddRectFilled(ImVec2(x, top), ImVec2(x + sw, top + sh), IM_COL32(30, 33, 42, 255), 2)
+            -- The line you care about crossing. Not a rule about the game - a place to put your eye.
+            local ty = top + sh * 0.2
+            dl:AddLine(ImVec2(x, ty), ImVec2(x + sw, ty), IM_COL32(90, 96, 116, 140), 1)
+
+            local n    = AGG_HIST_N
+            local step = sw / math.max(1, n - 1)
+            local function px(i) return x + (i - 1) * step end
+            local function py(v) return top + sh - (v / 100) * sh end
+            -- Right-aligned: the newest sample sits at the right edge whatever the buffer holds, so a
+            -- half-full history after a fresh target does not stretch itself across the whole row.
+            local off = n - #h
+            local pr, pg, pb = 150, 155, 170
+            if (cur or 0) >= 80 then pr, pg, pb = 225, 150, 70
+            elseif (cur or 0) >= 50 then pr, pg, pb = 210, 190, 90 end
+            for i = 2, #h do
+                local a, b = h[i - 1], h[i]
+                -- Both ends must be real. A hole breaks the line rather than being bridged, because a
+                -- bridge would draw a measurement that was never taken.
+                if a ~= false and b ~= false then
+                    dl:AddLine(ImVec2(px(off + i - 1), py(a)), ImVec2(px(off + i), py(b)),
+                               IM_COL32(pr, pg, pb, 230), 1.5)
+                end
+            end
+            if cur then
+                dl:AddCircleFilled(ImVec2(x + sw, py(cur)), 2.5, IM_COL32(pr, pg, pb, 255), 0)
+            end
+            ImGui.Dummy(sw, fs)
+        end)
+        ImGui.SameLine()
+        if cur then
+            ui_text((cur >= 80) and UI_WAIT or UI_LABEL, string.format('%d', cur))
+        else
+            ImGui.TextDisabled('-')
+        end
+    end
+end
+
+-- Sample, push on change, and let the driver summarise. Called from the main loop.
+function agg_tick()
+    if not AGG.on then return end
+    local ic = false
+    pcall(function() ic = (tostring(mq.TLO.Me.CombatState() or ''):upper() == 'COMBAT') end)
+    local gap = ic and AGG_READ_MS or AGG_IDLE_MS
+    if (mq.gettime() - AGG.lastRead) >= gap then
+        AGG.lastRead = mq.gettime()
+        local pct, tid, top = agg_read_self()
+        AGG.samples = AGG.samples + 1
+        -- HOW OFTEN DOES IT ACTUALLY MOVE? One of the two questions this whole exercise exists to
+        -- answer, counted here where the raw reads are, rather than inferred later from the pushes -
+        -- the pushes are rate limited and would undercount badly.
+        local k = string.format('%d/%d', pct, tid)
+        if k ~= AGG.key then AGG.moves = AGG.moves + 1 end
+        local since   = mq.gettime() - AGG.lastPush
+        local changed = (k ~= AGG.key) and since >= (ic and AGG_PUSH_MS or AGG_IDLE_MS)
+        local keep    = since >= (ic and AGG_KEEP_MS or AGG_KEEP_IDLE)
+        if changed or keep then
+            AGG.key, AGG.lastPush = k, mq.gettime()
+            AGG.state[myName] = { pct = pct, tid = tid, top = top, updated = mq.gettime() }
+            peer_bcast('/at_agg %s %d %d %s', myName, pct, tid,
+                       (top ~= '') and top:gsub(' ', '_') or '-')
+        end
+    end
+    if SHOW_UI and (mq.gettime() - AGG.lastLog) >= AGG_LOG_MS then
+        AGG.lastLog = mq.gettime()
+        pcall(agg_summary)
+    end
+    pcall(agg_hist_tick)
 end
 
 function diq_candidates()
@@ -6341,7 +7089,13 @@ pcall(function()
     --   /atcoth off    stop
     -- The rewrite dropped this bind while keeping its unbind, so the command simply did nothing.
     mq.bind('/atcoth', function(arg)
+        local a = arg and tostring(arg):lower() or ''
+        -- /atcoth group - I am the only summoner and the rest of the group are other people's characters,
+        -- so there is nothing to talk to. Deliberately separate from the peer gather below.
+        if a == 'group' then cothgSetWanted = 'on'; return end
+        if a == 'groupoff' then cothgSetWanted = 'off'; return end
         local off = arg and tostring(arg):lower() == 'off'
+        if COTHG.active and off then cothgSetWanted = 'off'; return end
         -- coth_set broadcasts, and peer_bcast can wait on channel detection - so the bind records and the
         -- tick acts, the same as the buttons.
         cothSetWanted = off and 'off' or 'on'
@@ -6476,6 +7230,46 @@ pcall(function()
         -- arrives in /at_cothat, and until it does everyone reports -1 and nobody is judged 'away'.
         COTH.state = {}
         if mode ~= 'on' then COTH.at = nil end
+        -- THE SAME PER-GATHER RESET THE STARTER DOES. coth_set(true) clears these, but coth_set only runs
+        -- on the character that STARTS the gather - everyone else arrives here instead, and these flags
+        -- were left holding the previous gather's answers.
+        -- saidDone is the one that bit: it is the 'announce completion once' guard, and the block it
+        -- guards is where a character asks for its charm back. Still true from last time, a worker skipped
+        -- that block entirely and never restored - so the driver put its charm back and nobody else did,
+        -- and the next gather found them already wearing the emblem with the real charm in a bag.
+        -- Stylin, 2026-08-20: restored after gather 1, not after gather 2, restored after gather 3 - and
+        -- gather 3 was the one where it was the driver.
+        if mode == 'on' then
+            COTH.saidDone, COTH.saidWait, COTH.saidRank = nil, nil, nil
+            COTH.swapped, COTH.saidWaitSwap, COTH.saidSwapDone = {}, nil, nil
+            COTH.mine, COTH.saidScarce = 0, nil
+            COTH.skip, COTH.grey = {}, {}
+        end
+        -- THE CHARM RIDES THE GATHER, both ends. Every character hears this, so the swap needs no
+        -- fan-out of its own - and every way a gather ends already sends 'off', which is what makes the
+        -- restore reach the same set of characters the swap did.
+        -- Requested here, done in the main loop: this is a bind, and the swap waits on the cursor.
+        if mode == 'on' then
+            cothSwapWant = { auto = true }
+        else
+            cothSwapWant = { back = true, auto = true }
+        end
+    end)
+    mq.bind('/at_cothswapset', function(mode)
+        cothSwap = (mode == 'on')
+        save_settings()
+    end)
+    -- Who has finished swapping. Collected by whoever is driving, so it knows when to start summoning.
+    mq.bind('/at_cothswapped', function(who, state)
+        if not who then return end
+        COTH.swapped = COTH.swapped or {}
+        COTH.swapped[who] = state or 'ok'
+    end)
+    mq.bind('/at_agg', function(name, pct, tid, top)
+        if not name then return end
+        AGG.state[name] = { pct = tonumber(pct) or -1, tid = tonumber(tid) or 0,
+                            top = (top and top ~= '-') and top:gsub('_', ' ') or '',
+                            updated = mq.gettime() }
     end)
     mq.bind('/at_di', function(name, staff, em, dg, save, sname)
         if name then
@@ -8652,6 +9446,11 @@ chainMode       = {}      -- [nameLower] = 'off' | 'raid'   (absent = group only
 function chain_mode(nm) return chainMode[(nm or ''):lower()] or 'group' end
 function chain_off(nm)  return chain_mode(nm) == 'off' end
 uiLocked        = false   -- lock both windows in place: no dragging, no resizing
+-- Per pop-out panel, keyed by panel number. Separate from uiLocked on purpose: pinning the panel you
+-- parked in a corner should not also pin the mini window you still want to move.
+miniAggro       = false   -- the aggro sparkline section; off until it has earned a place
+popLocked       = popLocked or {}   -- `or {}`, per the convention above: a plain assignment here would
+                                    -- wipe the loaded value if this line ever moved below load_settings
 miniMode        = false   -- compact window when minimized. NOT local: save_settings is defined
                           -- further up the file and would otherwise write a same-named global.
 -- NOT local: save_settings/load_settings are defined further up the file, so a local declared here
@@ -9587,6 +10386,24 @@ function draw_burn_running()
                 end
             end
         end
+        -- THE DRAUGHTS TOO. potState has carried 'up' and 'dsecs' since it was written - the same two
+        -- numbers a burn reports - and nothing has ever drawn them as time. A group draught is exactly
+        -- the thing you want to see running: it is spent from a stack, it covers the whole group, and
+        -- 'is Fleeting still up' is the question that decides whether the next one gets drunk.
+        -- Given a fixed hue rather than burn_colour, because they are not burns and should not be read
+        -- as one character's cooldown - the same draught is up on everybody at once.
+        for _, gp in ipairs(GROUP_POTS) do
+            local ps = (potState[c] or {})[gp.key]
+            if ps and (ps.up or 0) > 0 and (ps.dsecs or 0) > 0 then
+                local age  = math.floor((mq.gettime() - (ps.updated or 0)) / 1000)
+                local left = math.max(0, (ps.dsecs or 0) - age)
+                if left > 0 then
+                    if not byChar[c] then byChar[c] = {}; order[#order + 1] = c end
+                    byChar[c][#byChar[c] + 1] = { it = gp.label, left = left, total = ps.dsecs,
+                                                  rgb = UI_POT_RGB }
+                end
+            end
+        end
     end
     if #order == 0 then
         -- Nothing running is the normal state, and it should read as calm rather than as an error.
@@ -9619,8 +10436,11 @@ function draw_burn_running()
         table.sort(rows, function(a, b) return a.left < b.left end)
         ui_text(UI_LABEL, c .. ':')
         for _, r in ipairs(rows) do
-            local br, bg, bb = burn_colour(r.st)
-            local rgb = { math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) }
+            local rgb = r.rgb
+            if not rgb then
+                local br, bg, bb = burn_colour(r.st)
+                rgb = { math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) }
+            end
             ImGui.Dummy(18, fs)          -- indent, so the discs read as belonging to the name above
             ImGui.SameLine(24)
             ImGui.TextColored(0.80, 0.80, 0.80, 1.0, r.it)
@@ -13346,6 +14166,565 @@ end
 -- cast guard will not relent, so the run spins until the 180s backstop tears it down and the next run
 -- walks into the same wall. Observed on Shela 2026-08-05 - the offhand needed three attempts and got
 -- them, the mainhand needed a fourth and did not.
+-- FIND IT BY THE AUG IT HOLDS. The charm has a different name on every character, so anything built on
+-- a name needs a per-character setting - and a setting that must be right on six toons will be wrong on
+-- one of them. The aug's name is the same everywhere.
+-- SOCKET WALK, taken from augcheck.lua's inspect(). AugSlot1..6 give the socket TYPE - 0 means no socket
+-- there, 20 and 30 are ornaments - and AugSlot(n).Item.Name() is what is actually seated in it.
+-- The first attempt at this asked whether the CHARM granted Call of the Hero, via Spell.Name. That was
+-- wrong: the aug grants the click, and a host item does not reliably report a socketed aug's clicky as
+-- its own spell - so it would have searched every bag and found nothing.
+-- The Spell/Clicky read stays as a fallback for the case where the charm itself is the clicky.
+COTH_SPELL = 'Call of the Hero'
+
+function coth_item_has_emblem(item)
+    local nm = ''
+    pcall(function() nm = tostring(item.Name() or '') end)
+    if nm == '' or nm == 'NULL' then return false end
+    for a = 1, 6 do
+        local stype = 0
+        pcall(function() stype = tonumber(item['AugSlot' .. a]()) or 0 end)
+        if stype > 0 and stype ~= 20 and stype ~= 30 then
+            local an = ''
+            pcall(function() an = tostring(item.AugSlot(a).Item.Name() or '') end)
+            if an == COTH.ITEM then return true end
+        end
+    end
+    -- Fallback: the item itself is the clicky rather than hosting an aug that is.
+    local sp, cl = '', ''
+    pcall(function() sp = tostring(mq.TLO.FindItem('=' .. nm).Spell.Name() or '') end)
+    pcall(function() cl = tostring(mq.TLO.FindItem('=' .. nm).Clicky.Name() or '') end)
+    local want = COTH_SPELL:lower()
+    return sp:lower() == want or cl:lower() == want
+end
+
+-- Returns: name, alreadyWorn. nil when this character has no such item at all.
+function coth_find_charm()
+    local worn = ''
+    pcall(function() worn = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if worn ~= '' and worn ~= 'NULL' then
+        local hit = false
+        pcall(function() hit = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
+        if hit then return worn, true end
+    end
+    -- Twelve, not ten: augcheck walks pack1..12 and there is no reason to look at fewer.
+    for pk = 1, 12 do
+        local slots = 0
+        pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. pk).Container()) or 0 end)
+        for s = 1, slots do
+            local id = 0
+            pcall(function() id = tonumber(mq.TLO.Me.Inventory('pack' .. pk).Item(s).ID()) or 0 end)
+            if id > 0 then
+                local hit, nm = false, ''
+                pcall(function()
+                    hit = coth_item_has_emblem(mq.TLO.Me.Inventory('pack' .. pk).Item(s))
+                    nm  = tostring(mq.TLO.Me.Inventory('pack' .. pk).Item(s).Name() or '')
+                end)
+                if hit and nm ~= '' then return nm, false end
+            end
+        end
+    end
+    return nil, false
+end
+
+-- ===========================================================================
+--  SOLO GATHER - /atcoth group. One summoner, real players for a group.
+-- ===========================================================================
+-- A DIFFERENT PROBLEM WEARING THE SAME NAME. The gather above is a conversation between six copies of
+-- AdventureTime: everyone reports position, the summoner asks before spending an emblem, the target
+-- confirms it arrived. None of that exists here, because the other five are people. There is nobody to
+-- report, nobody to ask, and nobody to confirm.
+-- So this reads the client instead of the network. Group.Member(n).Spawn gives the distance and the id
+-- and that is the whole picture: anybody further than the anchor range gets summoned, one at a time,
+-- until the list is clear or the group stops moving.
+-- WHY IT IS WORTH HAVING AT ALL rather than clicking six times by hand: the charm. The emblem goes on
+-- before the first summon and comes off after the last one, which is the part nobody wants to do
+-- manually and the part that halves the cast for anyone who has the focus.
+-- NO PEER TRAFFIC. Nothing here broadcasts, and it deliberately does not touch COTH.active - a solo run
+-- and a group gather must not be able to interfere with each other.
+COTHG = { active = false, at = nil, castAt = 0, done = 0, saidWait = 0, startedAt = 0 }
+COTHG_GIVE_UP = 300000   -- a whole run cannot outlast this, however stubborn the list is
+
+-- Everyone in the group except me, with what the CLIENT can see: spawn id and how far away they are.
+-- A member with no spawn is in another zone and cannot be summoned - said once rather than retried.
+function cothg_targets()
+    local out = {}
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.Group.Members()) or 0 end)
+    for i = 1, n do
+        local nm, id, dist = '', 0, -1
+        pcall(function() nm = tostring(mq.TLO.Group.Member(i).Name() or '') end)
+        pcall(function() id = tonumber(mq.TLO.Group.Member(i).Spawn.ID()) or 0 end)
+        pcall(function() dist = tonumber(mq.TLO.Group.Member(i).Spawn.Distance3D()) or -1 end)
+        -- Distance3D exists (checked against MacroQuest's own MQ2SpawnType), but a failed read would
+        -- come back -1 and read as 'far', which summons somebody standing next to me. Fall back to the
+        -- flat distance rather than let a nil decide.
+        if dist < 0 then
+            pcall(function() dist = tonumber(mq.TLO.Group.Member(i).Spawn.Distance()) or -1 end)
+        end
+        if nm ~= '' and nm:lower() ~= myName:lower() then
+            out[#out + 1] = { name = nm, id = id, dist = dist }
+        end
+    end
+    return out
+end
+
+function cothg_set(on)
+    if on then
+        local x, y, z = 0, 0, 0
+        pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
+        pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
+        pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
+        COTHG.active, COTHG.at = true, { x = x, y = y, z = z }
+        COTHG.castAt, COTHG.done, COTHG.saidWait = 0, 0, 0
+        COTHG.startedAt = mq.gettime()
+        rezlog('[cothg] solo gather started - I am the only summoner')
+        -- SAY IT OUT LOUD. Everyone else here is a person, and a summon that arrives with no warning is
+        -- the difference between 'thanks' and 'what just happened'. The group gather says nothing per
+        -- summon because the other five are scripts and do not read /gsay.
+        pcall(function() mq.cmd('/gsay CoTH: Gathering the group') end)
+        -- The charm goes on the same way it does for a group gather, through the same code and the same
+        -- recovery file. Off means click it from the bag, exactly as the toggle promises everywhere else.
+        if cothSwap then cothSwapWant = { auto = true } end
+    else
+        COTHG.active = false
+        rezlog('[cothg] solo gather stopped after %d summon(s)', COTHG.done or 0)
+        cothSwapWant = { back = true, auto = true }
+    end
+end
+
+function cothg_tick()
+    if not COTHG.active then return end
+    local now = mq.gettime()
+    if (now - (COTHG.startedAt or now)) > COTHG_GIVE_UP then
+        rezlog('\\ay[cothg] giving up after %ds\\ax', COTHG_GIVE_UP / 1000)
+        pcall(function() mq.cmd('/gsay CoTH: giving up - some of you will need to make your own way.') end)
+        cothg_set(false)
+        return
+    end
+    -- Nothing starts until the charm is settled. cothSwapWant is cleared by the swap tick, so this is
+    -- simply 'a swap has been asked for and has not run yet'.
+    if cothSwapWant then return end
+
+    local far, missing = {}, {}
+    for _, m in ipairs(cothg_targets()) do
+        if m.id <= 0 then missing[#missing + 1] = m.name
+        elseif m.dist < 0 or m.dist > COTH.RANGE then far[#far + 1] = m end
+    end
+    if #far == 0 then
+        rezlog('[cothg] everyone is here after %d summon(s)%s', COTHG.done or 0,
+               (#missing > 0) and (' - not in zone: ' .. table.concat(missing, ', ')) or '')
+        local secs = (now - (COTHG.startedAt or now)) / 1000
+        -- Only worth saying if something actually happened - announcing a gather where nobody needed
+        -- summoning is noise in somebody else's chat window.
+        if (COTHG.done or 0) > 0 then
+            pcall(function()
+                mq.cmdf('/gsay CoTH: everyone is here - %d summoned in %.0f seconds.', COTHG.done, secs)
+            end)
+        end
+        -- NAME WHO IS STILL OUT. This is the one thing a person can act on and the script cannot: a
+        -- member in another zone has to walk or gate, and nobody knows that unless they are told.
+        if #missing > 0 then
+            pcall(function()
+                mq.cmdf('/gsay CoTH: cannot reach %s - not in this zone.', table.concat(missing, ', '))
+            end)
+        end
+        cothg_set(false)
+        return
+    end
+    -- FURTHEST FIRST. With one summoner the order is only about not wasting a cast on somebody who was
+    -- about to walk in anyway.
+    table.sort(far, function(a, b) return (a.dist or 0) > (b.dist or 0) end)
+
+    local em = coth_emblem()
+    if em ~= 0 then
+        if em > 0 and (now - (COTHG.saidWait or 0)) > 10000 then
+            COTHG.saidWait = now
+            rezlog('[cothg] emblem back in %ds - %d still out', em, #far)
+        elseif em < 0 then
+            rezlog('\\ay[cothg] I have no %s - stopping\\ax', COTH.ITEM)
+            pcall(function() mq.cmd('/gsay CoTH: I cannot find my emblem - stopping.') end)
+            cothg_set(false)
+        end
+        return
+    end
+
+    local t = far[1]
+    rezlog('[cothg] summoning %s (%d away)', t.name, t.dist or -1)
+    pcall(function() mq.cmdf('/gsay CoTH: summoning %s now.', t.name) end)
+    pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, t.id) end)
+    -- SAME TWO-PART WAIT AS THE GROUP GATHER: see the cast start, then see it finish. A bard gets no bar
+    -- from the emblem, so the reuse timer starting counts as proof it went out.
+    local castFrom, started, sawBar = mq.gettime(), false, false
+    mq.delay(3000, function()
+        sawBar = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0
+        local tr = -1
+        pcall(function() tr = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
+        started = sawBar or (tr > 0)
+        return started
+    end)
+    if not started then
+        rezlog('\\ay[cothg] the emblem never went out for %s\\ax', t.name)
+        return
+    end
+    if sawBar then
+        mq.delay(20000, function()
+            return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 or not COTHG.active
+        end)
+    else
+        mq.delay(11000, function() return not COTHG.active end)
+    end
+    if not COTHG.active then return end
+    COTHG.done = (COTHG.done or 0) + 1
+    local wornNow = false
+    pcall(function() wornNow = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
+    rezlog('[cothg]   cast finished for %s in %.1fs (emblem %s)', t.name,
+           (mq.gettime() - castFrom) / 1000, wornNow and 'WORN' or 'in a bag')
+end
+
+-- ===========================================================================
+--  CHARM SWAP - test only, nothing calls this from the CoTH run yet
+-- ===========================================================================
+-- Spell haste applies to a clicky only when it is WORN, so an emblem clicked out of a bag eats the full
+-- unhasted cast every time. Putting the charm on for the gather and taking it off after is worth several
+-- seconds a summon, across five or six summons.
+-- BUILT ON THE PLACATE STRIP, deliberately - not a second way of doing the same thing. Same pickup by
+-- slot, same confirm-the-right-item-is-on-the-cursor, same retries, same recovery file for the case where
+-- the client dies holding somebody's charm. That code took several sessions to get right and every one of
+-- its retries is there because something failed in game.
+-- ITS OWN RECOVERY FILE. adventuretime_stripped_<who>.txt belongs to the placate run; a swap that wrote
+-- to it during a placate would overwrite the record of three weapons with the record of one charm.
+-- THIS IS AN OPTIMISATION AND IS ALLOWED TO FAIL. Every failure path here leaves the charm alone and
+-- lets the emblem be clicked from the bag exactly as it is today - a slow gather beats a stuck one.
+cothCharmSaved = nil     -- what was in the charm slot before we touched it ('' = empty)
+cothSwapWant   = nil     -- set by the bind, drained by the main loop: this does cursor work and delays
+
+-- OUR OWN HOLD, NOT THE PLACATE'S. This called ep_pause/ep_resume, which take the hold under the name
+-- 'placate' - so a swap running during a placate would find the hold already taken, do nothing, and then
+-- RELEASE the placate's hold when it finished. E3 would start driving an enchanter standing there with
+-- no weapons mid-run. That is exactly the clobbering E3HOLD's reference count exists to make impossible,
+-- reintroduced by borrowing somebody else's owner name.
+-- A distinct owner means the two nest correctly in either order and neither can free the other.
+cothSwapHeld = false
+function coth_swap_hold()
+    if cothSwapHeld then return end
+    cothSwapHeld = true
+    e3_hold('cothswap')
+end
+function coth_swap_unhold(why)
+    if not cothSwapHeld then return end
+    cothSwapHeld = false
+    e3_release('cothswap')
+    rezlog('[coth] E3 released (%s)', why or 'done')
+end
+
+function coth_charm_recovery_path()
+    local who = ''
+    pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
+    return at_read('adventuretime_cothcharm_' .. who .. '.txt')
+end
+
+function coth_charm_recovery_write()
+    local fh = io.open(coth_charm_recovery_path(), 'w')
+    if not fh then return end
+    fh:write('charm=' .. (cothCharmSaved or '') .. '\n')
+    fh:close()
+end
+
+function coth_charm_recovery_clear()
+    pcall(function() os.remove(coth_charm_recovery_path()) end)
+end
+
+function coth_charm_recovery_read()
+    local fh = io.open(coth_charm_recovery_path(), 'r')
+    if not fh then return nil end
+    local v = nil
+    for line in fh:lines() do
+        local k, val = line:match('^(%w+)=(.*)$')
+        if k == 'charm' and val and val ~= '' then v = val end
+    end
+    fh:close()
+    return v
+end
+
+-- Pick an item up by name and confirm THE RIGHT one is on the cursor before doing anything with it.
+-- Straight from the placate restore: firing the command and assuming is what let a run finish with an
+-- epic still in a bag.
+function coth_pickup(name, tries)
+    for n = 1, (tries or 4) do
+        pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', name) end)
+        mq.delay(900, function() return tostring(mq.TLO.Cursor.Name() or '') == name end)
+        if tostring(mq.TLO.Cursor.Name() or '') == name then return true end
+        rezlog('[coth]   could not pick up %s, retry %d', name, n)
+        mq.delay(300)
+    end
+    return false
+end
+
+-- Seat whatever is on the cursor into the charm slot and confirm the slot reads it back.
+function coth_seat_charm(name, tries)
+    for n = 1, (tries or 4) do
+        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
+        mq.delay(900, function()
+            return tostring(mq.TLO.Me.Inventory('charm').Name() or '') == name
+        end)
+        local seated = ''
+        pcall(function() seated = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+        if seated == name then return true end
+        rezlog('[coth]   %s did not seat in charm, retry %d', name, n)
+        mq.delay(300)
+    end
+    return false
+end
+
+-- EMPTY THE SLOT FIRST, THEN FILL IT. Seating a charm straight into an occupied slot is one click that
+-- does two things - the new one goes in and the old one lands on the cursor - and 1.18.24 showed it does
+-- not hold: the swap reported success, and eight seconds later the slot read the ORIGINAL charm again.
+-- The verify passed because the slot genuinely did read the new charm at that instant; what it could not
+-- see was the old one still sitting on the cursor with nowhere settled to go.
+-- So: take the worn one off, confirm it is on the cursor, STOW IT, confirm the cursor is empty, and only
+-- then pick up the new one and seat it into a slot that is now empty. Four verified steps instead of one
+-- compound one - exactly the shape ep_strip arrived at, and for the same reason.
+-- LET THE CLIENT CATCH UP BETWEEN STEPS. Each of these operations is a real inventory move, and the
+-- client's item state is not updated the instant the slot read comes back true - it settles a beat
+-- later. Running the next pickup into that gap is what desynced the emblem: the swap "succeeded", and
+-- FindItem then could not see the aug at all, so the character reported having no emblem and refused to
+-- summon with the charm sitting right there.
+-- The verifies are still the real gate; this is the pause AFTER a verify passes, before the next move.
+-- Cheap: half a second per phase, four phases, once per gather.
+COTH_SETTLE_MS = 500
+
+function coth_charm_take_off()
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if now == '' or now == 'NULL' then return true, '' end
+    for n = 1, 4 do
+        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
+        mq.delay(900, function() return tostring(mq.TLO.Cursor.Name() or '') == now end)
+        if tostring(mq.TLO.Cursor.Name() or '') == now then
+            -- ON THE CURSOR IS NOT PUT AWAY. Stow it and confirm the cursor is clear before touching
+            -- anything else: everything after this needs the cursor free, and an item left on it is how
+            -- the next click swaps something back by accident.
+            for st = 1, 3 do
+                ep_stow_cursor()
+                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+                if (mq.TLO.Cursor.ID() or 0) == 0 then
+                    mq.delay(COTH_SETTLE_MS)
+                    rezlog('[coth]   took off %s and stowed it', now)
+                    return true, now
+                end
+                rezlog('[coth]   %s did not stow, retry %d of 3', now, st)
+            end
+            rezlog('\\ar[coth] %s is stuck on the cursor - putting it back on\\ax', now)
+            pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
+            mq.delay(700)
+            clear_cursor()
+            return false, now
+        end
+        rezlog('[coth]   charm pickup did not take, retry %d of 4', n)
+        mq.delay(300)
+    end
+    return false, now
+end
+
+function coth_charm_equip(want)
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if now == want then
+        rezlog('[coth] %s is already worn - nothing to swap', want)
+        return true
+    end
+    local have = 0
+    pcall(function() have = tonumber(mq.TLO.FindItem('=' .. want).ID()) or 0 end)
+    if have <= 0 then
+        rezlog('\\ar[coth] cannot find "%s" - not swapping\\ax', want)
+        return false
+    end
+    -- E3 PAUSED FOR THE SWAP, same reason the placate strip does it: a live E3 grabs the cursor and
+    -- re-equips underneath us. Every exit below resumes it.
+    coth_swap_hold()
+    -- NO BAG TOGGLING. MacroQuest's PickupItem only insists on an open window for the BANK, the shared
+    -- bank, the hoard, the depot and merchant selection - ordinary inventory goes straight to
+    -- pInvSlotMgr->MoveItem, which is a data move with no slot window involved. The one branch that does
+    -- need a slot is splitting a stack with ctrl held, and MQ opens and closes the bag itself for that.
+    -- A charm is a single item, so it never reaches that branch.
+    -- The placate strip still toggles, deliberately: its comment says name lookup was unreliable with the
+    -- bags shut and that was arrived at from something real. This is the same idea tried in ONE place
+    -- first, where a failure costs an unhasted gather rather than an enchanter standing weaponless.
+    -- If this holds up, placate is the next candidate - not before.
+    -- RECORD BEFORE REMOVING. Written first so a crash between the read and the click still leaves a file
+    -- naming what should be worn. The other order loses exactly the case this exists for.
+    cothCharmSaved = now
+    coth_charm_recovery_write()
+    rezlog('[coth] charm slot holds "%s" - swapping in %s', (now ~= '') and now or '(empty)', want)
+
+    clear_cursor()
+    mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+
+    local off = coth_charm_take_off()
+    if not off then
+        rezlog('\\ar[coth] could not clear the charm slot - leaving it alone\\ax')
+        coth_swap_unhold('coth swap failed')
+        return false
+    end
+    mq.delay(COTH_SETTLE_MS)
+    if not coth_pickup(want) then
+        rezlog('\\ar[coth] %s never reached the cursor - putting the original back\\ax', want)
+        clear_cursor()
+        pcall(function() coth_charm_restore('swap aborted') end)
+        return false
+    end
+    mq.delay(COTH_SETTLE_MS)
+    if not coth_seat_charm(want) then
+        rezlog('\\ar[coth] %s would not seat in the charm slot\\ax', want)
+        ep_stow_cursor()
+        pcall(function() coth_charm_restore('swap aborted') end)
+        return false
+    end
+    -- The slot was empty before this, so nothing should have come back to the cursor. Clearing it anyway
+    -- is free and the alternative is carrying somebody's charm into the next click.
+    ep_stow_cursor()
+    mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    mq.delay(COTH_SETTLE_MS)
+    -- READ IT BACK ONE LAST TIME, after the dust settles. The old code trusted the verify inside the seat
+    -- and that is precisely the check that passed while the swap was quietly coming undone.
+    local final = ''
+    pcall(function() final = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if final ~= want then
+        rezlog('\\ar[coth] charm reads "%s" after the swap, wanted %s\\ax', final, want)
+        pcall(function() coth_charm_restore('swap did not hold') end)
+        return false
+    end
+    rezlog('[coth] charm swap done - %s is worn', want)
+    return true
+end
+
+function coth_charm_restore(why)
+    local original = cothCharmSaved or coth_charm_recovery_read()
+    if original == nil then
+        coth_swap_unhold(why or 'nothing to restore')
+        return true
+    end
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if now == original then
+        rezlog('[coth] charm already back to "%s" (%s)', original, why or 'restore')
+        cothCharmSaved = nil
+        coth_charm_recovery_clear()
+        coth_swap_unhold(why or 'coth swap done')
+        return true
+    end
+    -- Same as the swap: no toggling. See the note there.
+    clear_cursor()
+    mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    -- SAME ORDER AS THE SWAP, in reverse. Take ours off and put it away FIRST, so the original is seated
+    -- into an empty slot rather than traded for whatever is in there - the compound swap is what did not
+    -- hold going in and there is no reason to trust it coming back.
+    local ok = coth_charm_take_off()
+    if ok and original ~= '' then
+        mq.delay(COTH_SETTLE_MS)
+        if coth_pickup(original) then
+            mq.delay(COTH_SETTLE_MS)
+            ok = coth_seat_charm(original)
+            ep_stow_cursor()
+        else
+            ok = false
+            rezlog('\\ar[coth] %s is not findable in bags - charm slot left empty\\ax', original)
+        end
+    end
+    mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+    mq.delay(COTH_SETTLE_MS)
+    -- Read it back rather than trusting the seat, for the reason the swap now does the same.
+    local final = ''
+    pcall(function() final = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if ok and final == original then
+        rezlog('[coth] charm restored to "%s" (%s)', (original ~= '') and original or '(empty)', why or 'restore')
+        cothCharmSaved = nil
+        coth_charm_recovery_clear()
+    else
+        -- KEEP THE RECORD. cothCharmSaved is what the backstop and /atcothswap back work from, so clearing
+        -- it on a failed restore would throw away the only note of what belongs in that slot.
+        ok = false
+        rezlog('\\ar[coth] charm reads "%s", wanted "%s" - leaving the record in place to retry\\ax',
+               (final ~= '') and final or '(empty)', original)
+    end
+    coth_swap_unhold(why or 'coth swap done')
+    return ok
+end
+
+-- Drained from the main loop, not the bind: this does cursor work and second-long delays, and a bind
+-- runs inside doevents where blocking is how you hold the whole loop down.
+-- ON BY DEFAULT, BUT NOT COMPULSORY. The swap buys a hasted cast and costs a few seconds of cursor work
+-- with the group's charms off - a fair trade most of the time, and somebody's business to decline.
+-- Off means the emblem is clicked out of the bag exactly as it was before any of this existed.
+-- `if nil` rather than a plain assignment, per the convention on miniOrder and popLocked: this sits
+-- above load_settings() today, and a bare `= true` would silently overwrite a loaded 'off' if it ever
+-- moved below it.
+if cothSwap == nil then cothSwap = true end
+
+COTH_SWAP_MAX = 180000   -- backstop: never stay swapped longer than this, whatever the gather is doing
+
+-- TELL THE GROUP, AND TELL MYSELF. peer_bcast reaches the other five and NOT me - relay echo is muted -
+-- so the driver broadcast its own answer, never heard it, and sat in its own waiting list until
+-- COTH_SWAP_WAIT expired. Twelve seconds at the front of every gather, spent waiting for a character
+-- that had finished swapping nine seconds earlier.
+-- Same shape as the bug in 1.18.24, one layer down: anything a character has to know about ITSELF has to
+-- be written locally as well as sent.
+function coth_report_swap(state)
+    COTH.swapped = COTH.swapped or {}
+    COTH.swapped[myName] = state
+    pcall(function() peer_bcast('/at_cothswapped %s %s', myName, state) end)
+end
+cothSwapAt    = 0
+
+function coth_swap_tick()
+    -- BACKSTOP FIRST. If the driver goes away mid-gather - crash, zone, /lua stop - nothing else will
+    -- ever send the 'off' that puts the charm back, and the character would wear the wrong charm until
+    -- somebody noticed. Same reasoning as EP_STRIP_MAX, same duration.
+    if cothCharmSaved and cothSwapAt > 0 and (mq.gettime() - cothSwapAt) > COTH_SWAP_MAX then
+        cothSwapAt = 0
+        rezlog('\\ay[coth] swapped for over %ds - putting the charm back\\ax', COTH_SWAP_MAX / 1000)
+        pcall(function() coth_charm_restore('stayed swapped too long') end)
+        return
+    end
+    if not cothSwapWant then return end
+    local w = cothSwapWant
+    cothSwapWant = nil
+
+    if w.back then
+        cothSwapAt = 0
+        coth_charm_restore(w.auto and 'gather finished' or 'asked by hand')
+        return
+    end
+
+    -- The automatic path has no name to work from: find it. A character with no emblem simply has
+    -- nothing to do, which is the honest answer for most of the group and needs no special case.
+    local name = w.name
+    local wornAlready = false
+    if w.auto then
+        name, wornAlready = coth_find_charm()
+    end
+    -- SWITCHED OFF: answer immediately and do nothing. Reporting still matters - a character that is not
+    -- swapping must say so, or the gather waits the full COTH_SWAP_WAIT for an answer never coming.
+    if w.auto and not cothSwap then
+        coth_report_swap('off')
+        return
+    end
+    if w.auto and (not name or wornAlready) then
+        -- Nothing to swap. Report anyway - the driver is counting answers, and a character that cannot
+        -- help still has to say so or the whole gather waits on it.
+        coth_report_swap(name and 'worn' or 'none')
+        return
+    end
+    if not name then
+        rezlog('[coth] no charm holding the %s was found', COTH.ITEM)
+        return
+    end
+    local ok = coth_charm_equip(name)
+    if ok then cothSwapAt = mq.gettime() end
+    if w.auto then coth_report_swap(ok and 'ok' or 'fail') end
+end
+
 -- Re-running is safe as long as epSaved is not clobbered: a slot stripped on pass one now reads empty,
 -- and overwriting its saved name with '' would lose the item's identity for the restore.
 EP_STRIP_PASSES = 3
@@ -15751,6 +17130,8 @@ MINI_SECTIONS = {
       get = function() return miniRez end,    set = function(v) miniRez = v end },
     { key = 'di',     label = 'DI staff',              draw = draw_di_mini,
       get = function() return miniDI end,     set = function(v) miniDI = v end },
+    { key = 'aggro',   label = 'Aggro',            draw = draw_aggro,
+      get = function() return miniAggro end,    set = function(v) miniAggro = v end },
     { key = 'running', label = 'Running now',      draw = draw_burn_running,
       get = function() return miniRunning end,  set = function(v) miniRunning = v end },
     { key = 'timeline', label = 'Burn timeline',   draw = draw_burn_timeline,
@@ -16370,6 +17751,11 @@ function pop_drop_target(panel)
 end
 
 local function draw_popouts()
+    -- POP-OUTS WERE NEVER THEMED. ui_push_chrome runs around the mini and the expanded window, and this
+    -- function is called before either of them - so every pop-out has been drawing in stock ImGui
+    -- colours the whole time, which is most of why they looked like a different program.
+    -- Pushed once around the whole loop: the style stack applies to every Begin made while it is on.
+    local popC, popV = ui_push_chrome()
     for p = 1, POP_PANELS do
         -- Who lives here? In miniOrder order, so a panel reads the way the mini would.
         local mine = {}
@@ -16392,8 +17778,23 @@ local function draw_popouts()
             local title = table.concat(names, ' + ')
             -- ###at_panel_N and not the title: the id has to stay put or ImGui forgets the window's size
             -- and position the moment its contents change.
-            local show = ImGui.Begin(title .. '###at_panel_' .. p, true,
-                                     ImGuiWindowFlags.AlwaysAutoResize)
+            -- LOCKED PER PANEL, not with the mini. A pop-out is put somewhere deliberately and is the
+            -- window most likely to be nudged by a stray click, but pinning one should not pin the rest.
+            local pflags = ImGuiWindowFlags.AlwaysAutoResize or 0
+            local pinned = (popLocked or {})[p]
+            if pinned then
+                pflags = pflags + (ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)
+                -- NO TITLE BAR WHILE PINNED, and only while pinned. The bar is the biggest thing on a
+                -- pop-out still saying 'debug window' - the collapse triangle and the close cross are
+                -- ImGui's own widgets and no style var reaches them. NoTitleBar removes all of it.
+                -- The reason this is free HERE and not in general: the title bar is also the drag handle,
+                -- so taking it away normally means writing the drag by hand and risking a window that
+                -- cannot be moved. A pinned panel already has NoMove - there is no drag left to lose.
+                -- Unpinned panels keep the bar, so arranging one works exactly as it did.
+                -- The lock is drawn inside the content, so it is still there to click your way back out.
+                pflags = pflags + (ImGuiWindowFlags.NoTitleBar or 0)
+            end
+            local show = ImGui.Begin(title .. '###at_panel_' .. p, true, pflags)
             -- DOCKED IS NOT MERGED. Dragging this window onto another makes ImGui tab them, which looks
             -- like a merge and is not one - the sections still live in separate windows and only one is
             -- visible at a time. Say so once, because the two gestures are easy to confuse and the wrong
@@ -16413,7 +17814,23 @@ local function draw_popouts()
                 save_settings()
             else
                 -- The zone sits at the TOP, where the cursor already is after dragging onto the window.
-                pop_drop_zone(p, 'drop a section here to merge it in')
+                -- The lock shares that row rather than taking one of its own: a pop-out is often three
+                -- rows tall and a whole line spent on chrome is a real cost there.
+                popLocked = popLocked or {}
+                if ui_lock_button('##at_panel_lock_' .. p, popLocked[p]) then
+                    popLocked[p] = (not popLocked[p]) or nil
+                    save_settings()
+                end
+                if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                    pcall(function() ImGui.SetTooltip(popLocked[p]
+                            and 'Pinned - no title bar, cannot be moved or resized.\nClick to unpin.'
+                            or  'Unpinned. Click to pin this panel where it is and drop the title bar.') end)
+                end
+                ImGui.SameLine()
+                -- THE NAME GOES SOMEWHERE. Pinned, there is no title bar to carry it - so the drop zone
+                -- shows the panel's own name instead of its hint. It is still a drop target either way;
+                -- only the words change, and by the time a panel is pinned you know what merging does.
+                pop_drop_zone(p, popLocked[p] and title or 'drop a section here to merge it in')
                 for i, s in ipairs(mine) do
                     if i > 1 then ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing() end
                     -- THE GRIP IS THE HANDLE, and it needs to look like one. Without something visibly
@@ -16459,6 +17876,7 @@ local function draw_popouts()
             ImGui.End()
         end
     end
+    ui_pop_chrome(popC, popV)
 end
 
 local function render()
@@ -16491,6 +17909,13 @@ local function render()
         -- still wanders, and the reason to lock one is that a stray click while fighting moves it.
         if uiLocked then
             mflags = mflags + (ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)
+            -- AND NO TITLE BAR, same bargain as the pinned pop-outs. The bar is only worth its pixels
+            -- for dragging and closing, and a locked window does neither - so while it is locked the
+            -- strip, the collapse triangle and the close cross all go.
+            -- WHAT REPLACES THE CLOSE BUTTON: the lock is drawn in the first content row and unlocking
+            -- brings the bar straight back in the same frame, so nothing is one-way. /atui also reopens
+            -- the window from a bind, which is the backstop if it is ever closed some other way.
+            mflags = mflags + (ImGuiWindowFlags.NoTitleBar or 0)
         end
         -- Fires once per session as well as on the toggle: if detail was ALREADY on at load, the toggle
         -- never runs, and ImGui just restores the small size it remembered from when this was an
@@ -16580,14 +18005,14 @@ local function render()
             end
             -- Padlock: closed when locked, open when not. A glyph rather than a word because both title
             -- strips are already tight, and the state is legible at a glance either way.
-            if ImGui.SmallButton((uiLocked and '\240\159\148\146' or '\240\159\148\147') .. '##at_lock') then
+            if ui_lock_button('##at_lock', uiLocked) then
                 uiLocked = not uiLocked
                 save_settings()
             end
             if ImGui.IsItemHovered and ImGui.IsItemHovered() then
                 pcall(function() ImGui.SetTooltip(uiLocked
-                        and 'Locked - the window cannot be moved or resized.\nClick to unlock.'
-                        or  'Unlocked. Click to pin it in place so a stray click cannot drag it.') end)
+                        and 'Locked - no title bar, cannot be moved or resized.\nClick to unlock.'
+                        or  'Unlocked. Click to pin it in place and drop the title bar.') end)
             end
             ImGui.SameLine()
             if ImGui.SmallButton('Expand') then miniMode = false; save_settings() end
@@ -16733,7 +18158,13 @@ local function render()
         return
     end
     ImGui.SetNextWindowSize(560, 500, ImGuiCond.FirstUseEver)
-    local wflags = uiLocked and ((ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)) or 0
+    -- Same as the mini and the pinned pop-outs: locked means no drag and no close, so the bar carrying
+    -- both is dead weight. This window is opened by /atuie and the mini's Expand button, so losing the
+    -- cross while locked strands nothing.
+    local wflags = uiLocked
+        and ((ImGuiWindowFlags.NoMove or 0) + (ImGuiWindowFlags.NoResize or 0)
+             + (ImGuiWindowFlags.NoTitleBar or 0))
+        or 0
     local chromeC, chromeV = ui_push_chrome()
     local show = ImGui.Begin('AdventureTime ' .. VERSION .. '###advtime', windowOpen, wflags)
     windowOpen = show
@@ -16741,7 +18172,7 @@ local function render()
         -- top strip: global controls + the tribute glance (always visible, above the tabs)
         -- Padlock: closed when locked, open when not. A glyph rather than a word because both title
         -- strips are already tight, and the state is legible at a glance either way.
-        if ImGui.SmallButton((uiLocked and '\240\159\148\146' or '\240\159\148\147') .. '##at_lock') then
+        if ui_lock_button('##at_lock', uiLocked) then
             uiLocked = not uiLocked
             save_settings()
         end
@@ -16868,6 +18299,31 @@ local function render()
                             'Darker ground, rounded corners, coloured section bands.\nOff returns both windows to stock ImGui.') end)
                     end
                 end
+                if UI_CHROME then
+                    -- Only shown when the chrome is on, because with it off the choice does nothing and a
+                    -- control that does nothing is worse than one that is absent.
+                    ImGui.SetNextItemWidth(140)
+                    local ok = pcall(function()
+                        if ImGui.BeginCombo('Theme##ui_theme', uiTheme) then
+                            for _, t in ipairs(AT_THEMES) do
+                                if ImGui.Selectable(t.name, t.name == uiTheme) and t.name ~= uiTheme then
+                                    uiTheme = t.name
+                                    save_settings()
+                                end
+                            end
+                            ImGui.EndCombo()
+                        end
+                    end)
+                    -- A binding without BeginCombo still gets to change it, one press at a time.
+                    if not ok then
+                        if ImGui.SmallButton('Theme: ' .. uiTheme .. '##ui_theme_cycle') then
+                            local i = 1
+                            for n, t in ipairs(AT_THEMES) do if t.name == uiTheme then i = n end end
+                            uiTheme = AT_THEMES[(i % #AT_THEMES) + 1].name
+                            save_settings()
+                        end
+                    end
+                end
                 do
                     if ui_toggle('##ui_segring', uiSegRings) then uiSegRings = not uiSegRings; save_settings() end
                     ImGui.SameLine(); ImGui.Text('Burn tiers as one arc per burn')
@@ -16902,13 +18358,38 @@ local function render()
                     end
                 end
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
+                ui_text(UI_LABEL, 'Call of the Hero')
+                do
+                    -- GROUP WIDE, not per character. Half the group swapping and half not is the worst of
+                    -- both, so the toggle sends the same setting to everyone rather than only changing
+                    -- the driver - which is also why it is here and not a per-character preference.
+                    if ui_toggle('##coth_swap', cothSwap) then
+                        cothSwap = not cothSwap
+                        save_settings()
+                        for _, nm in ipairs(group_members()) do
+                            if nm:lower() ~= myName:lower() then
+                                pcall(function()
+                                    peer_cmdf(nm, '/at_cothswapset %s', cothSwap and 'on' or 'off')
+                                end)
+                            end
+                        end
+                    end
+                    ImGui.SameLine(); ImGui.Text('Wear the emblem charm to summon')
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function() ImGui.SetTooltip(
+                            'Spell haste only applies to a clicky that is WORN, so each summoner puts the charm\n'
+                         .. 'holding the emblem on for the gather and takes it off afterwards.\n'
+                         .. 'Off clicks it straight out of the bag, unhasted - slower, but nothing is moved.') end)
+                    end
+                end
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ui_text(UI_LABEL, 'Sections')
                 ImGui.TextDisabled('Turn off anything you do not use - hidden sections stop rendering.')
                 ImGui.Spacing()
                 local dirty = false
                 local function chk(key, label)
                     local prev = showSec[key]
-                    showSec[key] = ImGui.Checkbox(label, showSec[key])
+                    showSec[key] = ui_check(label, showSec[key])
                     if prev ~= showSec[key] then dirty = true end
                 end
                 chk('tribute', 'Tribute panel')
@@ -16925,7 +18406,7 @@ local function render()
                     -- button, which told you nothing without the button beside it for context - and the
                     -- button has gone. This is a set-once preference, which is what Settings is for.
                     local prev = autoXTank
-                    autoXTank = ImGui.Checkbox('Keep tank XTargets up to date automatically', autoXTank)
+                    autoXTank = ui_check('Keep tank XTargets up to date automatically', autoXTank)
                     if autoXTank ~= prev then
                         save_settings()
                         if autoXTank then xtankAutoRequested = true end
@@ -16938,7 +18419,7 @@ local function render()
                 end
                 do
                     local prev = xtankAnnounce
-                    xtankAnnounce = ImGui.Checkbox('Announce tank swaps in /rsay', xtankAnnounce)
+                    xtankAnnounce = ui_check('Announce tank swaps in /rsay', xtankAnnounce)
                     if xtankAnnounce ~= prev then
                         save_settings()
                         peer_bcast('/at_xtsay %s', xtankAnnounce and 'on' or 'off')
@@ -16967,7 +18448,7 @@ local function render()
                             end
                             ImGui.SameLine()
                             local was = sec.get() and true or false
-                            local now = ImGui.Checkbox(sec.label .. '##at_sec_' .. k, was)
+                            local now = ui_check(sec.label .. '##at_sec_' .. k, was)
                             if now ~= was then sec.set(now); dirty = true end
                             -- The panel picker used to live here: M 1 2 3 4 5 6 7 8 on every row, nine
                             -- buttons per section for something the mini now does with one click and a
@@ -17005,7 +18486,7 @@ local function render()
                                     n = n + 1
                                     if n % 3 == 1 then ImGui.TextDisabled('     ') else ImGui.SameLine() end
                                     local was = not cm_hidden(g)
-                                    local now = ImGui.Checkbox(g .. '##cmrow_' .. g, was)
+                                    local now = ui_check(g .. '##cmrow_' .. g, was)
                                     if now ~= was then
                                         cmOff[g] = (not now) or nil
                                         dirty = true
@@ -17015,11 +18496,11 @@ local function render()
                             if k == 'invis' and (miniInvisRows or miniInvisCombo) then
                                 ImGui.SameLine()
                                 local wasR = miniInvisRows
-                                miniInvisRows = ImGui.Checkbox('coverage##at_inv_rows', miniInvisRows)
+                                miniInvisRows = ui_check('coverage##at_inv_rows', miniInvisRows)
                                 if miniInvisRows ~= wasR then dirty = true end
                                 ImGui.SameLine()
                                 local wasC = miniInvisCombo
-                                miniInvisCombo = ImGui.Checkbox('combo##at_inv_combo', miniInvisCombo)
+                                miniInvisCombo = ui_check('combo##at_inv_combo', miniInvisCombo)
                                 if miniInvisCombo ~= wasC then dirty = true end
                                 -- WHO CASTS EACH ROW, configured here rather than in the mini window.
                                 -- Only shown when the combo is on, because that is the only thing that
@@ -17029,11 +18510,11 @@ local function render()
                             if k == 'groupheals' and (miniClicks or miniCombos) then
                                 ImGui.SameLine()
                                 local wasC = miniClicks
-                                miniClicks = ImGui.Checkbox('class buttons##at_gh_mgb', miniClicks)
+                                miniClicks = ui_check('class buttons##at_gh_mgb', miniClicks)
                                 if miniClicks ~= wasC then dirty = true end
                                 ImGui.SameLine()
                                 local wasK = miniCombos
-                                miniCombos = ImGui.Checkbox('combos##at_gh_combo', miniCombos)
+                                miniCombos = ui_check('combos##at_gh_combo', miniCombos)
                                 if miniCombos ~= wasK then dirty = true end
                             end
                             -- The placate gem field used to sit here. It is a DUPLICATE: the same
@@ -17146,7 +18627,7 @@ local function render()
                         for oi, opt in ipairs(opts) do
                             if oi > 1 then ImGui.SameLine() end
                             local was = has[opt.key] and true or false
-                            local now = ImGui.Checkbox(opt.label .. '##at_c' .. ci .. '_' .. opt.key, was)
+                            local now = ui_check(opt.label .. '##at_c' .. ci .. '_' .. opt.key, was)
                             if now ~= was then
                                 if now then
                                     c.members[#c.members + 1] = opt.key
@@ -17346,6 +18827,143 @@ end)
 pcall(function() mq.bind('/atdraw', function()
     uiDrawProbe = true
     log('[draw] probing on the next frame - the mini window needs to be open')
+end) end)
+
+-- /ataggro            - what is my aggro reporting doing
+-- /ataggro on | off   - start or stop sampling and pushing (group-wide; every toon needs it on)
+-- /ataggro probe      - print every threat accessor side by side, once, on this character
+-- /ataggro now        - print the collected picture immediately rather than waiting for the summary
+-- WHERE CAN THIS THING ACTUALLY GO? Everything about the equip-before-summon idea depends on facts the
+-- client knows and we do not: whether the emblem is the worn item or an aug inside one, which slot it is
+-- allowed into, and where it is sitting right now. Guessing 'charm' and hardcoding it is how you write a
+-- swap that silently equips nothing.
+-- Same approach as the DI staff reads: print every accessor side by side and let the numbers decide.
+-- /atcothswap <charm name>  - save what is worn, put that charm on
+-- /atcothswap back          - put the original back
+-- Underscores for spaces, as everywhere else. Test only: nothing in the CoTH run calls this yet, so it
+-- can be fired by hand, watched, and reversed without a gather in progress.
+pcall(function() mq.bind('/atcothswap', function(a)
+    local arg = a and tostring(a) or ''
+    if arg:lower() == 'on' or arg:lower() == 'off' then
+        cothSwap = (arg:lower() == 'on')
+        save_settings()
+        -- Group wide: a gather where half the characters swap and half do not is the worst of both, and
+        -- this is a preference about how the group gathers rather than about one character.
+        for _, nm in ipairs(group_members()) do
+            if nm:lower() ~= myName:lower() then
+                pcall(function() peer_cmdf(nm, '/at_cothswapset %s', arg:lower()) end)
+            end
+        end
+        log('[coth] charm swapping %s for the group', cothSwap and 'ON' or 'off')
+        return
+    end
+    if arg:lower() == 'back' then cothSwapWant = { back = true }; return end
+    if arg ~= '' and arg:lower() ~= 'status' and arg:lower() ~= 'find' then
+        cothSwapWant = { name = arg:gsub('_', ' ') }
+        return
+    end
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    log('[coth] charm slot: %s', (now ~= '') and now or '(empty)')
+    log('[coth] saved original: %s', cothCharmSaved or coth_charm_recovery_read() or '(none)')
+    -- Say what it FOUND, not just what is worn - the whole point is that nobody should have to know
+    -- the charm's name, so the command has to prove it can work it out.
+    local found, wornAlready = coth_find_charm()
+    if found then
+        log('[coth] %s holds the %s%s', found, COTH.ITEM, wornAlready and ' - already worn' or ' - in a bag')
+    else
+        log('\\ay[coth] no item in bags or the charm slot holds the %s\\ax', COTH.ITEM)
+    end
+    if arg:lower() == 'find' then return end
+    -- Bare /atcothswap now DOES the swap when it found something, since there is nothing left to type.
+    if found and not wornAlready then
+        cothSwapWant = { name = found }
+    else
+        log('[coth] /atcothswap  |  /atcothswap <charm_name>  |  /atcothswap find  |  /atcothswap back')
+    end
+end) end)
+
+-- WHAT DOES THE CLIENT THINK THIS CAST TAKES? Every plausible accessor at once, because the socketed
+-- emblem is the same shape as the Nightveil aug - whose TimerReady reads 0 forever once it is in a charm
+-- - so none of these can be assumed to answer honestly while it is seated.
+-- Run it with the charm OFF and again with it ON: a number that moves between the two is one that is
+-- seeing the haste, and that is the one worth prioritising summoners on. If none of them move, the
+-- measured '[coth] cast finished ... in X.Xs' line is the only honest source and static class order is
+-- the fallback.
+pcall(function() mq.bind('/atcothcast', function()
+    local it = '=' .. COTH.ITEM
+    local f = {}
+    local function get(label, fn)
+        local v = 'n/a'
+        pcall(function() v = tostring(fn() or 'NULL') end)
+        f[#f + 1] = label .. '=' .. v
+    end
+    get('Clicky.CastTime',      function() return mq.TLO.FindItem(it).Clicky.CastTime.TotalSeconds() end)
+    get('Spell.CastTime',       function() return mq.TLO.FindItem(it).Spell.CastTime.TotalSeconds() end)
+    get('Spell.MyCastTime',     function() return mq.TLO.FindItem(it).Spell.MyCastTime.TotalSeconds() end)
+    get('CastTime',             function() return mq.TLO.FindItem(it).CastTime.TotalSeconds() end)
+    get('Spell.RecastTime',     function() return mq.TLO.FindItem(it).Spell.RecastTime.TotalSeconds() end)
+    get('Me.CastTimeLeft',      function() return mq.TLO.Me.CastTimeLeft.TotalSeconds() end)
+    get('Me.SpellHasteFocus',   function() return mq.TLO.Me.SpellHasteFocus() end)
+    get('charm',                function() return mq.TLO.Me.Inventory('charm').Name() end)
+    log('[coth] %s', table.concat(f, '  '))
+    log('[coth] last measured cast: %s', COTH.castSecs and string.format('%.1fs', COTH.castSecs) or '(none yet)')
+end) end)
+
+pcall(function() mq.bind('/atcothslot', function()
+    local f = {}
+    local function get(label, fn)
+        local v = 'n/a'
+        pcall(function() v = tostring(fn() or 'NULL') end)
+        f[#f + 1] = label .. '=' .. v
+    end
+    local it = '=' .. COTH.ITEM
+    get('Name',       function() return mq.TLO.FindItem(it).Name() end)
+    get('ID',         function() return mq.TLO.FindItem(it).ID() end)
+    -- ItemSlot/ItemSlot2 say where it IS. Non-nil ItemSlot2 means it is inside a bag.
+    get('ItemSlot',   function() return mq.TLO.FindItem(it).ItemSlot() end)
+    get('ItemSlot2',  function() return mq.TLO.FindItem(it).ItemSlot2() end)
+    -- WornSlot says where it MAY go. If this is NULL the emblem is not a worn item at all, which would
+    -- mean the thing to equip is whatever it is socketed into and we are looking for the wrong name.
+    get('WornSlot1',  function() return mq.TLO.FindItem(it).WornSlot(1)() end)
+    get('WornSlots',  function() return mq.TLO.FindItem(it).WornSlots() end)
+    get('Type',       function() return mq.TLO.FindItem(it).Type() end)
+    get('AugType',    function() return mq.TLO.FindItem(it).AugType() end)
+    get('Clicky',     function() return mq.TLO.FindItem(it).Clicky() end)
+    get('CastTime',   function() return mq.TLO.FindItem(it).Clicky.CastTime.TotalSeconds() end)
+    get('TimerReady', function() return mq.TLO.FindItem(it).TimerReady() end)
+    log('[coth] %s', table.concat(f, '  '))
+    -- And what is worn in the likely destination right now, so the save-and-restore has something real
+    -- to record rather than a slot name someone typed from memory.
+    for _, sl in ipairs({ 'charm', 'ranged', 'earring1', 'neck' }) do
+        local w = ''
+        pcall(function() w = tostring(mq.TLO.Me.Inventory(sl).Name() or '') end)
+        log('[coth]   worn %-9s = %s', sl, (w ~= '') and w or '(empty)')
+    end
+end) end)
+
+pcall(function() mq.bind('/ataggro', function(what, arg2)
+    local a = what and tostring(what):lower() or ''
+    if a == 'on' or a == 'off' then
+        AGG.on = (a == 'on')
+        AGG.moves, AGG.samples, AGG.key, AGG.bad = 0, 0, '', 0
+        log('[agg] sampling %s here', AGG.on and 'ON' or 'off')
+        -- SAY IT TO THE GROUP TOO. One character's numbers are not a picture; this is only worth
+        -- anything with everybody reporting, so turning it on here turns it on everywhere.
+        if arg2 ~= 'me' then
+            for _, nm in ipairs(group_members()) do
+                if nm:lower() ~= myName:lower() then pcall(function() peer_cmdf(nm, '/ataggro %s me', a) end) end
+            end
+        end
+        return
+    end
+    if a == 'probe' then log('[agg] %s', agg_reads()); return end
+    if a == 'now'   then pcall(agg_summary); return end
+    log('[agg] sampling %s - %d samples, my number changed %d time(s)%s',
+        AGG.on and 'ON' or 'off', AGG.samples, AGG.moves,
+        (AGG.bad or 0) > 0 and string.format(', %d out-of-range read(s), last was %s',
+                                             AGG.bad, tostring(AGG.badRaw)) or '')
+    log('[agg] /ataggro on|off  |  /ataggro probe  |  /ataggro now')
 end) end)
 
 pcall(function() mq.bind('/atui', function(what)
@@ -18321,9 +19939,17 @@ while running do
                 end
             end
         end
-        for _, gp in ipairs(GROUP_POTS) do
+        -- ONCE EVERY POT_POLL_MS, not on every click poll. Buffs tick on the server's own schedule and
+        -- reading them faster only produces the same answer more often.
+        if (mq.gettime() - lastPotPoll) > POT_POLL_MS then
+          lastPotPoll = mq.gettime()
+          for _, gp in ipairs(GROUP_POTS) do
             local carries, up, secs, dsecs = pot_state(gp.base)
-            local k = string.format('%d/%d/%d/%d', carries, up, secs, dsecs)
+            -- THE SAME KEY SHAPE AS BURNS: the flags, plus the LATCHED duration. `secs` is a live
+            -- countdown and putting it in the key meant every tick of it looked like new state - which
+            -- is exactly the churn the burn key was written to avoid. It is still SENT, so the driver
+            -- has a real number to count down from; it just no longer decides when to send.
+            local k = string.format('%d/%d/%s/%d', carries, up, (secs or -1) <= 0 and 'R' or 'd', dsecs)
             if potLast[gp.key] ~= k then   -- only mark sent if it actually went; see magic
                 if SHOW_UI then
                     potState[myName] = potState[myName] or {}
@@ -18334,6 +19960,7 @@ while running do
                     potLast[gp.key] = k
                 end
             end
+          end
         end
     end
     if mq.gettime() > burnStartAt and (mq.gettime() - lastBurnResync) > 120000 then
@@ -18386,6 +20013,12 @@ while running do
             local m = AT_slowPending
             AT_slowPending = nil
             log('\\ay[slow] %s\\ax', m)
+        end
+        -- Same pattern, same reason: ui_push_chrome sits above `log` in the file and cannot reach it.
+        if AT_chromeNote then
+            local m = AT_chromeNote
+            AT_chromeNote = nil
+            log('%s', m)
         end
         -- The test loop presses the combo for us. On the tick, never from a bind: firing blocks.
         if INVT.checkAt and mq.gettime() >= INVT.checkAt then
@@ -18582,6 +20215,15 @@ while running do
         -- THE FAST PATH FIRST. On the tank this decides and asks; on everyone else it returns at once.
         -- It runs BEFORE di_tick so that when it is working, the old ladder sees a covered tank and never
         -- reaches for anything - the stand-down it broadcasts is the same one the ladder already honours.
+        atphase('aggro'); pcall(agg_tick)
+        atphase('cothswap'); pcall(coth_swap_tick)
+        atphase('cothg'); pcall(function()
+            if cothgSetWanted then
+                local w = cothgSetWanted; cothgSetWanted = nil
+                cothg_set(w == 'on')
+            end
+            cothg_tick()
+        end)
         atphase('cothwatch'); pcall(coth_watch_tick)
         atphase('di_verify'); pcall(di_rung_verify)
         atphase('diq')
