@@ -88,7 +88,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.19'
-local BUILD_TAG = '1.19.0'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.19.6'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -9715,7 +9715,16 @@ pcall(function()
         peer_cmdf(who, '/at_trib %s %d %d', myName, a and 1 or 0, f)
     end)
     mq.bind('/at_trib', function(name, act, favor)   -- a peer reported its tribute status
-        if name then tributeState[name] = { active = (tonumber(act) == 1), favor = tonumber(favor) or 0, updated = mq.gettime() } end
+        if not name then return end
+        tributeState[name] = { active = (tonumber(act) == 1), favor = tonumber(favor) or 0, updated = mq.gettime() }
+        -- REBUILD ON ARRIVAL, NOT ON DRAW. tributeState is what peers report into; tributeRows is what the
+        -- UI renders, and the only thing copying one into the other was gated on the tribute panel having
+        -- drawn in the last three seconds. That panel lives in the expanded view, so in mini mode the rows
+        -- were never rebuilt and the display kept whatever it happened to hold - reports arriving the whole
+        -- time and none of them visible. Opening the expanded view 'fixed' it by making the gate true.
+        -- A report is the event; this is the work it implies. It is a walk over the group list, so doing it
+        -- per message costs nothing next to being wrong.
+        tribRowsDirty = true
     end)
 end)
 
@@ -10312,7 +10321,6 @@ miniCoth        = false   -- show the CoTH Group button in the mini window
 -- compiling. One table holds every section toggle rather than a local per setting.
 showSec = { tribute = true, pots = true, burns = true, rez = true, misc = true }   -- section visibility (persisted)
 local lastTributePoll = 0       -- gettime of last tribute refresh
-local lastTribPush    = 0       -- my own tribute report to the driver
 local lastZoneID      = -1      -- detect zoning to force a refresh
 local zoneSettleAt    = nil     -- refresh this long after a zone (let DanNet peers resync)
 local shortfalls = {}   -- { "Item: Char short N", ... } from the last run
@@ -14622,6 +14630,17 @@ function click_saw(key, owned)
 end
 
 TRIB_KEEP_MS = 300000
+-- The panel's own failsafe refresh. Deliberately not paced: tribute changes on zoning and on a toggle,
+-- both of which arrive as events, so this only exists to stop the favor number aging indefinitely while
+-- somebody watches the panel. Five minutes matches how often the game actually charges favor.
+TRIB_POLL_MS = 300000
+-- How often a worker LOOKS at its own tribute state. Two TLO reads, deliberately unpaced, so a flip is
+-- noticed within a couple of seconds on any machine. Not how often anything is SENT - that stays
+-- change-gated and silent until the flag moves.
+TRIB_WATCH_MS = 2000
+lastTribPoll  = 0
+-- Set when a peer's tribute report arrives; cleared by the tick after the rendered rows are rebuilt.
+tribRowsDirty = false
 tribKeepAt   = 0
 tribDrawnAt  = 0        -- when the tribute panel last drew; the poll follows it
 epCapSaid    = false    -- log the ceiling working once per session
@@ -15203,17 +15222,34 @@ end
 -- Reading every cell and comparing here removes MaybeExactCompare from the question entirely: whatever
 -- the client put in that cell, we see the same string it does.
 -- Only runs after the fast path fails, so the normal case still costs one read.
+-- SWEEP THE COLUMNS, not just the one we expect. raid_find_row_once has always done this - try
+-- RAID_NAME_COL, then 1 through 6 - and this scan never did, so a roster whose name column reads blank
+-- was invisible to the fallback that exists precisely for when the named lookup fails.
+-- 2026-08-27 01:17:29: 83 rows, zero readable names in column 2, and both lookups gave up. If the client
+-- puts the name somewhere else when the window has not been drawn, this is what finds it.
+-- Costs nothing in the normal case: column 2 answers on the first try and the sweep never runs.
 function raid_scan_rows(name)
     local want = name:lower()
+    local function cell(lst, r, c)
+        local v = ''
+        pcall(function()
+            v = tostring(mq.TLO.Window(RAID_WND).Child(lst).List(r .. ', ' .. c)() or '')
+        end)
+        if v == 'NULL' then v = '' end
+        return v
+    end
     for _, lst in ipairs(RAID_LISTS) do
         local rows = 0
         pcall(function() rows = tonumber(mq.TLO.Window(RAID_WND).Child(lst).Items()) or 0 end)
         for r = 1, rows do
-            local v = ''
-            pcall(function()
-                v = tostring(mq.TLO.Window(RAID_WND).Child(lst).List(r .. ', ' .. RAID_NAME_COL)() or '')
-            end)
-            if v:lower() == want then return lst, r end
+            if cell(lst, r, RAID_NAME_COL):lower() == want then return lst, r end
+            for c = 1, 6 do
+                if c ~= RAID_NAME_COL and cell(lst, r, c):lower() == want then
+                    rezlog('[raid] found %s in column %d, not %d - the name column moved',
+                           name, c, RAID_NAME_COL)
+                    return lst, r
+                end
+            end
         end
     end
     return nil, 0
@@ -15242,25 +15278,70 @@ function raid_find_row(name)
     -- Say what IS in the list, so a repeat of this is diagnosable from the log rather than from a
     -- separate command run afterwards when the state has moved on.
     -- AND COUNT THE ROWS, because empty is not the same kind of failure as populated-but-absent.
-    local total = 0
+    local total, named = 0, 0
     for _, lst in ipairs(RAID_LISTS) do
         local rows = 0
         pcall(function() rows = tonumber(mq.TLO.Window(RAID_WND).Child(lst).Items()) or 0 end)
         total = total + rows
-        local names = {}
-        for r = 1, math.min(rows, 40) do
+        local before = named
+        -- EVERY ROW, NOT THE FIRST FORTY. The cap was there to keep the line short, and it made the
+        -- count wrong: a raid whose first forty rows are unused slots reported zero names and was
+        -- declared a stale window, three times over, while it was reading perfectly.
+        -- 2026-08-27 01:21 - 83 rows, row 1 reading group "1" slot "empty", which is exactly what an
+        -- unused slot looks like and nothing like an unreadable one.
+        -- The count walks everything; only the printed sample is trimmed.
+        local names, shown = {}, 0
+        for r = 1, rows do
             local v = ''
             pcall(function()
                 v = tostring(mq.TLO.Window(RAID_WND).Child(lst).List(r .. ', ' .. RAID_NAME_COL)() or '')
             end)
-            if v ~= '' and v ~= 'NULL' and v ~= 'empty' then names[#names + 1] = r .. ':' .. v end
+            if v ~= '' and v ~= 'NULL' and v ~= 'empty' then
+                named = named + 1
+                if shown < 12 then
+                    shown = shown + 1
+                    names[#names + 1] = r .. ':' .. v
+                end
+            end
         end
-        rezlog('[raid] %s holds %d row(s): %s', lst, rows, table.concat(names, ' '))
+        if named > shown then names[#names + 1] = '(+' .. (named - shown) .. ' more)' end
+        rezlog('[raid] %s holds %d row(s), %d named: %s', lst, rows, named, table.concat(names, ' '))
+        -- WHEN NOTHING READ, SAY WHAT ROW 1 DOES HOLD, across every column. 'no readable names' on its
+        -- own cannot tell an empty window from one whose name column has moved, and that is the whole
+        -- question when the roster will not read.
+        if rows > 0 and named == before then
+            local cols = {}
+            for c = 1, 6 do
+                local v = ''
+                pcall(function()
+                    v = tostring(mq.TLO.Window(RAID_WND).Child(lst).List('1, ' .. c)() or '')
+                end)
+                cols[#cols + 1] = c .. '="' .. ((v ~= 'NULL') and v or '') .. '"'
+            end
+            rezlog('[raid]   row 1 by column: %s', table.concat(cols, ' '))
+            -- And a row from further down, because row 1 being an unused slot says nothing about
+            -- whether the roster is populated at all.
+            if rows >= 45 then
+                local c2 = {}
+                for c = 1, 6 do
+                    local v = ''
+                    pcall(function()
+                        v = tostring(mq.TLO.Window(RAID_WND).Child(lst).List('45, ' .. c)() or '')
+                    end)
+                    c2[#c2 + 1] = c .. '="' .. ((v ~= 'NULL') and v or '') .. '"'
+                end
+                rezlog('[raid]   row 45 by column: %s', table.concat(c2, ' '))
+            end
+        end
     end
-    -- BOTH LISTS EMPTY IS NOT AN ANSWER, IT IS A BAD READ - and the caller has already established this
-    -- character IS in the raid, because raid_group_of found their group before we got here. A raid with
-    -- members cannot legitimately have two empty rosters, so say 'stale' rather than 'absent'.
-    return nil, 0, (total == 0)
+    -- A BAD READ HAS TWO SHAPES AND THIS ONLY KNEW ONE.
+    -- 'total == 0' was the proxy for 'the window is not ready', and it misses the commoner case entirely:
+    -- 2026-08-27 01:17:29, RAID_PlayerList reported 83 rows and not one readable name. The rows exist, the
+    -- cell text does not - which is what a raid window that has not been drawn looks like. total was 83,
+    -- so stale read false, the retry never fired and the move was abandoned on the first attempt.
+    -- Rows with no names is as impossible a state as no rows at all: the caller already proved this
+    -- character is in the raid via raid_group_of. Either shape means read again, not give up.
+    return nil, 0, (total == 0 or named == 0)
 end
 
 function raid_group_of(name)
@@ -15360,8 +15441,9 @@ function raid_move(name, group, inner)
                 if not inner then raidMoveWant = { name = name, group = group } end
                 return false
             end
-            log('\\ar[raid] both raid rosters have read empty %d times running, across %d fresh lock(s) - '
-                .. 'open the raid window once and retry\\ax', raidStaleTries, raidStaleTries)
+            log('\\ar[raid] the raid roster has read unusable %d times running, across %d fresh lock(s) - '
+                .. 'either no rows at all, or rows with no readable names. Open the raid window once so '
+                .. 'the client fills it in, then retry.\\ax', raidStaleTries, raidStaleTries)
             raidStaleTries = 0
             return done(false)
         end
@@ -22290,11 +22372,14 @@ while running do
         uiStatus = 'Counts updated.'
         distributing = false
     end
-    -- ZONE EVERY TICK IS THE POINT of this block - a zone change has to be caught promptly - but the rest
-    -- of it is bookkeeping that does not. One TLO read stays hot; the block around it slows down.
-    if (mq.gettime() - (lastUpkeep or 0)) >= pace(UPKEEP_MS) then
-    lastUpkeep = mq.gettime()
-    do   -- timed background jobs: tribute refresh, and (if the toggle's on) auto tank-XTargets. Zone = always.
+    -- THE ZONE READ IS OUT OF THE PACED GATE, WHICH IS WHAT THE NOTE ALWAYS CLAIMED.
+    -- 'One TLO read stays hot; the block around it slows down' described the intent, and the read was
+    -- inside the gate with everything else - so on low spec the zone check itself ran a third as often,
+    -- and every job keyed off zoning slowed with it. Tribute is the visible one: it refreshes on zone
+    -- settle, so a late zone detection is a late tribute readout, which is what 'no updates on low spec'
+    -- turned out to be.
+    -- One integer compare per tick, unpaced. Everything downstream of it is still paced.
+    do
         local z = mq.TLO.Zone.ID() or 0
         if z ~= lastZoneID then
             lastZoneID = z; zoneSettleAt = mq.gettime() + 3000
@@ -22305,19 +22390,27 @@ while running do
                 rezlog('\\ag[rez] zoned - wipe mode cleared, rezzing again\\ax')
             end
         end
+    end
+    if (mq.gettime() - (lastUpkeep or 0)) >= pace(UPKEEP_MS) then
+    lastUpkeep = mq.gettime()
+    do   -- timed background jobs: tribute refresh, and (if the toggle's on) auto tank-XTargets.
         local settled = false
         if zoneSettleAt and mq.gettime() >= zoneSettleAt then zoneSettleAt = nil; settled = true end
         if settled then tributeRequested = true end
-        -- ONLY WHILE THE PANEL IS ACTUALLY ON SCREEN, and far more slowly. Workers now push a flip the
-        -- instant it happens and refresh the number every five minutes on their own, so this poll is a
-        -- convenience for a panel being watched, not the mechanism.
-        -- 60s rather than 15s: favor is charged by the game every few minutes, so a faster poll cannot
-        -- show anything a slower one misses.
+        -- TRIBUTE IS EVENT DRIVEN. It changes on exactly two things: zoning, and somebody toggling it -
+        -- and both already announce themselves. Zoning sets `settled` above; a flip is pushed by the
+        -- worker the instant it happens. Neither needs polling to be noticed.
+        -- What is left is a slow failsafe for the number itself, and it is NOT paced: the whole point is
+        -- that it is already rare, and multiplying a five minute job by perfScale only makes a readout
+        -- people watch go stale for a quarter of an hour.
+        -- Still gated on the panel being visible - refreshing a readout nobody is looking at is work for
+        -- its own sake - but the cadence no longer follows the draw rate.
         if windowOpen and (mq.gettime() - (tribDrawnAt or 0)) < 3000
-           and (mq.gettime() - lastTributePoll) > 60000 then
+           and (mq.gettime() - lastTributePoll) > TRIB_POLL_MS then
             tributeRequested = true
         end
         -- Local rebuild only while the panel is up; it is cheap but it is also pointless otherwise.
+        -- Panel-driven rebuild kept for the driver's OWN row, which no /at_trib ever arrives for.
         if windowOpen and (mq.gettime() - (tribDrawnAt or 0)) < 3000 then rebuild_tribute_rows() end
         if autoXTank and iAmHealer then   -- each priest self-maintains; silent, no broadcast
             if settled then xtankAutoRequested = true end
@@ -22374,23 +22467,29 @@ while running do
             if sent >= 1 then break end
         end
     end
-    -- CHANGE-GATED, like every other reporter here. This was the one push left that went out on a timer
-    -- regardless: every worker told the driver its tribute state every 15s whether or not it had moved,
-    -- which is five messages a minute per toon carrying a flag and a number that change maybe twice a
-    -- session. The read stays on the 15s tick - it is two cheap TLOs - only the SEND is gated.
+    -- TRIBUTE: READ OFTEN, SEND RARELY. This block used to live inside the paced upkeep gate on a 15
+    -- second read, so a flip could sit unnoticed for fifteen seconds before anyone even looked - and on
+    -- low spec the gate around it stretched that further. The result was a panel showing tribute for the
+    -- driver and nothing for anybody else until the expanded view was opened, which is backwards.
+    -- Polling frequency and message frequency are different dials and this was turning the wrong one. The
+    -- read is two TLOs and costs nothing, so it happens every couple of seconds and is NOT paced. The
+    -- SEND is unchanged: change-gated, silent unless the flag actually moved, plus the five minute
+    -- keepalive so the favor number does not age forever.
     -- tribLast is cleared by /at_resync along with the other last-sent tables, so a driver that restarts
     -- still gets a full report rather than silence.
-    if driverName and (mq.gettime() - lastTribPush) > 15000 then
-        lastTribPush = mq.gettime()
+    -- A peer's report landed, so the rendered rows are stale. Done here rather than in the bind because
+    -- the bind runs inside doevents and this is a table walk, not a one-liner.
+    if tribRowsDirty then
+        tribRowsDirty = false
+        rebuild_tribute_rows()
+    end
+    atphase('trib_watch')
+    if driverName and (mq.gettime() - (lastTribPoll or 0)) > TRIB_WATCH_MS then
+        lastTribPoll = mq.gettime()
         local a = false; pcall(function() local v = mq.TLO.Me.TributeActive(); a = (v == true) or (tostring(v):upper() == 'TRUE') end)
         local f = 0; pcall(function() f = tonumber(mq.TLO.Me.CurrentFavor()) or 0 end)
         -- KEY ON THE STATE, NOT THE FAVOR. Favor DRAINS while tribute is running, so putting it in the
-        -- key meant the key moved on every single tick and every worker reported every 15 seconds - 49 of
-        -- 140 messages in a two minute sample, all of them saying 'still on, slightly less favor'.
-        -- The only thing anyone acts on is whether tribute is on or off; the number is a readout in a row
-        -- of a panel, and the game itself only charges favor every few minutes.
-        -- So: send instantly on a flip, and otherwise refresh the number every TRIB_KEEP_MS. The favor
-        -- shown can be a few minutes old, which is finer than the resolution of the thing it describes.
+        -- key meant the key moved on every read. The only thing anyone acts on is on or off.
         local k = tostring(a and 1 or 0)
         local due = (mq.gettime() - (tribKeepAt or 0)) > TRIB_KEEP_MS
         if tribLast ~= k or due then
