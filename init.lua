@@ -63,11 +63,28 @@ local mq    = require('mq')
 -- Relay commands (/at_*) are excluded: six characters send them to each other constantly and typing one
 -- does nothing useful.
 AT_ALL_BINDS = {}
+-- AND COUNT INBOUND RELAY TRAFFIC, in the same wrapper. There was very nearly a second one of these
+-- doing the mirror-image test - this collects the commands that are NOT /at_*, that one would have
+-- counted the ones that ARE - and two wrappers around the same function is how a handler ends up
+-- double-counted or double-called.
+-- Why count arrivals at all: net_count measures what this client SENDS, and on the driver that is
+-- almost nothing. The cost of a message is paid by the RECEIVER - every arrival fires a Lua bind, and
+-- all of them run inside one mq.doevents() call, in one tick, on the client that is also drawing the UI.
+-- net_in is defined much further down; it is a global and this wrapper only ever runs the inner function
+-- at message time, long after load.
 do
     local realBind = mq.bind
     mq.bind = function(name, fn)
         if type(name) == 'string' and name:sub(1, 4) ~= '/at_' then
             AT_ALL_BINDS[#AT_ALL_BINDS + 1] = name
+            return realBind(name, fn)
+        end
+        if type(name) == 'string' and type(fn) == 'function' then
+            local cmd = name
+            return realBind(name, function(...)
+                pcall(function() net_in(cmd) end)
+                return fn(...)
+            end)
         end
         return realBind(name, fn)
     end
@@ -88,7 +105,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.19'
-local BUILD_TAG = '1.19.6'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.19.55'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -950,6 +967,21 @@ AT_DISP_TICKS, AT_DISP_AT, AT_DISP_RATE, AT_DISP_WORK = 0, 0, 0, 0
 -- over half again as long as it meant to - enough to notice in the Loop readout, and rare enough that
 -- the log stays readable.
 AT_SLOW_TICK_MS = 400
+-- PHASES THAT BLOCK ON PURPOSE, and roughly what they cost when behaving. Below the figure here they are
+-- not worth a line; above it, something has gone wrong inside a phase that is normally predictable.
+-- These are schedules, not work: the invis combo spends its time waiting for five other clients to pause
+-- E3, which is the entire point of the lead.
+-- Not a way to hide slow code - anything not listed reports at AT_SLOW_TICK_MS as it always did.
+-- Which phase was the heaviest of each tick, tallied. Cheap enough to always run: one table write per
+-- tick. Read with /atheavy.
+AT_HEAVY    = {}
+AT_HEAVY_MS = {}
+AT_HEAVY_N  = 0
+AT_SLOW_EXPECTED = {
+    invis_combo = 8000,   -- lead 3500 + cast wait <=3000 + hold 2500, measured at 6042-6284ms
+    invis_arm   = 8000,   -- the same schedule, reached from the worker side
+    invis_prep  = 3000,   -- pause confirm plus two 400ms settles
+}
 -- FAST LANE VISIBILITY. The lane shipped in 1.18.124 and went six builds without a single line saying
 -- whether it ever engaged - so the only evidence was its absence, and a question that should have been a
 -- grep turned into reading gap timings off consecutive log lines and guessing.
@@ -991,6 +1023,21 @@ function atphase(name)
     -- The sampled-profiling and armed-tracing paths that used to sit here are gone. Sampling produced a
     -- phantom six second doevents block by leaving a phase open across the sampling boundary, and the
     -- tracer could only ever name whichever phase happened to be last. Both cost real time to mislead.
+    -- THE WORST PHASE OF THIS TICK, ALWAYS TRACKED. Two operations per phase - a subtraction and a
+    -- compare into two plain variables - which is not the thing that cost 69ms a tick. That was the
+    -- per-phase TABLE accumulation below, and that still only runs under /atprofile.
+    -- Why it is needed: the slow-tick warning used to name AT_phaseName, the phase OPEN when the check
+    -- ran, and the check runs at the end of the tick - so it named phase_flush every single time,
+    -- including on a 5685ms block. Exactly the failure the note below describes, reproduced on
+    -- 2026-08-31 by me after being warned about it.
+    -- The phase that was open is not the phase that was slow. This records the latter.
+    local nowT = mq.gettime()
+    if AT_phaseStart and AT_phaseName then
+        local took = nowT - AT_phaseStart
+        if took > (AT_tickWorstMs or 0) then
+            AT_tickWorstMs, AT_tickWorst = took, AT_phaseName
+        end
+    end
     if atProfile and AT_phaseAt and AT_phaseName then
         local took = mq.gettime() - AT_phaseAt
         AT_CPU.phase[AT_phaseName] = (AT_CPU.phase[AT_phaseName] or 0) + took
@@ -1002,6 +1049,7 @@ function atphase(name)
     end
     local now = mq.gettime()
     AT_phaseName, AT_phaseAt = name, (atProfile and now or nil)
+    AT_phaseStart = nowT
     local last = AT_PHASE_RING[((AT_PHASE_N - 1) % AT_PHASE_KEEP) + 1]
     if last and last.name == name then last.n = (last.n or 1) + 1; last.t = now; return end
     AT_PHASE_N = AT_PHASE_N + 1
@@ -1191,6 +1239,72 @@ ITEMS[#ITEMS + 1] = 'Ruby'
 -- middle of a routine that otherwise just moves things.
 -- ITEMS drives the counts pass, the grid and the planner, so leaving it out keeps all three simple.
 ALT_ITEMS = { 'Diamond Coin' }
+
+-- ===== DIAMOND COIN HAND-OFF =====
+-- Every character claims its own coins into inventory and hands them to one named character, so the
+-- balance ends up in one place instead of six.
+-- THE RECEIVER ARBITRATES, not the driver. It is the actual bottleneck - one trade window - it knows
+-- when it is free, and it keeps working through a driver restart. A driver-held token would be a second
+-- source of truth about a queue the receiver already owns.
+-- Blank name = off. Nothing here runs unless somebody has been named.
+dcGiveTo      = ''      -- who receives; set in Settings > Pots
+DC_ITEM       = 'Diamond Coin'
+-- Stop claiming with this many inventory slots left. Two rather than one: a claim can land a partial
+-- stack in a fresh slot, and running to literally zero leaves nothing free for the trade itself.
+DC_MIN_FREE   = 2
+-- A FULL STACK PER PRESS. Was 100 for no better reason than it being a round number, which meant two
+-- presses, two window round-trips and two log lines for every stack that could have moved in one.
+DC_PULL_EACH  = 200
+-- The receiver empties its own bags back into currency below this many free slots, so it can keep
+-- accepting. Higher than the giver's threshold: a trade arrives as several stacks at once, and a
+-- receiver that waits until it is as full as a giver has nowhere to put the last one.
+DC_RECV_FREE  = 6
+DC_RECLAIM_GAP = 5000   -- least time between reclaim attempts, so a failing one cannot spin
+dcReclaimAt   = 0
+DC_TURN_MS    = 120000  -- a granted turn expires after this, so one stuck giver cannot jam the queue
+DC_RETRY_MS   = 30000   -- how long a giver waits before asking again
+dcTurnHolder  = nil     -- receiver: who currently has the trade window
+dcTurnAt      = 0       -- receiver: when that turn was granted
+dcQueue       = {}      -- receiver: who is waiting
+dcAskedAt     = 0       -- giver: when we last asked for a turn
+dcHaveTurn    = false   -- giver: we have been told to come
+dcSaidFull    = false   -- giver: so 'inventory full' is said once, not every tick
+dcGiveNowWant = false   -- set by the button; consumed on the tick, never acted on in a draw
+-- A RUN, NOT A MODE. Naming somebody in the box used to be enough to start claiming - so the first thing
+-- that happened after typing a name was six characters emptying their currency tabs unasked. The name is
+-- now only a destination; nothing moves until the button says so, and the run ends by itself.
+dcRunning     = false   -- giver: a claim-and-hand-over run is in progress
+dcRunSaid     = false
+dcHeldWindow  = false   -- we are holding the inventory open for the duration of a run
+
+function dc_free_slots()
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.Me.FreeInventory()) or 0 end)
+    return n
+end
+
+function dc_my_coins()
+    local n = 0
+    pcall(function() n = tonumber(mq.TLO.FindItemCount('=' .. DC_ITEM)()) or 0 end)
+    return n
+end
+
+-- Am I the receiver? Compared case-insensitively, because a name typed into a settings box will not
+-- match Me.Name exactly, and silently doing nothing is the worst possible failure here.
+-- READS THE NAME ITSELF rather than using myName. myName is a LOCAL declared at ~1721, and this function
+-- sits above it - so the myName in here was never that local, it was a nil global, and the first call
+-- indexed nil and took the script down at startup. 2026-08-27.
+-- One TLO read on a function that is called a few times a second at most.
+function dc_i_am_receiver()
+    if (dcGiveTo or '') == '' then return false end
+    local me = ''
+    pcall(function() me = tostring(mq.TLO.Me.Name() or '') end)
+    return me ~= '' and dcGiveTo:lower() == me:lower()
+end
+
+function dc_active()
+    return dcGiveTo ~= '' and not dc_i_am_receiver()
+end
 
 -- Everything a REFRESH should read. Give out still walks ITEMS on its own, so a general hand-out never
 -- disturbs the alt items - but "what has everyone got" means all of it.
@@ -1568,6 +1682,31 @@ local peerChan
 -- thought the traffic looked like, which is exactly the kind of claim that should be a number instead.
 -- Counted at the two places anything leaves this client, so nothing can be added later that skips it.
 NET = { sent = 0, since = 0, byCmd = {} }
+-- DECLARED HERE, NOT IN THE BIND. benchState made exactly this mistake earlier today: created inside the
+-- command handler, so a reply arriving before the command had ever been run indexed a nil table and the
+-- bind died silently inside its own pcall. Five peers answered and none were recorded.
+netPeers = {}
+-- /atgrab state. Off unless armed, and it disarms itself on a clock rather than needing a second
+-- command - an always-on catch-all event is exactly the sort of thing that gets left running.
+atGrabUntil = 0
+atGrabN     = 0
+AT_GRAB_MAX = 400
+
+-- INBOUND, THE HALF WE NEVER MEASURED.
+-- net_count below counts what this client SENDS. On the driver that is almost nothing - and the driver
+-- is the client that struggles. The cost of a message is not paid by the sender: it is paid by whoever
+-- receives it, because every arriving message fires a Lua bind and every bind runs inside ONE
+-- mq.doevents() call, in one tick. Five workers sending twenty messages each is a hundred callbacks
+-- landing on the client that is also drawing the UI.
+-- That is why cutting the change-keys helped at all. It was never the wire; it was a hundred Lua
+-- callbacks arriving together.
+NETIN = { got = 0, since = 0, byCmd = {}, tick = 0, worstTick = 0, worstAt = 0 }
+function net_in(cmd)
+    NETIN.got = NETIN.got + 1
+    NETIN.tick = NETIN.tick + 1
+    if NETIN.since == 0 then NETIN.since = mq.gettime() end
+    NETIN.byCmd[cmd] = (NETIN.byCmd[cmd] or 0) + 1
+end
 
 function net_count(fmt)
     NET.sent = NET.sent + 1
@@ -1830,8 +1969,29 @@ function altcur_announce(name)
 end
 
 altcurCloseAfter = false
+-- HOLD THE WINDOW OPEN ACROSS A BATCH.
+-- Every altcur operation opened the inventory, did one thing and closed it again - right for a single
+-- read, wasteful for a run of them. A claim-and-hand-over pass is dozens of pulls back to back, so the
+-- window cycled open/closed dozens of times and every cycle pays its own settle.
+-- While this is held, nothing closes the window; whoever took the hold closes it once at the end.
+-- A COUNT rather than a flag, so nested holders cannot close it out from under each other.
+altcurHold = 0
+function altcur_hold()  altcurHold = altcurHold + 1 end
+function altcur_unhold(alsoClose)
+    altcurHold = math.max(0, altcurHold - 1)
+    if altcurHold == 0 and alsoClose then
+        pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end)
+    end
+end
+-- EVERY close in this file goes through here, so a site that was missed cannot bypass the hold.
+function altcur_close_if(wasOpen)
+    if wasOpen or altcurHold > 0 then return end
+    pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end)
+end
+
 function altcur_done()
     if not altcurCloseAfter then return end
+    if altcurHold > 0 then return end   -- a batch is running; it closes the window when it finishes
     altcurCloseAfter = false
     pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end)
 end
@@ -1952,6 +2112,15 @@ end
 -- Balances across the group. A peer can only read its own list, and only with that window open - so
 -- this asks each peer to report rather than trying to read their client from here.
 function query_alt_currency(peers, name)
+    -- NOBODY TO ASK, NOTHING TO WAIT FOR. This walked its full reply timeout with an empty peer list -
+    -- 2.3 seconds of blocked loop on a character running solo, twice in one session, for answers from
+    -- a group that does not exist.
+    -- The local read below still happens; it is only the waiting that is skipped.
+    if not peers or #peers == 0 then
+        altCounts[myName:lower()] = altCounts[myName:lower()] or {}
+        altCounts[myName:lower()][name] = altcur_balance(name)
+        return
+    end
     altCounts[myName:lower()] = altCounts[myName:lower()] or {}
     altCounts[myName:lower()][name] = altcur_balance(name)
 
@@ -2095,6 +2264,17 @@ local function query_all_counts(peers, items)
     end
     if #need == 0 then
         log('[counts] %d peer(s) from their own reports - no queries needed', fromPush)
+        -- THE PUSH DOES NOT CARRY ALT CURRENCY. It carries ITEM counts, which is what the shortcut above
+        -- was written for - and taking it also skipped the currency ask, because the two rode on the same
+        -- pass. /at_altrep is the ONLY thing that makes a character read its currency list, so a group
+        -- that had all reported showed blanks for every balance and nobody had been asked.
+        -- 2026-08-29: Ejtou had no [altcur] line at all while Shylain, on the same build in the same
+        -- group, had 22. The difference was not the character, it was whether a query reached it.
+        -- query_alt_currency, not a second simpler copy of it: that one spaces its sends because bunched
+        -- fires are what DanNet drops, waits 2.5s for replies because a peer on the wrong inventory tab
+        -- needs seconds to sweep for the right one, and re-fires whoever stayed silent. All of that was
+        -- learned the hard way and none of it is optional just because the caller changed.
+        for _, nm in ipairs(ALT_ITEMS) do query_alt_currency(peers, nm) end
         return
     end
     if fromPush > 0 then
@@ -2756,9 +2936,22 @@ local function ability_state(name)
     -- spell. Multiply by thirty-odd burn entries and burn_poll held the whole loop for 4408ms on
     -- 2026-08-17 21:50, which is four seconds during which no save, rez or invis could fire.
     -- The handle can be held and read from repeatedly; only the LOOKUP is expensive.
-    local it = mq.TLO.FindItem('=' .. name)
+    --
+    -- AND SKIP THE LOOKUP ENTIRELY FOR THINGS THAT ARE NOT ITEMS. That earlier fix cut three searches to
+    -- one; this cuts the remaining one for every AA and discipline on the list. Their FindItem ALWAYS
+    -- fails, and it fails only after checking every slot of every bag - then the function carries on to
+    -- the lookup that was always going to answer.
+    -- An AA does not become an item and a disc does not become an item, so once a name has been
+    -- classified the answer cannot change and the search is pure waste. Items are deliberately NOT
+    -- cached: those genuinely come and go.
+    -- Measured across five characters on 2026-08-30: 4782 bag scans avoided against 4108 performed, and
+    -- the skip rate per character tracks its loadout exactly - 63% on a disc-heavy monk, 36% on a shaman
+    -- whose burns really are mostly items.
+    abilityKind = abilityKind or {}
+    local cachedKind = abilityKind[name]
+    local it = (cachedKind == nil or cachedKind == 'i') and mq.TLO.FindItem('=' .. name) or nil
     local isItem = false
-    pcall(function() isItem = (tonumber(it.ID()) or 0) > 0 end)
+    if it then pcall(function() isItem = (tonumber(it.ID()) or 0) > 0 end) end
     if isItem then
         local t = 0; pcall(function() t = tonumber(it.TimerReady()) or 0 end)
         -- ONLY LOOK FOR THE EFFECT WHILE THE THING THAT GRANTS IT IS ON COOLDOWN. A burn's effect cannot
@@ -2774,6 +2967,7 @@ local function ability_state(name)
         else
             buffLatch[name] = nil       -- ready again: whatever it granted is done
         end
+        abilityKind[name] = 'i'
         return true, (t == 0), t, (ds > 0), ds, 'i'
     end
     -- OWNERSHIP, not existence. Me.AltAbility[x].ID resolves out of the game's AA table and answers
@@ -2797,11 +2991,15 @@ local function ability_state(name)
         else
             buffLatch[name] = nil
         end
+        abilityKind[name] = 'a'
         if aaRdy then return true, true, 0, false, 0, 'a' end
         return true, false, (aaSecs and aaSecs > 0 and aaSecs or -1), (ds > 0), ds, 'a'
     end
     local isSpell = false   -- otherwise a discipline
     pcall(function() isSpell = (tonumber(mq.TLO.Spell(name).ID()) or 0) > 0 end)
+    -- Remembered too: a name that resolves in the spell table is not going to start resolving in the
+    -- bags instead. Everything the cache skips is a search that could only ever fail.
+    if isSpell then abilityKind[name] = 'd' end
     if isSpell then   -- a discipline: also flag whether it's the one currently RUNNING (ActiveDisc)
         local active = false; pcall(function() active = (tostring(mq.TLO.Me.ActiveDisc.Name() or '') == name) end)
         local dsecs = 0
@@ -3267,12 +3465,25 @@ end
 
 -- ===== Rez target priority: a reorderable, persisted list (top gets rezzed first) =====
 local REZ_FILE
+-- PER CHARACTER, for the same reason the rez ORDER is - and this is the half of that fix that never
+-- landed. The order file was split per character on the strength of 'running a second box overwrote the
+-- first's rez order'; the PRIORITY list it is built from stayed machine-wide.
+-- So a second team on the same PC loads the first team's names, default_rez_order builds a chain out of
+-- characters who are not here, and the baton is handed to people who cannot answer. Reported 2026-08-27:
+-- rez did nothing until Reset default was pressed, which rebuilt the list from the group actually present.
+-- Writes always go to the per-character file. The old shared one is read ONLY when no per-character file
+-- exists yet, so an existing setup keeps its list on first run and then owns its own copy.
 local function rez_file_path()
     if REZ_FILE then return REZ_FILE end
-    local cfg = ''; pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    -- Settings folder, with the old flat path as a read fallback. Written to the new one from then on.
-    REZ_FILE = at_read('adventuretime_rezpriority.txt')
+    local who = ''
+    pcall(function() who = tostring(mq.TLO.Me.Name() or '') end)
+    REZ_FILE = at_read('adventuretime_rezpriority_' .. ((who ~= '') and who or 'unknown') .. '.txt')
     return REZ_FILE
+end
+
+-- The pre-1.19.20 shared file. Read once, never written.
+local function rez_file_path_shared()
+    return at_read('adventuretime_rezpriority.txt')
 end
 local function rez_rank(cls)
     cls = (cls or ''):upper()
@@ -3320,10 +3531,37 @@ function save_rez_priority()
 end
 function load_rez_priority()
     local list = {}
-    pcall(function()
-        local f = io.open(rez_file_path(), 'r')
-        if f then for line in f:lines() do local nm = (line:gsub('%s+$', '')); if nm ~= '' then list[#list + 1] = nm end end; f:close() end
-    end)
+    local function readInto(path)
+        pcall(function()
+            local f = io.open(path, 'r')
+            if f then
+                for line in f:lines() do
+                    local nm = (line:gsub('%s+$', ''))
+                    if nm ~= '' then list[#list + 1] = nm end
+                end
+                f:close()
+            end
+        end)
+    end
+    readInto(rez_file_path())
+    -- MIGRATION, ONCE. No per-character file yet means either a first run or an upgrade, and the shared
+    -- file is the best guess for what this character was using. It is never written back to.
+    if #list == 0 then readInto(rez_file_path_shared()) end
+    -- NAMES THAT ARE NOT HERE ARE NOT A REZ CHAIN. A list inherited from another team is worse than no
+    -- list: default_rez_priority rebuilds from the group actually present, which is what pressing Reset
+    -- default did by hand. Judged on overlap rather than exact match, so one member being out of zone
+    -- does not throw the whole order away.
+    if #list > 0 then
+        local here = {}
+        for _, nm in ipairs(group_members()) do here[nm:lower()] = true end
+        local hits = 0
+        for _, nm in ipairs(list) do if here[nm:lower()] then hits = hits + 1 end end
+        if hits == 0 then
+            rezlog('\\ay[rez] the saved rez list names nobody in this group (%s) - rebuilding from who is '
+                .. 'actually here\\ax', table.concat(list, ', '))
+            list = {}
+        end
+    end
     if #list == 0 then list = default_rez_priority() end
     local have = {}; for _, nm in ipairs(list) do have[nm:lower()] = true end
     for _, nm in ipairs(group_members()) do if not have[nm:lower()] then list[#list + 1] = nm end end   -- append any new group members
@@ -3424,6 +3662,7 @@ local function save_settings()
             f:write('miniCombos=' .. (miniCombos and '1' or '0') .. '\n')
             f:write('miniInvisRows=' .. (miniInvisRows and '1' or '0') .. '\n')
             f:write('raidFolded=' .. (raidFolded and '1' or '0') .. '\n')
+            f:write('dcGiveTo=' .. (dcGiveTo or '') .. '\n')
             f:write('miniInvisCombo=' .. (miniInvisCombo and '1' or '0') .. '\n')
             for _, g in ipairs({ 'ITU', 'Invis' }) do
                 if invisPick[g] then f:write('invispick_' .. g .. '=' .. invisPick[g] .. '\n') end
@@ -3569,6 +3808,9 @@ local function load_settings()
             if k == 'miniCombos' then miniCombos = (v == '1' or v:lower() == 'true') end
             if k == 'miniInvisRows'  then miniInvisRows  = (v == '1' or v:lower() == 'true') end
             if k == 'raidFolded'     then raidFolded     = (v == '1' or v:lower() == 'true') end
+            -- Not trimmed to a word: a name is one token, but a trailing space typed into the box would
+            -- otherwise make every comparison fail with nothing to show for it.
+            if k == 'dcGiveTo'       then dcGiveTo       = (v or ''):gsub('^%s+', ''):gsub('%s+$', '') end
             if k == 'miniInvisCombo' then miniInvisCombo = (v == '1' or v:lower() == 'true') end
             local ig = k:match('^invispick_(%a+)$')
             if ig and v ~= '' then invisPick[ig] = v end
@@ -4038,12 +4280,23 @@ function coth_watch_tick()
     pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
     local dx, dy, dz = x - w.x, y - w.y, z - w.z
     local moved = math.floor(math.sqrt(dx*dx + dy*dy + dz*dz))
-    if moved >= COTH.JUMPED then
+    -- ARRIVED IS A PLACE, NOT A DISTANCE. This asked only 'did I travel further than JUMPED (75)', which
+    -- is a proxy for 'was I teleported' - and it fails exactly when the summon is short.
+    -- 2026-08-27 03:32: Sebbun was 72 from the anchor, got summoned to 0, and 72 < 75 - so a character
+    -- standing on the anchor announced in group chat that it had not moved, and told the summoner the
+    -- cast failed. The summoner then has every reason to spend another emblem on somebody already here.
+    -- So ask the question that matters. Being within RANGE of the anchor with line of sight IS arrival,
+    -- however short the trip. The jump test stays as the other half: it catches a landing that is out of
+    -- LOS or slightly wide, which is still a summon and still worth reporting as one.
+    local here = false
+    pcall(function() here = (coth_dist_to_anchor() <= COTH.RANGE) and (coth_los() == 1) end)
+    if moved >= COTH.JUMPED or here then
         -- MY WHOLE PICTURE AT THE MOMENT I LAND. If I am about to decide I am NOT with the group, this
         -- line says which half failed - too far from the point, or no line of sight to the anchor.
         local a = COTH.at
-        rezlog('[coth] I was moved %d - telling %s I arrived (%d from the anchor, limit %d, los=%d to %s)',
-               moved, w.by, coth_dist_to_anchor(), COTH.RANGE, coth_los(), a and a.by or '?')
+        rezlog('[coth] arrived after %s cast - moved %d, now %d from the anchor (limit %d, los=%d to %s)%s',
+               w.by, moved, coth_dist_to_anchor(), COTH.RANGE, coth_los(), a and a.by or '?',
+               (moved < COTH.JUMPED) and ' [short summon - counted by position, not distance]' or '')
         -- Arrival is the expected case and does not need announcing to five other people; the summoner
         -- hears it directly and the log has it. Only the failures are worth the channel.
         -- EVERYONE, not just the character that summoned me. On 2026-08-15 04:41 Stylin told Khulian it
@@ -4169,8 +4422,19 @@ COTH_RANK_DEFAULT = 4
 -- the first arrival lands and could otherwise outrank the character that pulled them in.
 COTH_ANCHOR_CASTS = 2
 
+-- MY OWN CLASS, read locally, which is the one read that cannot fail for want of a spawn.
+function coth_my_class()
+    local c = ''
+    pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or '') end)
+    return (c ~= '' and c ~= 'NULL') and c:upper() or '?'
+end
+
+-- THE REPORT FIRST, the local read second. What the character said about itself beats what we can see of
+-- it from here - and during a gather we can usually see nothing at all.
 function coth_rank(nm)
-    local c = (member_class(nm) or ''):upper()
+    local st = COTH.state[nm]
+    local c = st and st.class or ''
+    if c == '' then c = (member_class(nm) or ''):upper() end
     return COTH_CLASS_RANK[c] or COTH_RANK_DEFAULT
 end
 -- How long the driver will hold the first summon waiting for charms to go on. Generous: the swap is
@@ -4188,6 +4452,8 @@ COTH_GREY_MS   = 8000
 COTH_ASK_MS    = 400
 COTH_SKIP_BUSY = 15000
 COTH_SKIP_FAIL = 4000
+-- How many times the charm may be put back in one gather before we stop fighting whatever removes it.
+COTH_RESEAT_MAX = 3
 COTH_SETTLE  = 3000    -- after the cast lands, how long to allow for the client to actually move me
 COTH_GIVE_UP = 25000   -- backstop for a target that never answers at all: crashed, zoned, gone
 -- AND A BACKSTOP FOR THE WHOLE GATHER. COTH_GIVE_UP above is PER TARGET - it drops one character who
@@ -4228,7 +4494,8 @@ local function coth_tick()
             if (now - COTH.lastPush) > 1000 then
                 COTH.lastPush = now
                 pcall(function()
-                    peer_bcast('/at_coth %s %d %d %d %d', myName, em, d, los, coth_here() and 1 or 0)
+                    peer_bcast('/at_coth %s %d %d %d %d %s', myName, em, d, los,
+                               coth_here() and 1 or 0, coth_my_class())
                 end)
             end
         end
@@ -4257,7 +4524,8 @@ local function coth_tick()
                    a and a.by or '?', a and tostring(a.zone) or '?')
         end
         COTH.state[myName] = { emblem = em, dist = d, los = los, here = here, updated = now }
-        pcall(function() peer_bcast('/at_coth %s %d %d %d %d', myName, em, d, los, here) end)
+        pcall(function() peer_bcast('/at_coth %s %d %d %d %d %s', myName, em, d, los, here,
+                                    coth_my_class()) end)
     end
 
     -- NOBODY SUMMONS UNTIL EVERYONE HAS SWAPPED. The point of the swap is the hasted cast, and a
@@ -4496,7 +4764,19 @@ local function coth_tick()
     -- logs afterwards is the slow way to see it; one channel with everyone announcing what they are
     -- doing shows the whole thing as it happens.
     pcall(function() mq.cmdf('/gsay CoTH: summoning %s', mine) end)
-    cursor_stow('coth')
+    -- NOTHING ON THE CURSOR, OR NOTHING HAPPENS. Casting with an item held is what disconnects the
+    -- client, and this called cursor_stow and threw the answer away - so a cursor that would not clear
+    -- was found, reported, and then cast over anyway.
+    -- Refusing costs one summon. The alternative costs the character its connection, and on a bard mid
+    -- gather that is the whole gather.
+    local clear, stuck = cursor_stow('coth')
+    if not clear then
+        rezlog('\\ar[coth] NOT casting - "%s" is stuck on the cursor and casting with a held item '
+            .. 'disconnects the client. Clear it and the next pass will summon %s.\\ax',
+               tostring(stuck or '?'), mine)
+        COTH.pending = nil
+        return
+    end
     pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, tid) end)
     -- BARDS GET NO CAST BAR FROM THE EMBLEM. Me.Casting never moves for them, so every check below reads
     -- 'it never started' and we release a summon that is actually on its way.
@@ -7648,10 +7928,20 @@ pcall(function()
         xtankAnnounce = (mode == 'on')
         rezlog('[xtank] raid announce %s (from the driver)', mode or '?')
     end)
-    mq.bind('/at_coth', function(name, em, dist, los, here)
+    -- CLASS RIDES ALONG. coth_rank called member_class, which falls back to a LOCAL spawn read - and a
+    -- gather is by definition a group of characters too far away or out of zone to read. So the lookup
+    -- returned nothing for everybody, every rank came out as COTH_RANK_DEFAULT, and the sort fell through
+    -- to alphabetical. 2026-08-27 03:32 opened by summoning Khulian, a warrior, ahead of Nityrc, the
+    -- cleric the ranking exists to fetch first - and 'K' is simply first alphabetically.
+    -- The comment on that sort already records the same bug from 2026-08-20, when it opened a gather with
+    -- a rogue. It was fixed by adding the ranking and the ranking never had data to work with.
+    -- A character knows its own class for certain, so it reports it rather than being guessed at. Missing
+    -- on an older build, which reads as nil and falls back exactly as before.
+    mq.bind('/at_coth', function(name, em, dist, los, here, cls)
         if name then
             COTH.state[name] = { emblem = tonumber(em) or -1, dist = tonumber(dist) or -1,
                                  los = tonumber(los) or 0, here = tonumber(here),
+                                 class = (cls and cls ~= '' and cls ~= '?') and cls:upper() or nil,
                                  updated = mq.gettime() }
         end
     end)
@@ -8079,7 +8369,7 @@ pcall(function()
         mq.delay(400)   -- a freshly opened window needs a beat before the list is readable
         local t = altcur_find_tab('Diamond Coin')
         if not t then log('[altcur] tab not identified - see the line above for why') end
-        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+        altcur_close_if(wasOpen)
     end)
     -- No quantity argument: Reclaim converts every stack of the item in one press.
     mq.bind('/atreclaim', function(a)
@@ -8433,6 +8723,16 @@ pcall(function()
     -- only checking one is how the placate work lost a whole subsystem for a week.
     -- WHAT DO THE READS ACTUALLY SAY? Dumps every buff and song with the verdict this character reaches,
     -- so a wrong colour can be traced to the exact name rather than guessed at.
+    -- /atmakemevis - drop invis across the whole group and nothing else. None of the invis machinery is
+    -- involved, so it can be used to test the command on its own.
+    mq.bind('/atmakemevis', function()
+        pcall(function() peer_bcast('/at_makemevis') end)
+        pcall(function() mq.cmd('/makemevis') end)   -- a broadcast does not come back to the sender
+        log('[invis] /makemevis sent to the whole group')
+    end)
+    -- mechanism on this build before anything is wired to it.
+    -- PEER, so leaving one running costs that character something forever; a trial needs an off switch
+    -- or it stops being a trial.
     mq.bind('/atinvisprobe', function()
         local any = 'nil'
         pcall(function() any = tostring(mq.TLO.Me.Invis()) end)
@@ -8802,8 +9102,23 @@ end
     -- This one reached every character at once, so it took the whole group down together: six clients,
     -- all last recorded in 'doevents', all at 03:41:14.
     mq.bind('/at_invisprep', function() invisPrepWanted = true end)
+    -- BARE /makemevis, on demand, with none of the prep around it - no pause, no stopcast, and no
+    -- late-prep gate deciding it knows better. For testing the command itself.
+    mq.bind('/at_makemevis', function()
+        pcall(function() mq.cmd('/makemevis') end)
+        rezlog('[invis] /makemevis (asked by the driver)')
+    end)
     -- And go back to normal. Sent once the casts are done.
     mq.bind('/at_invisdone', function()
+        -- NOT WHILE I AM STILL CASTING. The two casters fire within milliseconds of each other but do not
+        -- necessarily finish together, so the first one done broadcasts a release that would land on the
+        -- other mid-cast - the same interruption this whole path exists to prevent, arriving from a peer
+        -- instead of from E3's own rotation.
+        -- Deferred rather than dropped: invisPrepped stays set and the safety net in invis_fire_tick
+        -- releases it a moment later, so a cast that never ends cannot strand the hold.
+        local casting = 0
+        pcall(function() casting = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
+        if casting > 0 then return end
         -- BOTH flags, always together. Clearing invisPrepped alone is what left the stale stamp behind.
         if invisPrepped then invisPrepped = nil; e3_release('invis') end
         invisPrepAt = nil
@@ -8885,10 +9200,17 @@ end
         countsPush[char:lower()] = t
     end)
     mq.bind('/at_countsask', function() countsPushAt = 0 end)
-    -- Accepted and dropped: a worker still on an older build will keep sending these, and an unbound
-    -- command logs an error on every push. Removable once the group is all past 1.18.140.
-    mq.bind('/at_invis', function(char, n, u)
+    -- STORED AGAIN as of 1.19.7, but only ever written once per combo by the sender - see
+    -- invis_self_check. The fourth argument is new; a worker on an older build sends three and the
+    -- anyInvis flag simply reads nil, which the panel treats as 'not stated' rather than 'false'.
+    mq.bind('/at_invis', function(char, n, u, any)
         if not char then return end
+        invisState[char] = { norm = tonumber(n) or 0, und = tonumber(u) or 0,
+                             anyInvis = (any ~= nil) and (tonumber(any) == 1) or nil,
+                             updated = mq.gettime() }
+        -- Hold the row open past the LAST report rather than the first: reports trickle in over a second
+        -- or two and a fixed window from the combo would close on a straggler.
+        invisRowUntil = math.max(invisRowUntil or 0, mq.gettime() + INVIS_ROW_MS)
     end)
     mq.bind('/at_magicprobe', function()   -- what does each magic entry resolve to on me?
         for _, e in ipairs(MAGIC_CLICKS) do
@@ -9614,6 +9936,22 @@ pcall(function()
     -- Cougar]' set this character waiting for a cast it had no part in.
     -- On 2026-08-14 20:28 that left the cleric holding for ninety seconds over interrupts of Sacred
     -- Remedy, Chromablast and Mark of the Blameless, none of which were ours.
+    -- GRAB WHATEVER THE WINDOW PRINTS, for a short window, into OUR log.
+    -- Some things only ever go to the MQ console - /e3listexposeddata prints a long list there and
+    -- nowhere else - and console text cannot always be copied out of the client. AT already has a log
+    -- file that survives reloads and keeps eight sessions, so it can just write the lines down.
+    -- A catch-all event is deliberately expensive to leave running, so it is armed for a fixed window
+    -- and disarms itself. It also does nothing at all until asked.
+    -- No filtering: the point is to capture output whose shape we do not know yet. Filtering it would
+    -- mean guessing the format of the thing we are trying to read.
+    mq.event('at_grab_all', '#1#', function(line)
+        if not atGrabUntil or mq.gettime() > atGrabUntil then return end
+        local t = tostring(line or '')
+        if t == '' then return end
+        atGrabN = (atGrabN or 0) + 1
+        -- Capped, so a chatty window cannot fill the log with a raid's worth of spam.
+        if atGrabN <= AT_GRAB_MAX then rezlog('[grab] %s', t) end
+    end)
     mq.event('at_e3_healcut', '#*#Interrupting [#1#] for #*#', function(line, spell)
         -- LOG THE RAW LINE. The pattern was wrong for weeks because it only matched the broadcast wording
         -- and the common case says something else - and nothing recorded what was actually being said, so
@@ -9690,9 +10028,32 @@ pcall(function()
         lastResyncHonored = mq.gettime()
         burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}; tribLast = nil
         potLast = {}; healLast = {}; cureLast = {}; magicLast = {}
+        -- THREE THAT WERE MISSING, and they are missing in the same way: each push is change-gated on a
+        -- key that survived the resync, so the driver heard nothing about them until the value happened
+        -- to move on its own. countsPushLast has a 120s keepalive and recovers eventually; the other two
+        -- have none, so a character joining mid-session could show a blank Nightveil indefinitely.
+        nvLast = ''            -- which emblems I carry and whether they are ready
+        arcLast = nil          -- arcane state, change-pushed exactly like the pots and cures
+        countsPushLast = ''    -- item counts behind the give-out tab
+        -- NOT epLast or pwLast. Those are recast timers rather than report caches - the note above
+        -- epLast is explicit that zeroing it removes the gap and refires the placate immediately.
         lastBurnPoll, lastClickPoll = 0, 0   -- poll on the next tick rather than waiting out the 2s
         burnStartAt, clickStartAt = 0, 0   -- skip both startup settles: the driver is waiting on us now
         lastBurnResync = mq.gettime()
+        -- AND THE ANNOUNCE-ONCE FACTS. Everything above is a cache that refills itself on the next poll.
+        -- These are stated once at startup and never again: what I can placate, whether I hold a phantom,
+        -- and what my DI ladder actually owns. A character that was up before the driver restarted never
+        -- repeats them, so the driver's picture of it stays permanently incomplete.
+        -- Clearing the said-flags makes the announce path treat this like a fresh start, which is exactly
+        -- what the driver asked for.
+        epSaidHave, pwSaidHave = false, false
+        if DI then DI.saidRungs = nil end
+        -- AND ASK FOR WHAT THE DRIVER OWNS. Reporting is only half of a resync: the rezzer order is shared
+        -- state the driver holds, and a late joiner asks for it at startup while a resync never did. A
+        -- character that was up through a driver restart kept whatever order it had from before.
+        if driverName then
+            pcall(function() peer_cmdf(driverName, '/at_rezorder? %s', myName) end)
+        end
         log('[sync] re-reporting everything at the driver request')
     end)
     mq.bind('/at_burnrefresh', function()   -- re-parse my [Burn] INI and re-report every item from scratch
@@ -9714,6 +10075,30 @@ pcall(function()
         local f = 0; pcall(function() f = tonumber(mq.TLO.Me.CurrentFavor()) or 0 end)
         peer_cmdf(who, '/at_trib %s %d %d', myName, a and 1 or 0, f)
     end)
+    -- A giver is full and wants the trade window. Queued rather than answered immediately, so two
+    -- characters filling up in the same second do not both get told to come.
+    -- Hand over now, whatever you are holding. The receiver still decides the order.
+    mq.bind('/at_dcnow', function()
+        if dc_active() then dcRunning, dcRunSaid = true, true end
+    end)
+    mq.bind('/at_dcwant', function(who)
+        if not who or not dc_i_am_receiver() then return end
+        if dcTurnHolder == who then return end
+        for _, q in ipairs(dcQueue) do if q == who then return end end
+        dcQueue[#dcQueue + 1] = who
+        rezlog('[dc] %s is waiting to hand over (%d in the queue)', who, #dcQueue)
+    end)
+    -- The receiver says come now.
+    mq.bind('/at_dcgo', function(from)
+        if not from or from:lower() ~= (dcGiveTo or ''):lower() then return end
+        dcHaveTurn = true
+    end)
+    -- A giver finished, or gave up. Either way the window is free.
+    mq.bind('/at_dcdone', function(who)
+        if not who or not dc_i_am_receiver() then return end
+        if dcTurnHolder == who then dcTurnHolder = nil end
+    end)
+
     mq.bind('/at_trib', function(name, act, favor)   -- a peer reported its tribute status
         if not name then return end
         tributeState[name] = { active = (tonumber(act) == 1), favor = tonumber(favor) or 0, updated = mq.gettime() }
@@ -9746,6 +10131,64 @@ BRING_UP_GAP = 400
 -- ceiling instead of exiting early: 1200 + 1500 + 1200 + 3000 plus the launch staggers. That is the
 -- 10056ms 'bringing the group up' at 01:06:50, spent entirely waiting on somebody who was never going
 -- to answer.
+-- ===== DANNET OBSERVERS =====
+-- An observer is a standing subscription to a TLO expression on a peer. Once set, DanNet keeps the value
+-- updated on our side and we read it locally - no message, no round trip, no Lua on the peer at all.
+--
+-- THEY OUTLIVE THIS SCRIPT. That is the thing to understand before using them, and it cost a night to
+-- learn: a subscription lives in DanNet, not here. Reloading AT does not drop it. On 2026-08-30 about a
+-- hundred were left running from an experiment - most of them FindItem[=x], which is a full bag scan -
+-- re-evaluating on every peer every second, invisible to /atnet because nothing crossed peer_cmdf, and
+-- surviving every reload until the plugin itself was restarted. The clients got measurably slower and
+-- there was no way to see why from inside the script.
+-- So: every subscription is REGISTERED, and dnet_drop_all runs on the way out. Nothing subscribes
+-- without that path existing first.
+--
+-- READ ONLY WHAT IS SUBSCRIBED. The plugin's release notes record that reading an observer as a data var
+-- without /dobserve first FREEZES the client. Every read here is gated on ObserveSet.
+--
+-- WHAT THEY SUIT: values that sit still. Measured - a constant sent nothing over 51 seconds, while a
+-- tribute flag was noticed 0-1809ms FASTER than the push on every one of ten transitions.
+-- WHAT THEY DO NOT: anything counting down. A burn timer produced 1534 changes in three minutes, because
+-- change-gating cannot help a value that genuinely changes every second.
+dnetObs = {}    -- dnetObs[peer .. '\0' .. query] = true, so everything we set can be unset
+
+
+
+-- Subscribe, once, and record it. Returns true when the observer is live and safe to read.
+
+-- nil means 'no answer', which the caller must treat differently from a zero.
+
+function dnet_unobserve(peer, query)
+    pcall(function() mq.cmdf('/dobserve %s -q "%s" -drop', peer, query) end)
+    dnetObs[peer .. '\0' .. query] = nil
+end
+
+-- THE ONE THAT MATTERS. Called on the way out, and by /atobsdrop. Walks the registry rather than
+-- reconstructing queries from whatever happens to be configured now - a subscription made against an
+-- item the character no longer carries still has to be dropped.
+function dnet_drop_all(why)
+    -- SNAPSHOT FIRST. dnet_unobserve clears its own key, so calling it from inside pairs(dnetObs) mutates
+    -- the table being traversed. Assigning nil to an existing key mid-traversal is technically defined in
+    -- Lua, but this is the shutdown path and it only gets one attempt - not the place to lean on a rule
+    -- most readers would have to look up.
+    local keys = {}
+    for key, _ in pairs(dnetObs) do keys[#keys + 1] = key end
+    local n = 0
+    for _, key in ipairs(keys) do
+        local peer, query = key:match('^(.-)%z(.*)$')
+        if peer and query then
+            -- Through dnet_unobserve rather than repeating the command here: one place that knows how to
+            -- phrase a drop, so a change to the syntax cannot fix one caller and miss the other.
+            dnet_unobserve(peer, query)
+            n = n + 1
+        end
+    end
+    dnetObs = {}
+    if n > 0 then log('[obs] dropped %d observer(s) (%s)', n, why or 'shutdown') end
+    return n
+end
+
 -- DanNet.Peers is the list of clients we can actually reach. Not in it, not ours, leave them alone.
 -- FAIL OPEN. An empty or unreadable peer list means DanNet has not discovered anyone yet - at startup
 -- that is normal and lasts a second or two. Treating that as 'nobody is ours' would stop the group
@@ -10052,6 +10495,132 @@ local function give_items_to(receiver, bundle)   -- bundle = { {item=, qty=}, ..
     for item, placed in pairs(placedMap) do log('\\agHanded %d %s to %s.\\ax', placed, item, receiver) end
     return placedMap
 end
+
+-- THE GIVER. Claim until nearly full, then ask the receiver for a turn and hand everything over.
+-- Nothing here navigates or trades on its own: it asks, and acts only when told to come. Two characters
+-- opening a trade on the same person at once is how items end up on the floor.
+function dc_giver_tick()
+    if not dc_active() then
+        -- RELEASE ON THIS PATH TOO. Clearing the name mid-run lands here, and returning without giving
+        -- the hold back would leave altcurHold above zero for the rest of the session - which means
+        -- nothing would ever close the inventory window again, on any code path.
+        if dcHeldWindow then dcHeldWindow = false; altcur_unhold(true) end
+        dcHaveTurn, dcSaidFull, dcRunning = false, false, false
+        return
+    end
+    -- NOTHING HAPPENS UNTIL ASKED. dcRunning is set only by the button (locally or via /at_dcnow), so a
+    -- name sitting in the box costs one string compare per tick and moves nothing.
+    if not dcRunning and not dcHaveTurn then
+        -- Run over, or never started: give the window back if we were holding it.
+        if dcHeldWindow then dcHeldWindow = false; altcur_unhold(true) end
+        return
+    end
+    -- HOLD THE INVENTORY OPEN FOR THE WHOLE RUN. Taken once, not per pull - the point is that a run of
+    -- claims stops paying an open/close cycle each time.
+    if not dcHeldWindow then dcHeldWindow = true; altcur_hold() end
+
+    -- HAVE A TURN? Then this is the whole job: hand over everything and say we are done.
+    if dcHaveTurn then
+        dcHaveTurn = false
+        local have = dc_my_coins()
+        if have <= 0 then
+            pcall(function() peer_cmdf(dcGiveTo, '/at_dcdone %s', myName) end)
+            return
+        end
+        log('[dc] my turn - handing %d %s to %s', have, DC_ITEM, dcGiveTo)
+        local moved = give_items_to(dcGiveTo, { { item = DC_ITEM, qty = have } })
+        local n = 0
+        for _, q in pairs(moved or {}) do n = n + (tonumber(q) or 0) end
+        log('[dc] handed over %d %s (%d still on me)', n, DC_ITEM, dc_my_coins())
+        -- Release even when nothing moved. A turn that is not given back is a queue that stops.
+        pcall(function() peer_cmdf(dcGiveTo, '/at_dcdone %s', myName) end)
+        dcSaidFull = false
+        return
+    end
+
+    local bal = altcur_balance(DC_ITEM) or 0
+    local free = dc_free_slots()
+
+    -- ROOM LEFT AND STILL SOMETHING TO CLAIM: claim more. altcur_pull opens and restores the inventory
+    -- window itself.
+    if bal > 0 and free >= DC_MIN_FREE then
+        dcSaidFull = false
+        altcur_pull(DC_ITEM, math.min(DC_PULL_EACH, bal))
+        return
+    end
+
+    -- NOTHING LEFT ANYWHERE: the run is finished. Said once, then quiet.
+    if bal <= 0 and dc_my_coins() <= 0 then
+        if dcRunSaid then log('[dc] nothing left to claim or hand over - done') end
+        dcRunning, dcRunSaid, dcSaidFull = false, false, false
+        -- Close it here, at the end of the batch, which is the whole point of having held it.
+        if dcHeldWindow then dcHeldWindow = false; altcur_unhold(true) end
+        return
+    end
+
+    -- EITHER FULL, OR THE BALANCE IS EMPTY AND WE ARE HOLDING COINS. Both mean the same next step: get
+    -- the trade window and hand over what we have. If the balance still has more, the run continues
+    -- after the hand-off, because the tick comes back round with free slots again.
+    if dc_my_coins() <= 0 then return end
+    if not dcSaidFull then
+        dcSaidFull = true
+        log('[dc] %d slot(s) free, %d left in currency - asking %s for a turn to hand over %d %s',
+            free, bal, dcGiveTo, dc_my_coins(), DC_ITEM)
+    end
+    if (mq.gettime() - dcAskedAt) > DC_RETRY_MS then
+        dcAskedAt = mq.gettime()
+        pcall(function() peer_cmdf(dcGiveTo, '/at_dcwant %s', myName) end)
+    end
+end
+
+-- THE RECEIVER. One turn at a time, granted in the order asked.
+-- A turn expires: a giver that crashes, zones or is killed mid-trade must not hold the window forever.
+function dc_receiver_tick()
+    if not dc_i_am_receiver() then
+        if dcTurnHolder then dcTurnHolder, dcQueue = nil, {} end
+        return
+    end
+    -- MAKE ROOM BEFORE TAKING MORE. The receiver fills up faster than anyone - it is taking everybody
+    -- else's - and a full receiver stops the whole chain: givers queue, get their turn, and the trade
+    -- has nowhere to land.
+    -- Reclaiming puts the coins back into ITS OWN currency tab, which is where they were being collected
+    -- to in the first place, so this is not a workaround - it is the last step of the job.
+    -- Only between turns. Reclaiming with a trade window open would be reaching into bags somebody is
+    -- actively handing items into.
+    if not dcTurnHolder and dc_free_slots() < DC_RECV_FREE and dc_my_coins() > 0
+       and (mq.gettime() - (dcReclaimAt or 0)) > DC_RECLAIM_GAP then
+        -- STAMPED BEFORE THE ATTEMPT, not after a success. A reclaim that fails - cursor blocked, window
+        -- refusing - would otherwise retry every tick, and each retry opens the inventory window. The gap
+        -- makes a failing reclaim cost one attempt every few seconds instead of one per tick.
+        dcReclaimAt = mq.gettime()
+        -- Held across the reclaim as well: it opens and closes the same window, and a receiver that is
+        -- filling up does this repeatedly.
+        altcur_hold()
+        local before = dc_my_coins()
+        log('[dc] %d slot(s) free - putting %d %s back into currency to make room',
+            dc_free_slots(), before, DC_ITEM)
+        pcall(function() altcur_reclaim(DC_ITEM) end)
+        local after = dc_my_coins()
+        altcur_unhold(true)
+        if after >= before then
+            log('\\ay[dc] reclaim moved nothing - still %d %s in bags, %d slot(s) free\\ax',
+                after, DC_ITEM, dc_free_slots())
+        end
+        return
+    end
+    if dcTurnHolder then
+        if (mq.gettime() - dcTurnAt) <= DC_TURN_MS then return end
+        log('\\ay[dc] %s did not finish within %ds - taking the turn back\\ax',
+            dcTurnHolder, math.floor(DC_TURN_MS / 1000))
+        dcTurnHolder = nil
+    end
+    if #dcQueue == 0 then return end
+    local nextUp = table.remove(dcQueue, 1)
+    dcTurnHolder, dcTurnAt = nextUp, mq.gettime()
+    log('[dc] %s may hand over now (%d waiting)', nextUp, #dcQueue)
+    pcall(function() peer_cmdf(nextUp, '/at_dcgo %s', myName) end)
+end
+
 
 -- single-item convenience (used by the Emerald buy hand-out)
 local function give_item_to(receiver, item, qty)
@@ -10816,6 +11385,60 @@ local function render_group(label, color, items, altCurrency)
 
         end
         ImGui.EndTable()
+    end
+    -- HAND-OFF TARGET, drawn AFTER the table rather than as a row in it.
+    -- The first attempt spanned the row by counting TableNextColumn calls to match the member columns.
+    -- ImGui asserts at the C level when a table overruns its column count, and a C assert is not
+    -- something a Lua pcall can catch - so a typo in that arithmetic took the whole script down the
+    -- moment somebody clicked the box. 2026-08-27.
+    -- Outside the table there is no arithmetic to get wrong, and it reads better anyway: this acts on
+    -- the currency as a whole, not on any one character's column.
+    if altCurrency then
+        ImGui.Spacing()
+        ImGui.TextColored(0.62, 0.82, 0.95, 1.0, 'Claim all ' .. altCurrency .. ' and give to:')
+        ImGui.SameLine()
+        ImGui.SetNextItemWidth(150)
+        local okI, nv = pcall(function()
+            return ImGui.InputText('##at_dcgive_' .. altCurrency, dcGiveTo or '')
+        end)
+        if okI and nv ~= nil and nv ~= dcGiveTo then
+            -- Clearing the queue on edit matters: retyping the name mid-run would otherwise leave turns
+            -- outstanding against whoever it used to be.
+            dcGiveTo = (nv:gsub('^%s+', ''):gsub('%s+$', ''))
+            dcQueue, dcTurnHolder, dcHaveTurn = {}, nil, false
+            save_settings()
+        end
+        ImGui.SameLine()
+        if (dcGiveTo or '') == '' then
+            ImGui.TextDisabled('off - blank means nobody claims or hands over')
+        else
+            -- GIVE ALL NOW. The background loop only moves coins once a character is nearly full, which
+            -- can be a long wait on a character that claims slowly. This says do it now, with whatever
+            -- everyone is already holding, and goes through the same one-at-a-time queue - so pressing
+            -- it cannot make two characters open a trade on the same person.
+            if ImGui.SmallButton('Claim + Give All##at_dcnow') then
+                dcGiveNowWant = true
+            end
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                pcall(function() ImGui.SetTooltip(
+                    'Every character claims its ' .. altCurrency .. ' into bags and hands it to '
+                 .. dcGiveTo .. '.\nClaiming pauses at ' .. DC_MIN_FREE .. ' free slots, hands over, '
+                 .. 'then carries on\nuntil the currency tab is empty.\n\n'
+                 .. 'One at a time - they queue for the trade window.\n'
+                 .. 'Nothing happens until you press this; the name alone does nothing.') end)
+            end
+            ImGui.SameLine()
+            if dc_i_am_receiver() then
+                ui_text({ 0.36, 0.80, 0.46 },
+                        string.format('receiving - %d waiting, %s has the window',
+                                      #dcQueue, dcTurnHolder or 'nobody'))
+            elseif dcRunning then
+                ui_text({ 0.90, 0.70, 0.30 },
+                        string.format('running - %d free, %d on me', dc_free_slots(), dc_my_coins()))
+            else
+                ImGui.TextDisabled(string.format('idle - %d on me, press to start', dc_my_coins()))
+            end
+        end
     end
     pop_state_button(pushed)
     ImGui.Spacing()
@@ -12003,16 +12626,41 @@ end
 -- panels tick smoothly regardless. Only the decision to SEND is coarsened.
 -- Minute buckets: a fire and a return still push instantly, because those cross a bucket. Everything
 -- between them is one message a minute, which the keepalives were already paying for.
+-- READY OR NOT. NOTHING FINER.
+-- This bucketed to MINUTES, which sounds coarse and is not: a minute bucket ticks once a minute for the
+-- whole cooldown, so a 30 minute reuse re-sent 30 times and a 2 hour one 120 times - on every character,
+-- for items whose state changes exactly twice.
+-- Same fault as the Nightveil key and the v2 burns payload, in a helper shared by four pushes at once.
+-- The countdown is still SENT in every payload, so the driver has a real number and counts down from
+-- `updated` exactly as it always has. What changed is only WHEN a message goes out.
+-- Negative and zero keep their exact values: 'ready' and 'not carried' are distinct states and both are
+-- worth sending the instant they happen.
 function push_bucket(secs)
     local n = tonumber(secs) or 0
-    if n <= 0 then return n end          -- ready, or 'none' - both are exact states worth sending at once
-    return math.floor(n / 60)
+    if n <= 0 then return n end          -- ready, or 'none' - exact states, sent at once
+    return 1                             -- on cooldown; how long is the payload's business
 end
 
+-- SAME CACHE AS ability_state, for the same reason and on the same measurement.
+-- click_poll is the largest single cost on the frame - 17.1% and 62ms a poll over 4129 ticks - and the
+-- note above it already worked out why: 'the time is not in asking about things we do NOT have, it is in
+-- reading the ones we DO'. That was answered by polling less often, 2s to 5s, rather than by making the
+-- read cheaper.
+-- This makes the read cheaper. FindItem walks every bag; for a cure that is an AA or a spell it walks
+-- them all and finds nothing, every poll, forever. An AA does not become an item, so once a name has
+-- been classified the scan can never do anything but fail.
+-- abilityKind is shared with ability_state deliberately: it is the same question about the same names,
+-- and two caches disagreeing about one item is a bug waiting to happen. Items stay uncached - those
+-- genuinely come and go.
 function cure_state(name)
+    abilityKind = abilityKind or {}
+    local ck = abilityKind[name]
     local itemID = 0
-    pcall(function() itemID = tonumber(mq.TLO.FindItem('=' .. name).ID()) or 0 end)
+    if ck == nil or ck == 'i' then
+        pcall(function() itemID = tonumber(mq.TLO.FindItem('=' .. name).ID()) or 0 end)
+    end
     if itemID > 0 then
+        abilityKind[name] = 'i'
         local t = 0
         pcall(function() t = tonumber(mq.TLO.FindItem('=' .. name).TimerReady()) or 0 end)
         return 1, (t > 0) and math.floor(t) or 0
@@ -12021,6 +12669,7 @@ function cure_state(name)
     pcall(function() rank = tonumber(mq.TLO.Me.AltAbility(name).Rank()) or 0 end)
     pcall(function() rdy  = tlo_true(mq.TLO.Me.AltAbilityReady(name)()) end)
     if (rank > 0) or rdy then
+        abilityKind[name] = 'a'
         if rdy then return 1, 0 end
         local s = -1
         pcall(function() s = tonumber(mq.TLO.Me.AltAbilityTimer(name).TotalSeconds()) or -1 end)
@@ -12028,7 +12677,11 @@ function cure_state(name)
     end
     -- Not an item and not an AA - but it may still be mine as a spell, disc or skill. Owned with no
     -- timer we can read is better than invisible: the button appears and simply always looks ready.
-    if have_thing(name) then return 1, 0 end
+    -- Owned but neither item nor AA: a spell, disc or skill. Cached as 'd' so the bag scan stops too -
+    -- same reasoning, and it is the case a cure list is most likely to be full of.
+    if have_thing(name) then abilityKind[name] = 'd'; return 1, 0 end
+    -- NOT CACHED WHEN NOTHING OWNS IT. An unknown name may be an item the character has not looted yet,
+    -- and caching 'not mine' would make it invisible forever.
     return 0, -1
 end
 
@@ -13010,9 +13663,12 @@ end
 -- not work that way.
 ALTCUR_RECLAIM_C = 'IW_AltCurr_ReclaimButton'
 function altcur_reclaim(name)
-    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
-        log('\\ay[altcur] something is on the cursor - clear it before reclaiming\\ax'); return 0
-    end
+    -- NO CURSOR GUARD. There was one, refusing outright whenever anything was held, and I replaced it in
+    -- 1.19.29 with a stow-then-reclaim dance on the theory that a held cursor blocked Elanta's reclaim.
+    -- It did not. The client reclaims perfectly well with something on the cursor - confirmed in play.
+    -- The real cause was the inventory's 'show only currency I own' filter hiding a zero-balance row, so
+    -- there was no row to select. Both the original guard and my replacement addressed a problem that was
+    -- not happening, and mine moved items around to do it.
     local before = 0
     pcall(function() before = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
     if before <= 0 then log('\\ay[altcur] no %s in bags to reclaim\\ax', name); return 0 end
@@ -13032,8 +13688,16 @@ function altcur_reclaim(name)
 
     local row, rows = altcur_row(name)
     if not row then
-        log('\\ay[altcur] %s is not in the currency list (%d rows) - cannot reclaim\\ax', name, rows or 0)
-        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+        -- NAME THE LIKELY CAUSE. The inventory has a 'show only currency I own' filter, and a character
+        -- holding coins in BAGS with a zero BALANCE is exactly the case it hides - which is every
+        -- receiver that has just reclaimed, and every character partway through a hand-off.
+        -- Elanta 2026-08-29: 15,200 in bags, 0 in currency, no row to select. The reclaim was correct to
+        -- refuse; it just could not say why, so it read as a cursor problem and I fixed the wrong thing.
+        log('\\ay[altcur] %s is not in the currency list (%d row(s) shown) - cannot reclaim.\\ax',
+            name, rows or 0)
+        log('\\ay[altcur]   If the inventory has "show only currency I own" ticked, a zero balance is '
+            .. 'hidden - untick it and this works. %d %s are in bags waiting.\\ax', before, name)
+        altcur_close_if(wasOpen)
         return 0
     end
     pcall(function() mq.cmdf('/notify %s %s listselect %d', ALTCUR_WND, ALTCUR_LIST_C, row) end)
@@ -13046,7 +13710,7 @@ function altcur_reclaim(name)
     end)
     mq.delay(400)
 
-    if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+    altcur_close_if(wasOpen)
     local left = 0
     pcall(function() left = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
     local gone = before - left
@@ -13200,7 +13864,7 @@ function altcur_pull(name, qty)
         if cn ~= '' then
             log('\\ay[altcur] something else is on the cursor (%s) - stopping\\ax', cn)
             altcurStuck = true
-            if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+            altcur_close_if(wasOpen)
             local sofar = 0
             pcall(function() sofar = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
             return math.max(0, sofar - before)
@@ -13266,7 +13930,7 @@ function altcur_pull(name, qty)
                 (held ~= '') and held or name)
         end
         altcurStuck = true
-        if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+        altcur_close_if(wasOpen)
         -- Report what DID land, not zero. Earlier rounds may have stowed several stacks fine, and
         -- claiming nothing happened would send the caller looking for a problem it does not have.
         local sofar = 0
@@ -13291,7 +13955,7 @@ function altcur_pull(name, qty)
 
     local after = 0
     pcall(function() after = tonumber(mq.TLO.FindItemCount('=' .. name)()) or 0 end)
-    if not wasOpen then pcall(function() mq.TLO.Window(ALTCUR_WND).DoClose() end) end
+    altcur_close_if(wasOpen)
 
     local got = after - before
     altcur_announce(name)
@@ -13927,6 +14591,30 @@ function cursor_stow(tag)
         rezlog('[%s] stowed %s off the cursor', tag or 'cursor', held)
         return true
     end
+    -- PUT IT IN A BAG BY HAND. /autoinventory decides for itself where something goes and declines
+    -- outright when it cannot decide - and a refusal leaves the item on the cursor, which is the state
+    -- everything downstream is not allowed to be in.
+    -- Naming a specific free slot removes the decision: find an empty one, click it, confirm the cursor
+    -- cleared. Same approach ep_stow_cursor already uses for the placate strip.
+    for b = 1, 10 do
+        local cont = 0
+        pcall(function() cont = tonumber(mq.TLO.Me.Inventory('pack' .. b).Container()) or 0 end)
+        for sl = 1, cont do
+            local occupied = true
+            pcall(function()
+                occupied = (tonumber(mq.TLO.Me.Inventory('pack' .. b).Item(sl).ID()) or 0) > 0
+            end)
+            if not occupied then
+                pcall(function() mq.cmdf('/itemnotify in pack%d %d leftmouseup', b, sl) end)
+                mq.delay(600, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
+                if (mq.TLO.Cursor.ID() or 0) == 0 then
+                    rezlog('[%s] stowed %s into pack%d slot %d', tag or 'cursor', held, b, sl)
+                    return true
+                end
+            end
+        end
+    end
+    rezlog('\\ar[%s] %s will not leave the cursor and there is no free bag slot\\ax', tag or 'cursor', held)
     return false, held
 end
 
@@ -15255,7 +15943,67 @@ function raid_scan_rows(name)
     return nil, 0
 end
 
+-- OPENED ONCE, NOT KEPT OPEN. This is the distinction I read past for a week.
+-- win_exists_raw's own note says it plainly: 'a window that has never been opened this session has no
+-- controls at all'. The client does not populate the raid roster until the window has been DRAWN once,
+-- and once it has, the rows stay readable whether it is open or shut.
+-- 2026-08-27 22:46 shows the untouched case: 0 rows, four fresh locks, four empty reads. 04:00 shows the
+-- half-primed case: 83 rows but only this character's own group named, so a member of another group
+-- 'is not in either list'. Neither is a lock problem and no amount of retrying fixes either.
+-- So AT does it rather than asking. Open, wait for rows, put the window back exactly as it was found.
+-- Same shape as altcur_show_tab, which has been doing this for the currency list all along.
+-- Once per session, because that is all the client needs. If the roster is still empty afterwards the
+-- caller reports it exactly as before: this removes a cause, it does not hide a symptom.
+raidPrimed = false
+function raid_prime_window()
+    if raidPrimed then return end
+    -- NOT IN A RAID, NOTHING TO PRIME. Opening the window to populate a roster that does not exist is a
+    -- window flashing on somebody's screen for no reason - and the flag stays down, so it primes properly
+    -- the moment there IS a raid.
+    local members = 0
+    pcall(function() members = tonumber(mq.TLO.Raid.Members()) or 0 end)
+    if members <= 0 then return end
+    raidPrimed = true
+    local wasOpen = false
+    pcall(function() wasOpen = (mq.TLO.Window(RAID_WND).Open() == true) end)
+    if not wasOpen then
+        pcall(function() mq.TLO.Window(RAID_WND).DoOpen() end)
+        mq.delay(800, function() return mq.TLO.Window(RAID_WND).Open() == true end)
+    end
+    -- Wait for ROWS, not a fixed nap: the point is that the roster filled, and how long that takes is
+    -- the client's business.
+    mq.delay(1200, function()
+        local n = 0
+        pcall(function() n = tonumber(mq.TLO.Window(RAID_WND).Child('RAID_PlayerList').Items()) or 0 end)
+        return n > 0
+    end)
+    local rows = 0
+    pcall(function() rows = tonumber(mq.TLO.Window(RAID_WND).Child('RAID_PlayerList').Items()) or 0 end)
+    -- SHUT IT, AND CONFIRM IT SHUT. Leaving somebody's raid window open because a close was sent and
+    -- never checked is the kind of small rudeness that gets a tool switched off - and it is one read to
+    -- be sure rather than hope. Three goes, because a client mid-zone can ignore the first.
+    local left = 'open'
+    if not wasOpen then
+        for _ = 1, 3 do
+            pcall(function() mq.TLO.Window(RAID_WND).DoClose() end)
+            mq.delay(600, function() return mq.TLO.Window(RAID_WND).Open() ~= true end)
+            local o = false
+            pcall(function() o = (mq.TLO.Window(RAID_WND).Open() == true) end)
+            if not o then left = 'shut again'; break end
+        end
+        if left ~= 'shut again' then
+            rezlog('\\ay[raid] could not close the raid window again after priming - leaving it open\\ax')
+            left = 'STILL OPEN'
+        end
+    end
+    rezlog('[raid] primed the raid window (%s) - %d row(s), left %s',
+           wasOpen and 'was already open' or 'opened it', rows, left)
+end
+
 function raid_find_row(name)
+    -- Still called here as a backstop - the flag makes it free once it has run, and a re-arm on zoning
+    -- lands here rather than costing a startup.
+    raid_prime_window()
     -- 'empty' is the client's placeholder text for an unused group slot, and there are dozens of them.
     -- Matching one would select a slot rather than a player and hand a click to whatever is highlighted.
     if name:lower() == 'empty' then return nil, 0 end
@@ -15304,8 +16052,13 @@ function raid_find_row(name)
                 end
             end
         end
-        if named > shown then names[#names + 1] = '(+' .. (named - shown) .. ' more)' end
-        rezlog('[raid] %s holds %d row(s), %d named: %s', lst, rows, named, table.concat(names, ' '))
+        -- PER LIST, not cumulative. named accumulates across both lists, so the second borrowed the
+        -- first one's count and printed '0 row(s), 7 named' - nonsense, and it made a readable roster
+        -- look like a broken one.
+        local thisList = named - before
+        if thisList > shown then names[#names + 1] = '(+' .. (thisList - shown) .. ' more)' end
+        rezlog('[raid] %s holds %d row(s), %d named: %s', lst, rows, named - before,
+               table.concat(names, ' '))
         -- WHEN NOTHING READ, SAY WHAT ROW 1 DOES HOLD, across every column. 'no readable names' on its
         -- own cannot tell an empty window from one whose name column has moved, and that is the whole
         -- question when the roster will not read.
@@ -16431,6 +17184,14 @@ function cothg_tick()
     end
 
     local t = far[1]
+    -- SAME CURSOR GUARD AS THE GROUP GATHER. This path had none at all - it cast straight into whatever
+    -- was held, and casting with an item on the cursor disconnects the client.
+    local clear, stuck = cursor_stow('cothg')
+    if not clear then
+        rezlog('\\ar[cothg] NOT casting - "%s" is stuck on the cursor. Clear it and the next pass '
+            .. 'will summon %s.\\ax', tostring(stuck or '?'), t.name)
+        return
+    end
     rezlog('[cothg] summoning %s (%d away)', t.name, t.dist or -1)
     pcall(function() mq.cmdf('/gsay CoTH: summoning %s now.', t.name) end)
     pcall(function() mq.cmdf('/nowcast me "%s%s" %d', COTH.ITEM, COTH.OPTS, t.id) end)
@@ -16478,6 +17239,8 @@ end
 -- THIS IS AN OPTIMISATION AND IS ALLOWED TO FAIL. Every failure path here leaves the charm alone and
 -- lets the emblem be clicked from the bag exactly as it is today - a slow gather beats a stuck one.
 cothCharmSaved = nil     -- what was in the charm slot before we touched it ('' = empty)
+cothCharmWorn  = nil     -- what WE seated, so a charm that comes back off can be spotted and re-seated
+cothCharmReseat = 0      -- how many times we have had to put it back this gather
 cothSwapWant   = nil     -- set by the bind, drained by the main loop: this does cursor work and delays
 
 -- OUR OWN HOLD, NOT THE PLACATE'S. This called ep_pause/ep_resume, which take the hold under the name
@@ -16543,21 +17306,6 @@ function coth_pickup(name, tries)
 end
 
 -- Seat whatever is on the cursor into the charm slot and confirm the slot reads it back.
-function coth_seat_charm(name, tries)
-    for n = 1, (tries or 4) do
-        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
-        mq.delay(900, function()
-            return tostring(mq.TLO.Me.Inventory('charm').Name() or '') == name
-        end)
-        local seated = ''
-        pcall(function() seated = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-        if seated == name then return true end
-        rezlog('[coth]   %s did not seat in charm, retry %d', name, n)
-        mq.delay(300)
-    end
-    return false
-end
-
 -- EMPTY THE SLOT FIRST, THEN FILL IT. Seating a charm straight into an occupied slot is one click that
 -- does two things - the new one goes in and the old one lands on the cursor - and 1.18.24 showed it does
 -- not hold: the swap reported success, and eight seconds later the slot read the ORIGINAL charm again.
@@ -16574,6 +17322,39 @@ end
 -- The verifies are still the real gate; this is the pause AFTER a verify passes, before the next move.
 -- Cheap: half a second per phase, four phases, once per gather.
 COTH_SETTLE_MS = 500
+
+function coth_seat_charm(name, tries)
+    for n = 1, (tries or 4) do
+        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
+        mq.delay(900, function()
+            return tostring(mq.TLO.Me.Inventory('charm').Name() or '') == name
+        end)
+        local seated = ''
+        pcall(function() seated = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+        if seated == name then
+            -- READ IT AGAIN AFTER IT SETTLES. The slot reading correctly the instant the click lands is
+            -- not the same as it having stuck: 1.18.24 saw exactly that, a verify that passed and a slot
+            -- that read the ORIGINAL charm eight seconds later. The note on the caller says the client's
+            -- item state settles a beat after the read comes back true - so take the beat, then look.
+            -- This is what an empty aug slot looks like from the inside: a seat that reported success and
+            -- did not hold, with nothing checking afterwards.
+            mq.delay(COTH_SETTLE_MS)
+            local again = ''
+            pcall(function() again = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+            if again == name then return true end
+            rezlog('\\ay[coth]   %s seated then came back as "%s" - reseating\\ax',
+                   name, (again ~= '') and again or '(empty)')
+            -- Whatever is there now is not what we asked for, and it may be sitting on the cursor. Clear
+            -- before trying again, or the next click swaps the two round instead of fixing anything.
+            cursor_stow('coth')
+        else
+            rezlog('[coth]   %s did not seat in charm, retry %d', name, n)
+        end
+        mq.delay(300)
+    end
+    return false
+end
+
 
 function coth_charm_take_off()
     local now = ''
@@ -16687,6 +17468,9 @@ function coth_charm_equip_inner(want)
     -- RECORD BEFORE REMOVING. Written first so a crash between the read and the click still leaves a file
     -- naming what should be worn. The other order loses exactly the case this exists for.
     cothCharmSaved = now
+    -- WHAT WE PUT ON, so the guard below can tell 'still worn' from 'quietly came off'. Recorded next to
+    -- what we took off, because the pair is what a recovery needs.
+    cothCharmWorn, cothCharmReseat = want, 0
     coth_charm_recovery_write()
     rezlog('[coth] charm slot holds "%s" - swapping in %s', (now ~= '') and now or '(empty)', want)
 
@@ -16752,6 +17536,7 @@ function coth_charm_restore_inner(why)
     if now == original then
         rezlog('[coth] charm already back to "%s" (%s)', original, why or 'restore')
         cothCharmSaved = nil
+        cothCharmWorn, cothCharmReseat = nil, 0
         coth_charm_recovery_clear()
         coth_swap_unhold(why or 'coth swap done')
         return true
@@ -16781,6 +17566,7 @@ function coth_charm_restore_inner(why)
     if ok and final == original then
         rezlog('[coth] charm restored to "%s" (%s)', (original ~= '') and original or '(empty)', why or 'restore')
         cothCharmSaved = nil
+        cothCharmWorn, cothCharmReseat = nil, 0
         coth_charm_recovery_clear()
     else
         -- KEEP THE RECORD. cothCharmSaved is what the backstop and /atcothswap back work from, so clearing
@@ -16843,7 +17629,40 @@ function coth_report_swap(state)
 end
 cothSwapAt    = 0
 
+-- IT CAME OFF AGAIN. Seating verified at the moment of the click is not the same as it having stuck:
+-- Stylin 2026-08-27 03:55:43 reported 'Master Lazarus Charm is worn' and by 03:56:47 the slot held the
+-- original again - E3 held throughout, no swap logged in between, no line anywhere saying it moved.
+-- A settle-and-recheck at seat time cannot catch that, because the revert arrived up to a minute later.
+-- So the charm is watched for as long as the gather runs: one inventory read per tick, and only while
+-- we are actually swapped.
+-- Bounded. A slot that will not hold the charm is a real problem, and reseating forever would hide it
+-- behind a gather that looks like it is working.
+function coth_charm_guard()
+    if not cothCharmWorn or cothCharmWorn == '' then return end
+    local now = ''
+    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
+    if now == cothCharmWorn then return end
+    if (cothCharmReseat or 0) >= COTH_RESEAT_MAX then return end
+    cothCharmReseat = (cothCharmReseat or 0) + 1
+    rezlog('\\ay[coth] %s came back off - slot now holds "%s" - reseating (%d of %d)\\ax',
+           cothCharmWorn, (now ~= '') and now or '(empty)', cothCharmReseat, COTH_RESEAT_MAX)
+    -- Clear the cursor first: whatever displaced the charm may still be on it, and clicking with a full
+    -- cursor swaps the two round instead of fixing anything.
+    cursor_stow('coth')
+    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
+        rezlog('\\ar[coth] cursor will not clear - not reseating into a held item\\ax')
+        return
+    end
+    if coth_pickup(cothCharmWorn) and coth_seat_charm(cothCharmWorn) then
+        rezlog('[coth] %s is back on', cothCharmWorn)
+    elseif cothCharmReseat >= COTH_RESEAT_MAX then
+        rezlog('\\ar[coth] %s has come off %d times this gather - something is re-equipping underneath '
+            .. 'us. Leaving it alone rather than fighting the client.\\ax', cothCharmWorn, cothCharmReseat)
+    end
+end
+
 function coth_swap_tick()
+    coth_charm_guard()
     -- BACKSTOP FIRST. If the driver goes away mid-gather - crash, zone, /lua stop - nothing else will
     -- ever send the 'off' that puts the charm back, and the character would wear the wrong charm until
     -- somebody noticed. Same reasoning as EP_STRIP_MAX, same duration.
@@ -18612,9 +19431,26 @@ miniFold = miniFold or {}
 -- on anybody.
 -- Only what was actually CAST is checked: if the combo only sent ITU, missing plain invis is not a miss.
 invisExpectItu, invisExpectInv, invisSelfCheckAt = false, false, 0
+-- Per-character invis result, written once per combo. Nothing polls it and nothing refreshes it: it is a
+-- record of how the last combo went, not a live reading, and the panel says how old it is.
+invisState = {}
+-- How long a result stays worth painting. Past this the row greys out rather than asserting a coverage
+-- that is half an hour old.
+-- How long the readout stays up after the last report lands. Short on purpose: the row exists to answer
+-- 'did that combo work' in the seconds after casting it, and a row that never leaves stops being read.
+INVIS_ROW_MS  = 10000
+invisRowUntil = 0
 -- After the lead expires, how long to allow for both casts to land before reading. Both have a cast time
 -- and the reading has to be of the settled state, not the mid-cast one.
 INVIS_SELF_CHECK_MS = 4000
+-- Ceiling on waiting for our own invis cast to finish before releasing E3. Exits as soon as the cast
+-- clears; this only bounds a cast that never does.
+INVIS_CAST_MAX = 3000
+-- Least time E3 stays paused after the cast goes out, whatever Me.Casting says. The buff has to land on
+-- five other clients, and letting a bard resume a song into that window is how the invis gets stripped
+-- from the people it was cast for.
+INVIS_HOLD_MIN = 2500
+invisFiredAt   = 0
 -- Vestigial: it was the change key for the push that no longer happens. Left declared because
 -- /atinvisprobe still clears it, and a nil global assignment there would be a silent no-op rather than
 -- an error - not worth chasing into a command that already does its own reading.
@@ -18965,7 +19801,24 @@ function invis_fire_now()
     -- All of that fed the per-character roster. With the roster gone it was writing two log lines for
     -- 2.7s of the loop, and the self-check verifies the same thing later, for EVERY character rather than
     -- just the two who cast.
-    -- Track at the cast, then stop. Nothing watches after this point.
+    -- STAMPED BEFORE THE WAIT, so a prep that arrives during it is already too late to run.
+    invisFiredAt = mq.gettime()
+    -- WAIT FOR THE CAST TO FINISH BEFORE HANDING E3 BACK.
+    -- magic_click issues the cast and returns; the spell is still in flight. Releasing here let E3 resume
+    -- mid-cast and take the character back - which is exactly the bard being caught mid-song, and any
+    -- other caster whose invis has a cast time.
+    -- This is a regression I introduced in 1.18.141. The old post-cast watch blocked 1200 then 1500ms and
+    -- I removed it as logging overhead, which it mostly was - but those delays were also the only thing
+    -- keeping E3 out until the cast landed. The cost went and so did a job nobody had written down.
+    -- Not a fixed wait this time. It exits the moment casting clears, so a working cast pays only its own
+    -- length instead of a flat 2.7 seconds, and the ceiling stops a stuck cast holding E3 forever.
+    mq.delay(INVIS_CAST_MAX, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
+    -- AND THEN A FLOOR. Me.Casting clearing means the cast finished, not that the buff has landed and
+    -- settled - on a click with no bar it can read clear almost immediately, and E3 comes straight back
+    -- while the group is still receiving. Hold for a fixed minimum measured from the cast going out.
+    -- Cheap: the wait above has usually consumed most of it already.
+    local held = mq.gettime() - invisFiredAt
+    if held < INVIS_HOLD_MIN then mq.delay(INVIS_HOLD_MIN - held) end
     -- Hand the group back. Everyone was held for this, so everyone gets released - and locally too, since
     -- a broadcast does not return to the sender.
     pcall(function() peer_bcast('/at_invisdone') end)
@@ -19040,7 +19893,23 @@ INVIS_PREP_MAX = 9000
 -- whatever was already in flight.
 -- It is also why this cannot be casters-only. Every character is receiving the invis, so every character
 -- has to be quiet for it - the casters are simply the most obvious case, not the only one.
+-- A LATE PREP STRIPS THE INVIS IT WAS MEANT TO PROTECT.
+-- prep runs /makemevis to clear any existing invis before a fresh one lands. Arriving AFTER the cast it
+-- removes the new buff instead of an old one: 2026-08-29 23:44, Nityrc fired ITU at 08.947 and logged
+-- 'dropped ... (+ /makemevis)' at 09.999 - it stripped its own cast one second later, and every other
+-- character did the same. Self check: missed both.
+-- The prep broadcast is sent before the cast message, but a queued flag is only as early as the tick
+-- that reads it, and on a loaded client that can land the wrong side of the cast.
+-- So the prep is not merely idempotent, it is EXPIRED: once a cast for this combo has gone out, the
+-- window for preparing has closed and running it late can only do harm.
+INVIS_PREP_DEAD = 8000
 function invis_prep_self()
+    if invisFiredAt and (mq.gettime() - invisFiredAt) < INVIS_PREP_DEAD then
+        rezlog('[invis] prep arrived %dms after the cast - skipping it, /makemevis would strip what just '
+            .. 'landed', mq.gettime() - invisFiredAt)
+        invisPrepWanted = false
+        return
+    end
     -- ANY PENDING REQUEST IS SATISFIED BY THIS. The arm runs before the prep handler in the tick and
     -- calls us itself, then blocks for the lead and the cast - about four seconds. The queued
     -- /at_invisprep is still sitting there when it returns, so the tick prepped a SECOND time for a cast
@@ -19058,11 +19927,19 @@ function invis_prep_self()
     -- That is the /e3p on, off, on, off shuffle, and it was also leaving the casters unprotected.
     invisPrepped = true
     invisPrepAt  = mq.gettime()
-    -- NOWAIT. Every millisecond spent confirming the pause comes off this caster's share of the lead, and
-    -- the two casters do not spend the same amount - which is precisely what pulls their casts apart.
-    -- The invis flow has its own protection anyway: /makemevis and /stopcast below clear whatever E3 had
-    -- going, and the heal-interrupt event catches the one thing that can still cut a cast.
-    e3_hold('invis', true)
+    -- CONFIRM THE PAUSE BEFORE TOUCHING ANYTHING. This was e3_hold('invis', true) - NOWAIT - on the
+    -- reasoning that confirming costs lead time and the /stopcast below would clean up anyway.
+    -- It does not clean up, because /e3p is QUEUED: the command returns to us instantly and only lands
+    -- when E3's loop next asks whether it is paused. So /stopcast could run while E3 was still driving,
+    -- E3 restarted the song immediately, and the invis landed on a bard who was already singing again.
+    -- The required order is pause, THEN stopcast, THEN cast, THEN unpause - and 'pause' means E3 has
+    -- actually stopped, not that we have asked it to.
+    -- e3_hold without nowait waits on e3_is_paused rather than a fixed guess, so it returns the moment
+    -- E3 reports paused - measured 1.0 to 1.6s on a live pull, against a 3500ms lead.
+    -- The cast time is an ABSOLUTE deadline (base + lead), not 'now + something', so a longer prep does
+    -- not move the cast or pull the two casters apart. It eats slack, and the armed line reports exactly
+    -- how much is left - if 'left of the lead' starts running short, INVIS_LEAD is the dial.
+    e3_hold('invis')
     -- CLEAR ANY INVIS WE ALREADY HAVE, before casting more at ourselves.
     -- Right here is the moment: E3 is paused so nothing will re-apply anything, and the stopcast below
     -- has not run yet. Starting from a known-visible state means the after-readings measure THIS combo
@@ -19086,10 +19963,22 @@ function invis_prep_self()
         pcall(function() mq.cmdf('/target id %d', myId) end)
         mq.delay(400, function() return (tonumber(mq.TLO.Target.ID()) or 0) == myId end)
     end
+    -- UNCONDITIONAL. This used to fire /stopcast only when Me.Casting read non-zero, and that read is not
+    -- reliable for every class - a bard mid-song frequently does not register there, so `casting` came
+    -- back false, the stopcast never went out, and the song ran straight through the invis and stripped
+    -- it. Reported 2026-08-27.
+    -- /stopcast on an idle character is a no-op. Gating a free command behind a read that is wrong for
+    -- one class buys nothing and costs exactly that class.
+    -- Songs get their own command as well: /stopsong is what the client offers for the case /stopcast was
+    -- never meant to cover, and it is equally harmless when nothing is playing. Sent in a pcall so a
+    -- build without it is a silent no-op rather than an error.
+    pcall(function() mq.cmd('/stopcast') end)
+    pcall(function() mq.cmd('/stopsong') end)
+    -- The WAIT is still conditional, because there is nothing to wait for when the read says idle - and
+    -- on the class where the read lies, waiting on it would block for the full 400ms every single time.
     local casting = false
     pcall(function() casting = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0 end)
     if casting then
-        pcall(function() mq.cmd('/stopcast') end)
         mq.delay(400, function() return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 end)
     end
     -- STRIP THE PROC BUFF THAT BREAKS INVIS. The necro line has one whose proc fires and drops invis a
@@ -19157,6 +20046,12 @@ function invis_combo_fire()
         return false
     end
     log('[invis] combo: %s', table.concat(parts, ', '))
+    -- OPEN THE READOUT WINDOW. The row is only worth screen space around a cast: before it there is
+    -- nothing to say, and ten minutes later it is a record nobody is reading. It opens here, stays up
+    -- through the lead and the settle while the reports come in, and closes shortly after the last one.
+    -- Cleared results, not stale ones: last combo's answers must not sit under this combo's header.
+    invisState = {}
+    invisRowUntil = mq.gettime() + INVIS_LEAD + INVIS_SELF_CHECK_MS + INVIS_ROW_MS
     -- QUIET THE WHOLE GROUP FIRST, not just the two casters.
     -- Anyone mid-cast when the invis lands strips their OWN - the caster is only the most obvious case.
     -- So everybody pauses E3 and drops whatever is in flight, and the lead below is what gives them time
@@ -19174,6 +20069,10 @@ end
 -- Am I one of the casters named in that message? Runs on every character; only the two named act.
 function invis_combo_take(lead, blob, at)
     local ld = tonumber(lead) or INVIS_LEAD
+    -- A NEW COMBO REOPENS THE PREP WINDOW. invisFiredAt closes it for INVIS_PREP_DEAD after a cast, and
+    -- without clearing it here a second combo inside that window would have its prep refused as 'late'.
+    -- The combo message is the definitive start of a new round, so it is the right place to reset.
+    invisFiredAt = 0
     -- EVERY character notes what is coming, not just the two casters - the whole point is that the ones
     -- who are only receiving are the ones worth hearing from.
     invisExpectItu, invisExpectInv = false, false
@@ -19220,6 +20119,23 @@ function invis_self_check()
     pcall(function() anyInvis = tlo_true(mq.TLO.Me.Invis()) end)
     local missItu = invisExpectItu and (u or 0) == 0
     local missInv = invisExpectInv and not anyInvis
+    -- ONE REPORT, ONCE, AT THE MOMENT THE ANSWER IS SETTLED.
+    -- The old push was continuous and that is what made it useless: every character pushed its state on a
+    -- timer, the driver painted a row from whatever had arrived, and under low spec the row showed misses
+    -- that were not misses. It was removed on 2026-08-24 rather than fixed.
+    -- This is a different proposition. It fires once per combo, after the lead plus the settle, when the
+    -- buffs have either landed or not - so there is no in-between state to catch and nothing to go stale
+    -- between reports. anyInvis rides along because plain invis cannot always be named from a buff, and
+    -- the driver would otherwise paint 'no invis' on a character that is plainly invisible.
+    if driverName and driverName:lower() ~= myName:lower() then
+        pcall(function()
+            peer_cmdf(driverName, '/at_invis %s %d %d %d',
+                      myName, (n or 0), (u or 0), anyInvis and 1 or 0)
+        end)
+    elseif SHOW_UI then
+        invisState[myName] = { norm = (n or 0), und = (u or 0),
+                               anyInvis = anyInvis, updated = mq.gettime() }
+    end
     local what
     if missItu and missInv then what = 'both ITU and invis'
     elseif missItu          then what = 'ITU'
@@ -19299,11 +20215,68 @@ function draw_invis()
     -- Colour is doing a lot of work here, and blue against white against grey is not a distinction
     -- everybody can make quickly - so the tooltip always spells it out in words, and a character with
     -- neither is dimmed as well as grey so "no invis" reads differently even if the hue does not.
-    -- COVERAGE ROW REMOVED (2026-08-24). Six names painted from state each character pushed to the
-    -- driver. Under low spec those pushes arrived late enough that the row showed misses which were
-    -- not misses - a confident claim about another client, made from data that was already stale.
-    -- Each character now says in /gsay what IT missed, which cannot be wrong about anybody, and the
-    -- whole push/roster path went with it.
+    -- BACK AS OF 1.19.7, ON A DIFFERENT FOOTING. The version removed on 2026-08-24 painted from a
+    -- continuous push, so the row could show a miss that was only a report arriving mid-cast. This paints
+    -- from a single report per combo, sent after the buffs have settled - there is no in-between state to
+    -- catch, so a name here is what that character actually ended up with.
+    -- It is a RECORD, not a live reading, and the row's lifetime says so: it exists for a few seconds
+    -- around a cast and then is gone entirely, rather than sitting there asserting a coverage that is ten
+    -- minutes old. A character that has not reported yet is dimmed, because 'no data' and 'no invis' must
+    -- not look the same.
+    -- ONLY AROUND A CAST. Outside the window there is no row at all - not a greyed one, not a header.
+    -- That is what makes it obvious this is a one-time read rather than a live display: it appears when
+    -- there is something to say and goes away when there is not, and it costs no space the rest of the
+    -- time.
+    if mq.gettime() < (invisRowUntil or 0) then
+        local total, ok = 0, 0
+        for _, nm in ipairs(group_members()) do
+            total = total + 1
+            local st = invisState[nm]
+            if st and ((st.norm or 0) > 0 or st.anyInvis == true) and (st.und or 0) > 0 then
+                ok = ok + 1
+            end
+        end
+        local shown = 0
+        for _, nm in ipairs(group_members()) do
+            local st = invisState[nm]
+            local rgb, word
+            if not st then
+                rgb, word = { 0.40, 0.40, 0.42 }, 'no report yet'
+            else
+                -- anyInvis covers the case invis_self cannot name: invisible, but by a buff this build
+                -- does not recognise. Treated as invis rather than as nothing, because the client saying
+                -- 'you are invisible' outranks our buff table not knowing which spell did it.
+                local inv = (st.norm or 0) > 0 or (st.anyInvis == true)
+                local itu = (st.und or 0) > 0
+                if     inv and itu then rgb, word = { 0.72, 0.55, 0.90 }, 'invis and ITU'
+                elseif itu         then rgb, word = { 0.88, 0.88, 0.90 }, 'ITU only - visible to the living'
+                elseif inv         then rgb, word = { 0.45, 0.65, 0.95 }, 'invis only - VISIBLE TO UNDEAD'
+                else                    rgb, word = { 0.85, 0.35, 0.35 }, 'NOTHING - fully visible'
+                end
+            end
+            if shown > 0 then ImGui.SameLine(0, 6) end
+            shown = shown + 1
+            ui_text(rgb, raid_short(nm))
+            if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                local age = (st and st.updated) and math.floor((mq.gettime() - st.updated) / 1000) or -1
+                pcall(function() ImGui.SetTooltip(string.format('%s\n%s%s', nm, word,
+                    (age >= 0) and string.format('\nreported %ds ago', age) or '')) end)
+            end
+        end
+        if shown > 0 then ImGui.NewLine() end
+        -- THE VERDICT UNDER THE NAMES, not above them. The names are the detail you scan; the verdict is
+        -- the conclusion you draw from them, and it reads better arriving after rather than before.
+        -- WITH A COUNTDOWN, because a row that vanishes without warning reads as a glitch. Seeing it tick
+        -- down is what tells you the disappearance is the design and not something breaking.
+        local left = math.max(0, math.ceil(((invisRowUntil or 0) - mq.gettime()) / 1000))
+        ui_text((ok == total) and { 0.36, 0.80, 0.46 } or { 0.90, 0.70, 0.30 },
+                string.format('%s %d/%d', (ok == total) and 'Cast successful' or 'Cast incomplete',
+                              ok, total))
+        ImGui.SameLine(0, 6)
+        -- The timer stays dim whatever the verdict: it is about the row's lifetime, not about coverage,
+        -- and colouring it green would make it look like part of the good news.
+        ui_text({ 0.45, 0.45, 0.48 }, string.format('(%ds)', left))
+    end
     if miniInvisCombo then
         local n = 0
         for _, grp in ipairs(INVIS_ROWS) do if invisPick[grp] then n = n + 1 end end
@@ -21348,19 +22321,222 @@ pcall(function() mq.bind('/atcpu', function(a)
     end
 end) end)
 
+-- A PEER REPORTING ITS OWN COUNTERS. NET only ever counted what THIS client sends, and on the driver
+-- that is almost nothing - the driver receives, the workers send. Reading /atnet on the driver therefore
+-- showed 4 messages in half a minute while the group as a whole was doing 354 a minute, which is a
+-- perfectly accurate answer to a question nobody was asking.
+pcall(function() mq.bind('/at_net', function(who, sent, mins, top1, n1, top2, n2)
+    if not who then return end
+    netPeers = netPeers or {}
+    netPeers[who] = { sent = tonumber(sent) or 0, mins = tonumber(mins) or 0.1,
+                      top1 = top1 or '-', n1 = tonumber(n1) or 0,
+                      top2 = top2 or '-', n2 = tonumber(n2) or 0, at = mq.gettime() }
+end) end)
+
+pcall(function() mq.bind('/at_netask', function(from, what)
+    if what == 'reset' then
+        NET.sent, NET.since, NET.byCmd = 0, mq.gettime(), {}
+        return
+    end
+    if not from then return end
+    local mins = math.max(0.1, (mq.gettime() - (NET.since > 0 and NET.since or mq.gettime())) / 60000)
+    local rows = {}
+    for c, n in pairs(NET.byCmd) do rows[#rows + 1] = { c = c, n = n } end
+    table.sort(rows, function(x, y) return x.n > y.n end)
+    local t1 = rows[1] and rows[1].c or '-'
+    local c1 = rows[1] and rows[1].n or 0
+    local t2 = rows[2] and rows[2].c or '-'
+    local c2 = rows[2] and rows[2].n or 0
+    pcall(function() peer_cmdf(from, '/at_net %s %d %.2f %s %d %s %d',
+                               myName, NET.sent, mins, t1, c1, t2, c2) end)
+end) end)
+
+-- /atobsdrop - clear every observer now. The shutdown hook covers a clean exit; this covers a crash, a
+-- killed client, or an experiment left running - all of which leave subscriptions behind that nothing
+-- else can reach.
+pcall(function() mq.bind('/atobsdrop', function()
+    local n = dnet_drop_all('asked')
+    if n == 0 then log('[obs] nothing subscribed from this client') end
+    log('[obs] note: observers set by a PREVIOUS run are not in this registry - if the peers are still '
+     .. 'slow, restart MQ2DanNet on them.')
+end) end)
+
+-- /atgrab [seconds] [command...] - write everything the MQ window prints into AT's log for a few
+-- seconds. With a command, it runs that command first, so one line does the whole job:
+--     /atgrab 10 /e3listexposeddata
+-- The output lands in the AT log as [grab] lines, which can be uploaded like any other log.
+-- /ate3 <key> - read one of E3's exposed values through the Mono bridge and print it.
+-- ${E3N.…} does NOT resolve from a command line; it is not a real TLO, it goes through MQ2Mono.Query.
+-- e3_is_paused has been using that form all along for exactly one key, which is how the mechanism sat
+-- in the file unnoticed while /e3listexposeddata advertised eighty more.
+-- The E3N. prefix is optional, so both of these work:
+--     /ate3 State.Basics.RaidMembersLookup
+--     /ate3 E3N.State.Basics.RaidMembersLookup
+-- /atpub <peer> <key> - read a value another character PUBLISHES, and time it.
+-- E3 lets a bot declare key/value pairs in its ini and lets other bots read them by name:
+--     [E3BotsPublishData (key/value)]
+--     DGTimer=${Me.AltAbilityTimer[Divine Guardian]}
+-- and Ejtou's own ini already reads one across characters:
+--     TankRecourseOff=!(${MQ2Mono.Query[e3,E3Bots(Antilerd).Query(RecourseUp)]})
+--
+-- THE QUESTION THIS ANSWERS, and it is the only one that matters for whether AT should use it: is the
+-- expression evaluated WHEN ASKED, or evaluated locally and cached for whoever asks?
+-- Evaluated on request means every read is a round trip - a query, with everything that costs. Cached
+-- means it is the same change-gated model AT already uses, and it is nearly free.
+-- Timing tells them apart: a round trip shows up as tens or hundreds of milliseconds and the second read
+-- costs the same as the first. A local read is sub-millisecond and the second is no cheaper because
+-- there was nothing to save.
+-- Three reads, because one number is not a measurement.
+pcall(function() mq.bind('/atpub', function(peer, key)
+    if not peer or not key then
+        log('[pub] usage: /atpub <peer> <key>   e.g. /atpub Antilerd RecourseUp')
+        log('[pub] keys come from that character\'s [E3BotsPublishData (key/value)] ini section')
+        return
+    end
+    local q = string.format('E3Bots(%s).Query(%s)', peer, key)
+    for i = 1, 3 do
+        local t0 = mq.gettime()
+        local v
+        pcall(function() v = mq.TLO.MQ2Mono.Query('e3', q)() end)
+        local took = mq.gettime() - t0
+        local sv = (v == nil) and '(nil)' or tostring(v)
+        -- The resolver hands back unresolved text rather than erroring - the same trap documented on
+        -- e3_is_paused, where a failed lookup read as a real answer.
+        if sv:find('%$%{') or sv == q then sv = 'UNRESOLVED: ' .. sv end
+        log('[pub] read %d: %s = %s   (%dms)', i, q, sv, took)
+    end
+    log('[pub] sub-millisecond and flat = local/cached, and worth using. Tens of ms or a first read '
+     .. 'slower than the rest = a round trip, which is the model we already measured as worse.')
+end) end)
+
+-- /atheavy - which phase is the heaviest, over every tick since load. The answer to 'where does the
+-- 78ms go', and unlike /atprofile it has been running the whole time.
+pcall(function() mq.bind('/atheavy', function(a)
+    if a and tostring(a):lower() == 'reset' then
+        AT_HEAVY, AT_HEAVY_MS, AT_HEAVY_N = {}, {}, 0
+        log('[heavy] counters reset')
+        return
+    end
+    if AT_HEAVY_N == 0 then log('[heavy] nothing sampled yet'); return end
+    local rows = {}
+    for ph, n in pairs(AT_HEAVY) do
+        rows[#rows + 1] = { ph = ph, n = n, ms = AT_HEAVY_MS[ph] or 0 }
+    end
+    -- Ordered by TOTAL time, not by how often it won: a phase that tops one tick in fifty at 200ms
+    -- matters more than one that tops half of them at 3ms.
+    table.sort(rows, function(x, y) return x.ms > y.ms end)
+    local tot = 0
+    for _, r in ipairs(rows) do tot = tot + r.ms end
+    log('[heavy] heaviest phase per tick, %d tick(s) sampled, %.1fs of measured work:',
+        AT_HEAVY_N, tot / 1000)
+    for i = 1, math.min(#rows, 12) do
+        local r = rows[i]
+        log('[heavy]   %-14s topped %5d tick(s)  %7.1fs total  %5.1fms avg  %4.1f%%',
+            r.ph, r.n, r.ms / 1000, r.ms / r.n, (tot > 0) and (r.ms * 100 / tot) or 0)
+    end
+    log('[heavy] this is the WINNER of each tick, not a full breakdown - a phase that is never the '
+     .. 'heaviest will not appear, however steady its cost.')
+end) end)
+
+pcall(function() mq.bind('/ate3', function(...)
+    local key = table.concat({...}, ' ')
+    if key == '' then
+        log('[e3] usage: /ate3 <key>   e.g. /ate3 State.Basics.RaidMembersLookup')
+        log('[e3] /atgrab 15 /e3listexposeddata writes the full list of keys into this log')
+        return
+    end
+    if not key:match('^E3N%.') then key = 'E3N.' .. key end
+    local v
+    local ok = pcall(function() v = mq.TLO.MQ2Mono.Query('e3', key)() end)
+    local s2 = (v == nil) and '' or tostring(v)
+    if not ok or s2 == '' then
+        log('\\ay[e3] %s -> no answer (is MQ2Mono loaded and e3 running?)\\ax', key)
+        return
+    end
+    -- A FAILED LOOKUP RETURNS THE KEY BACK. The bridge does string replacement, so an unknown key comes
+    -- back as its own text rather than as an error - the same trap documented on e3_is_paused, where a
+    -- failed query read as 'E3 is running' and was indistinguishable from the real answer.
+    if s2:lower():find('%$%{') or s2:lower() == key:lower() then
+        log('\\ay[e3] %s -> the bridge handed the key back unresolved: %s\\ax', key, s2)
+        return
+    end
+    log('[e3] %s = %s', key, s2)
+end) end)
+
+pcall(function() mq.bind('/atgrab', function(a, ...)
+    local secs = tonumber(a)
+    local cmd
+    if secs then cmd = table.concat({...}, ' ')
+    else cmd = table.concat({a, ...}, ' '); secs = 10 end
+    secs = math.max(1, math.min(60, secs))
+    atGrabUntil, atGrabN = mq.gettime() + (secs * 1000), 0
+    log('[grab] capturing window output for %ds (max %d lines) - it lands in the AT log as [grab] lines',
+        secs, AT_GRAB_MAX)
+    if cmd and cmd ~= '' then
+        log('[grab] running: %s', cmd)
+        pcall(function() mq.cmd(cmd) end)
+    end
+end) end)
+
 pcall(function() mq.bind('/atnet', function(a)
     if a and tostring(a):lower() == 'reset' then
         NET.sent, NET.since, NET.byCmd = 0, mq.gettime(), {}
-        log('[net] counters reset')
+        NETIN.got, NETIN.since, NETIN.byCmd = 0, mq.gettime(), {}
+        NETIN.tick, NETIN.worstTick, NETIN.worstAt = 0, 0, 0
+        netPeers = {}
+        -- Reset everyone, or the group total mixes a fresh local window with hours of peer history.
+        for _, p in ipairs(group_members()) do
+            if p:lower() ~= myName:lower() then
+                pcall(function() peer_cmdf(p, '/at_netask %s reset', myName) end)
+            end
+        end
+        log('[net] counters reset here and on every peer')
         return
     end
+    -- Ask the peers, then print whatever has come back. Same two-call pattern as the other gathers:
+    -- the replies land between invocations, so the first run shows only this client.
+    netPeers = netPeers or {}
+    for _, p in ipairs(group_members()) do
+        if p:lower() ~= myName:lower() then
+            pcall(function() peer_cmdf(p, '/at_netask %s', myName) end)
+        end
+    end
     local mins = math.max(0.1, (mq.gettime() - (NET.since > 0 and NET.since or mq.gettime())) / 60000)
-    log('[net] %d message(s) in %.1f min = %.1f/min', NET.sent, mins, NET.sent / mins)
+    log('[net] SENT %d message(s) in %.1f min = %.1f/min', NET.sent, mins, NET.sent / mins)
+    -- INBOUND, which on the driver is the number that matters. Every one of these fired a Lua bind
+    -- inside a single doevents call.
+    local imins = math.max(0.1, (mq.gettime() - (NETIN.since > 0 and NETIN.since or mq.gettime())) / 60000)
+    log('[net] RECV %d message(s) in %.1f min = %.1f/min   worst single doevents: %d message(s)%s',
+        NETIN.got, imins, NETIN.got / imins, NETIN.worstTick,
+        (NETIN.worstAt > 0) and string.format(' (%ds ago)',
+            math.floor((mq.gettime() - NETIN.worstAt) / 1000)) or '')
+    local irows = {}
+    for c, n in pairs(NETIN.byCmd) do irows[#irows + 1] = { c = c, n = n } end
+    table.sort(irows, function(x, y) return x.n > y.n end)
+    for i = 1, math.min(#irows, 6) do
+        log('[net]   in  %-18s %5d  %.1f/min', irows[i].c, irows[i].n, irows[i].n / imins)
+    end
     local rows = {}
     for c, n in pairs(NET.byCmd) do rows[#rows + 1] = { c = c, n = n } end
     table.sort(rows, function(x, y) return x.n > y.n end)
     for i = 1, math.min(#rows, 12) do
         log('[net]   %-18s %5d  %.1f/min', rows[i].c, rows[i].n, rows[i].n / mins)
+    end
+    -- THE GROUP TOTAL, which is the number that matters. What the driver RECEIVES is what every worker
+    -- sends, so summing the peers is the honest figure for 'how much is this group talking'.
+    local gs, any = NET.sent / mins, false
+    for who, st in pairs(netPeers or {}) do
+        any = true
+        local r = st.sent / math.max(0.1, st.mins)
+        gs = gs + r
+        log('[net]   %-12s %5d in %.1f min = %5.1f/min   top: %s %d, %s %d',
+            who, st.sent, st.mins, r, st.top1, st.n1, st.top2, st.n2)
+    end
+    if any then
+        log('[net] GROUP TOTAL %.1f/min across %d character(s)', gs, 1 + (function()
+            local n = 0; for _ in pairs(netPeers or {}) do n = n + 1 end; return n end)())
+    else
+        log('[net] no peer replies yet - run /atnet again in a second for the group total')
     end
 end) end)
 
@@ -21748,6 +22924,14 @@ end
 -- So: time each step and print anything slow. One number ends the argument.
 -- Only slow steps are logged, so a healthy startup stays quiet.
 boot_step('load settings', load_settings)
+-- PRIME THE RAID WINDOW HERE, not inside the first move. The client does not build the raid roster until
+-- the window has been drawn once, and until it has, a move reads an empty list however many times it
+-- retries - which is the bug that has come back after every 'fix' since 1.18.145, because whether the
+-- window had been opened that session was the real variable and never the build.
+-- At startup nothing is waiting on it. Inside a move it cost 2.6s with a lock held.
+-- DRIVER ONLY. Workers never move anybody, so priming on all six is five raid windows opening and
+-- closing at startup for nothing.
+if SHOW_UI then boot_step('prime raid window', function() pcall(raid_prime_window) end) end
 -- THE PERFORMANCE SETTINGS, IN THE LOG, ON EVERY START. These live in a settings file and are toggled
 -- from a panel, so a log opened the next morning had no way to say what the run was configured for -
 -- which is exactly the question every timing finding depends on.
@@ -22389,6 +23573,11 @@ while running do
                 rezWipe = false
                 rezlog('\\ag[rez] zoned - wipe mode cleared, rezzing again\\ax')
             end
+            -- ZONING REBUILDS THE UI, so the roster this character primed at startup may be gone. Re-arm
+            -- rather than re-prime: the next raid action pays for it, and a character that never touches
+            -- the raid never pays at all. 2026-08-27 22:46 read zero rows hours into a session, which is
+            -- what a torn-down roster looks like long after a successful startup.
+            raidPrimed = false
         end
     end
     if (mq.gettime() - (lastUpkeep or 0)) >= pace(UPKEEP_MS) then
@@ -22477,12 +23666,38 @@ while running do
     -- keepalive so the favor number does not age forever.
     -- tribLast is cleared by /at_resync along with the other last-sent tables, so a driver that restarts
     -- still gets a full report rather than silence.
+    -- TRIBUTE OBSERVER REMOVED (1.19.48), after one build in the wild.
+    -- It worked and it was measurably faster - every flip noticed 0-1809ms before the push, never later.
+    -- That is not the same as being worth it. Tribute flips twice a session, the push already reports it
+    -- within two seconds for two messages, and the observer cost 20 DanNet TLO reads every three seconds
+    -- on the driver plus five standing subscriptions evaluating on the peers every second, forever.
+    -- Buying 1.8 seconds of latency on a twice-a-session value with continuous polling on six clients is
+    -- a bad trade, and I made it because the measurement said 'faster' rather than asking 'faster enough
+    -- to pay for'. The helpers and the shutdown drop stay - they cost nothing unused, and the drop is
+    -- what makes any future experiment safe to run.
     -- A peer's report landed, so the rendered rows are stale. Done here rather than in the bind because
     -- the bind runs inside doevents and this is a table walk, not a one-liner.
     if tribRowsDirty then
         tribRowsDirty = false
         rebuild_tribute_rows()
     end
+    -- DIAMOND COINS. Both halves are cheap when off - one string compare - and neither is paced: this is
+    -- a claim-and-trade loop, and slowing it on the machine that most wants it emptied helps nobody.
+    -- Observer trial, driver only, every 5s. Reads nothing anyone depends on.
+    atphase('dc')
+    -- THE BUTTON ONLY SETS A FLAG. Broadcasting from inside a draw callback would send once per frame,
+    -- and the trade itself must never run on the ImGui thread - same separation the ports rescan uses.
+    if dcGiveNowWant then
+        dcGiveNowWant = false
+        if (dcGiveTo or '') ~= '' then
+            log('[dc] starting a claim-and-hand-over run for %s -> %s', DC_ITEM, dcGiveTo)
+            pcall(function() peer_bcast('/at_dcnow') end)
+            -- Locally too: a broadcast does not come back to the sender.
+            if dc_active() then dcRunning, dcRunSaid = true, true end
+        end
+    end
+    pcall(dc_receiver_tick)
+    pcall(dc_giver_tick)
     atphase('trib_watch')
     if driverName and (mq.gettime() - (lastTribPoll or 0)) > TRIB_WATCH_MS then
         lastTribPoll = mq.gettime()
@@ -22707,7 +23922,19 @@ while running do
             local have, ready, secs, active, dsecs, kind = ability_state(name)
             local ord = _ord
             if have then
-                local key = (ready and 'R' or 'd') .. (active and 'A' or '-') .. tostring(dsecs or 0)
+                -- dsecs IS A LIVE COUNTDOWN AND MUST NOT BE IN THE KEY.
+                -- my_effect_secs reads Me.Buff(name).Duration.TotalSeconds(), which ticks every second
+                -- while the effect is up - so every running burn re-keyed on every poll and pushed a
+                -- message. With several burns active that is most of the group's traffic, and it is why
+                -- /at_burn topped every net sample tonight.
+                -- The pot key one screen over already says this in its own comment: 'secs is a live
+                -- countdown and putting it in the key meant every tick of it looked like new state'.
+                -- Same lesson, adjacent key, never applied. Fifth instance today, after nvstate and the
+                -- four push_bucket callers.
+                -- The number is still SENT below, so the driver counts down exactly as before. Only the
+                -- decision about WHEN to send changes: on the effect appearing and on it going away.
+                local key = (ready and 'R' or 'd') .. (active and 'A' or '-')
+                         .. (((dsecs or 0) > 0) and 'e' or '-')
                 local prev = burnLast[name]
                 if prev == nil or prev ~= key then   -- report on ready<->down OR active<->inactive flip
                     burnLast[name] = key
@@ -22776,17 +24003,27 @@ while running do
                 invisFireWanted = true
             end
         end
-                if invisTake then
+                -- PREP BEFORE ARM. THE ORDER IS THE WHOLE MECHANISM.
+        -- /at_invisprep and /at_inviscast arrive in the same doevents batch and both set a flag, so
+        -- whichever the tick reads first is the one that happens first. Arm was first - and arm blocks
+        -- through the lead and then FIRES - so E3 was paused after the cast rather than before it.
+        -- On most characters that is invisible, because there was nothing running to interrupt. On a bard
+        -- the song simply never stopped, and the invis landed on someone already singing. Reported four
+        -- times before this was found, each time fixed somewhere further downstream: confirming the pause
+        -- (1.19.12), adding /stopsong (1.19.10), holding E3 until the cast lands (1.19.11). All of those
+        -- were right and none of them could work, because the pause was not applied yet when they ran.
+        -- Two lines swapped. Nothing else about either path changes.
+        if invisPrepWanted then
+            invisPrepWanted = false
+            atphase('invis_prep')
+            pcall(invis_prep_self)
+        end
+        if invisTake then
             local tk = invisTake
             invisTake = nil
             atphase('invis_arm')
             if tk.blob then pcall(function() invis_combo_take(tk.lead, tk.blob, tk.at) end)
             else pcall(function() invis_arm(tk.key, tk.lead, tk.at) end) end
-        end
-        if invisPrepWanted then
-            invisPrepWanted = false
-            atphase('invis_prep')
-            pcall(invis_prep_self)
         end
         if invisFireWanted then
             invisFireWanted = false
@@ -22819,6 +24056,16 @@ while running do
             -- reported exactly as a mob added by any other route.
             pcall(function() pac_add_spawn(a.id) end)
         end
+        -- CLOSE THE DISPATCH RUN. Eight conditional labels sit above this - invis_prep, invis_arm,
+        -- invis_combo, magic_click, group_pot, pac_add, coth_set - and a phase is REPLACED, never
+        -- closed. So whichever of them fired last stayed open across everything after it, all the way to
+        -- the next unconditional label, and inherited the whole bill.
+        -- That is how a 6157ms tick was reported as 'invis_combo (6074ms)' on a tick where invis did
+        -- almost nothing: the label was simply the last one set before a long unlabelled stretch.
+        -- The rule is already written a screen below - 'atphase belongs OUTSIDE the conditional it
+        -- describes, and every conditional label needs an unconditional one after it to stop the bleed' -
+        -- and this run never got one. Same fault that once put click_poll's time on burn_poll's bill.
+        atphase('dispatch')
         if cothSetWanted then
             local w = cothSetWanted
             cothSetWanted = nil
@@ -23093,16 +24340,29 @@ while running do
         -- fired, an emblem came up - plus once a minute while it counts down, which the 30s keepalive
         -- below was already paying for anyway. The seconds still travel exactly as before, so the panel
         -- and its tooltips are unchanged.
+        -- KEY ON READY-OR-NOT, NOTHING FINER. This bucketed to MINUTES, which sounds coarse until you
+        -- notice these are two-hour cooldowns: a minute bucket ticks 120 times over one cycle, so the
+        -- key moved every 60 seconds and the change-gate gated nothing. Every character re-sent its
+        -- Nightveil state once a minute, all day, for four items that change twice.
+        -- Same fault as the v2 burns payload and the same fix: the STATE goes in the key, the number
+        -- goes in the payload, and the driver counts down from `updated` like it does everywhere else.
+        -- nv_secs_at is a live read, so the payload below is always current whenever it does send.
         local kparts = {}
         for _, i in ipairs(nv_have()) do
-            local sec = nv_secs_at(i)
-            kparts[#kparts + 1] = string.format('%d:%d', i, (sec > 0) and math.floor(sec / 60) or sec)
+            kparts[#kparts + 1] = string.format('%d:%s', i, (nv_secs_at(i) > 0) and 'd' or 'r')
         end
         local nk = (#kparts > 0) and table.concat(kparts, ',') or '-'
         -- ON CHANGE, PLUS A SLOW KEEPALIVE. Change-gating alone means that if the driver's copy is ever
         -- dropped - a roster event prunes these tables - nothing re-sends it, because from this side
         -- nothing changed. The entry then stays missing until the cooldown happens to tick over.
-        if (mq.gettime() - (nvPushAt or 0)) > 30000 then nvLast = '' end
+        -- KEEPALIVE AT FIVE MINUTES, NOT THIRTY SECONDS. This blanked the key twice a minute to force a
+        -- resend, on the reasoning that a roster prune can drop the driver's copy with nothing on this
+        -- side having changed. That case is real - but /at_resync has cleared nvLast since 1.19.17, so
+        -- the driver already has a way to ask for everything, and thirty seconds was covering a gap that
+        -- had been closed.
+        -- Five minutes keeps the safety net for a driver that silently loses a row without resyncing,
+        -- at a tenth of the traffic.
+        if (mq.gettime() - (nvPushAt or 0)) > 300000 then nvLast = '' end
         if nvLast ~= nk then
             nvPushAt = mq.gettime()
             nvLast = nk
@@ -23196,7 +24456,13 @@ while running do
         lastRezPoll = mq.gettime(); rez_announce_ready(); rez_autoaccept(); rez_tick()
     end
     accept_incoming()
+    -- A BURST IS THE THING TO CATCH. Total inbound per minute says how busy it is; the WORST single
+    -- doevents says whether a lag spike and a pile of arrivals are the same event.
+    NETIN.tick = 0
     atphase('doevents'); mq.doevents()
+    if NETIN.tick > NETIN.worstTick then
+        NETIN.worstTick, NETIN.worstAt = NETIN.tick, mq.gettime()
+    end
     -- Flush FIRST, then mark idle. The other way round overwrote the tick's actual work with 'idle'
     -- before it was ever written down.
     -- ITS OWN LABEL. This rewrites the breadcrumb file five times a second, and it is called immediately
@@ -23233,18 +24499,67 @@ while running do
         -- fill the log and make itself part of the problem.
         if w >= AT_SLOW_TICK_MS and (mq.gettime() - (AT_SLOW_TICK_AT or 0)) > 3000 then
             AT_SLOW_TICK_AT = mq.gettime()
-            -- Says a tick was slow, not which phase - naming one needs per-phase timing, which is
-            -- /atprofile. Turn that on if a run of these needs chasing.
+            -- IT NAMES THE PHASE NOW. This used to say only that a tick was slow and point at
+            -- /atprofile, which is useless advice for something that has already happened - by the time
+            -- the profiler is on, the stall is gone. A run of four 4-to-7 second stalls on 2026-08-31
+            -- produced twenty lines of 'a tick was slow' and not one clue as to what did it.
+            -- AT_phaseName is the crash breadcrumb and is maintained on EVERY tick, profiler or not, so
+            -- the name is already sitting there for free.
+            -- IT NAMES THE SLOWEST PHASE OF THE TICK, not the one that happened to be open. Naming the
+            -- open one is what the first attempt did, and the open one at this point is always
+            -- phase_flush - so every warning, including a 5685ms block, blamed phase_flush.
             -- FILE ONLY. This went to the MQ window, where it was a running commentary on a problem that
             -- has been fixed - low spec now holds the loop near baseline, and a line every three seconds
             -- saying so is noise in the one window that should stay readable.
             -- Still written to the log, because the next time something DOES hold the loop this is the
             -- first place anyone would look.
-            AT_slowPending = string.format('%dms tick (/atprofile on to see which phase)', w)
+            -- KNOWN-DELIBERATE BLOCKS ARE NOT FINDINGS. The invis combo blocks for about six seconds by
+            -- design: a 3.5s lead so every character pauses E3 before anyone casts, then a wait for the
+            -- cast to land and a hold after it - both added because E3 was resuming mid-cast and
+            -- stripping the bard's invis. All three are correct, and all three are inline on the tick.
+            -- Reporting them anyway buries everything else under an identical 6.1s line every time
+            -- somebody hits invis, which is what happened while a second group had a problem nobody
+            -- could name.
+            -- So they report only when they exceed what they are KNOWN to cost. Anything unexpected in
+            -- those phases still surfaces; the routine schedule does not.
+            local wp = tostring(AT_tickWorst or '?')
+            local floor = AT_SLOW_EXPECTED[wp]
+            if not (floor and (AT_tickWorstMs or 0) < floor) then
+                AT_slowPending = string.format('%dms tick - worst phase: %s (%dms)%s%s', w,
+                                               wp, AT_tickWorstMs or 0,
+                                               floor and '  [over its expected cost]' or '',
+                                               (w >= 3000) and '  <-- MULTI-SECOND BLOCK' or '')
+            end
             AT_slowQuiet   = true
         end
     end
+    -- RESET PER TICK, right after the check that reads them. Without this the pair holds the worst phase
+    -- ever seen rather than this tick's, so one bad gather would be blamed for every slow tick after it.
+    -- AND CLEAR THE PHASE CLOCK. Without this the first phase of the NEXT tick measures from the end of
+    -- this one, so the whole idle wait lands on it - that is where '773ms tick - worst phase: idle
+    -- (3085ms)' came from, a phase reported as longer than the tick containing it.
+    -- RESET AFTER THE IDLE LABEL, NOT BEFORE IT. Clearing AT_phaseStart here and then calling
+    -- atphase('idle') immediately set it again - so the next tick's FIRST phase measured from the idle
+    -- label, across the whole 250ms wait, and reported it as its own. That is where
+    -- 'tick_start (3457ms)' came from on a character sitting alone doing nothing.
+    -- Second time this bleed has been fixed in the wrong place. The clock has to be dead across the
+    -- wait, so it is cleared after the last label of the tick rather than before it.
+    -- WHERE THE TIME GOES, CHEAPLY. /atprofile answers this by accumulating a total per phase per tick -
+    -- about thirty table writes - and its own note says that cost ~69ms a tick, more than the work it was
+    -- measuring. So it cannot be left on, which means it is never on when something interesting happens.
+    -- This records only the WINNER of each tick: one table write per tick instead of thirty. Over a few
+    -- thousand ticks the distribution says which phase is heaviest just as well as summing would, and it
+    -- is cheap enough to leave running forever.
+    -- Solo on 2026-08-31 the loop was doing 78ms of work on top of a 250ms wait with no group, no peers
+    -- and no messages - so the cost is local Lua, and this is the instrument that names which part.
+    if AT_tickWorst then
+        AT_HEAVY[AT_tickWorst] = (AT_HEAVY[AT_tickWorst] or 0) + 1
+        AT_HEAVY_MS[AT_tickWorst] = (AT_HEAVY_MS[AT_tickWorst] or 0) + (AT_tickWorstMs or 0)
+        AT_HEAVY_N = AT_HEAVY_N + 1
+    end
+    AT_tickWorst, AT_tickWorstMs = nil, 0
     atphase('idle')
+    AT_phaseStart = nil
     -- THE TICK RATE IS THE REAL DIAL, and it was the one thing low spec mode never touched.
     -- Scaling the poll intervals made each individual block run less often, but the loop still woke four
     -- times a second and walked twenty-odd phases of small unconditional work every time - the guards,
@@ -23319,6 +24634,10 @@ pcall(function() mq.unbind('/atfleeting') end)
 pcall(function() mq.unbind('/atinferno') end)
 pcall(function() mq.unbind('/atpacify') end)
 pcall(function() mq.unbind('/atuie') end)
+pcall(function() mq.unbind('/at_dcnow') end)
+pcall(function() mq.unbind('/at_dcwant') end)
+pcall(function() mq.unbind('/at_dcgo') end)
+pcall(function() mq.unbind('/at_dcdone') end)
 pcall(function() mq.unbind('/at_expecttrade') end)
 pcall(function() mq.unbind('/at_close') end)
 pcall(function() mq.unbind('/at_give') end)
@@ -23368,6 +24687,8 @@ pcall(function() mq.unbind('/at_cothat') end)
 pcall(function() mq.unbind('/atcothwho') end)
 pcall(function() mq.unbind('/atinvistest') end)
 pcall(function() mq.unbind('/at_invisfired') end)
+pcall(function() mq.unbind('/at_makemevis') end)
+pcall(function() mq.unbind('/atmakemevis') end)
 pcall(function() mq.unbind('/at_cothmine') end)
 pcall(function() mq.unbind('/at_di') end)
 pcall(function() mq.unbind('/at_diauto') end)
@@ -23386,6 +24707,9 @@ pcall(function() mq.unbind('/at_rezorder?') end)
 -- reports it restarting on its own.
 -- A restart with no stop line before it means the previous instance did NOT exit through here: it was
 -- killed, the client went down, or /lua stop was used. A restart WITH one means something asked it to.
+-- DROP EVERY OBSERVER FIRST. They live in DanNet and outlive this script - if they are not dropped here
+-- they keep evaluating on every peer, forever, and nothing left running can clear them.
+pcall(function() dnet_drop_all('script stopping') end)
 pcall(function()
     log('=== AdventureTime stopping: %s ===', atExitWhy or '/lua stop, a reload, or the client closing')
 end)
@@ -23480,6 +24804,13 @@ pcall(function() mq.unbind('/atburnpoll') end)
 pcall(function() mq.unbind('/at_burnpoll') end)
 pcall(function() mq.unbind('/at_pwhave') end)
 pcall(function() mq.unbind('/at_pwoor') end)
+pcall(function() mq.unbind('/atpub') end)
+pcall(function() mq.unbind('/atheavy') end)
+pcall(function() mq.unbind('/ate3') end)
+pcall(function() mq.unbind('/atgrab') end)
+pcall(function() mq.unbind('/atobsdrop') end)
+pcall(function() mq.unbind('/at_net') end)
+pcall(function() mq.unbind('/at_netask') end)
 pcall(function() mq.unbind('/at_pwmark') end)
 pcall(function() mq.unbind('/at_pwclear') end)
 pcall(function() mq.unbind('/at_pwdel') end)
