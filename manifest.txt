@@ -1,7 +1,4 @@
-# AdventureTime manifest - generated 2026-09-03 08:00
+# AdventureTime manifest - generated 2026-09-03 08:03
 # Do not hand-edit the hashes; re-run make-manifest.ps1 instead.
 build	1.19.55
 file	init.lua	709be70ef9124c5a27d9fed57acfeee25d2e3cd30df155371ee9b39859158266
-#
-# pulltest - standalone harness, goes in its OWN lua folder, not lua/adventuretime/
-file	pulltest/init.lua	f02e893d680afd6ef0beb8c24962d72874de7041b1190f5ca87e645c8ace9fd6
