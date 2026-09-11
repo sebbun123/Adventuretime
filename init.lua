@@ -105,7 +105,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.19'
-local BUILD_TAG = '1.19.55'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.19.57'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -1675,9 +1675,15 @@ local function save_targets()
 end
 
 -- ---------------------------------------------------------------------------
--- Peer network: prefer E3 (/e3bct), then EQBC (/bct), then DanNet (/dex). Detected once.
+-- Peer network: prefer E3 (/e3bct), then EQBC (/bct), then DanNet (/dex). Detected once, in peer_detect.
 -- ---------------------------------------------------------------------------
 local peerChan
+peerTransport = peerTransport or 'auto'  -- auto, e3, eqbc, dannet. Saved in Settings.
+PEER_TRANSPORT_LABEL = { auto = 'Auto', e3 = 'E3', eqbc = 'EQBC', dannet = 'DanNet' }
+peerTransportProbeAt = peerTransportProbeAt or 0
+peerTransportTestAt = peerTransportTestAt or 0
+botControl = botControl or 'auto'  -- auto, e3, rgmercs. Saved in Settings.
+BOT_CONTROL_LABEL = { auto = 'Auto', e3 = 'E3', rgmercs = 'RGMercs' }
 -- HOW MUCH ARE WE ACTUALLY SAYING? Every feature added tonight was argued about on the basis of what I
 -- thought the traffic looked like, which is exactly the kind of claim that should be a number instead.
 -- Counted at the two places anything leaves this client, so nothing can be added later that skips it.
@@ -1716,41 +1722,129 @@ function net_count(fmt)
     NET.byCmd[c] = (NET.byCmd[c] or 0) + 1
 end
 
+-- Is EQBC actually connected (not merely loaded)? Loaded-but-disconnected is a normal transient state
+-- while the plugin reconnects, and the detection below must not treat it as 'no EQBC'.
+function eqbc_connected()
+    local ok = false
+    pcall(function() ok = mq.TLO.EQBC.Connected() == true end)
+    return ok
+end
+
+function peer_transport_valid(v)
+    return v == 'auto' or v == 'e3' or v == 'eqbc' or v == 'dannet'
+end
+
+function peer_transport_label(v)
+    return PEER_TRANSPORT_LABEL[v or 'auto'] or PEER_TRANSPORT_LABEL.auto
+end
+
+function peer_transport_reset()
+    peerChan = nil
+    if atMuted ~= nil then atMuted = false end
+    peerTransportProbeAt = mq.gettime() + 1
+end
+
+-- Pick the peer transport ONCE, in the advertised order: E3, then EQBC, then DanNet.
+-- GLOBAL, not local: the main chunk is at Lua's 200-local ceiling.
+-- The order matters for more than preference. The old code loaded MQ2DanNet FIRST and only then looked
+-- at E3/EQBC, so a client that already had a working EQBC session still had DanNet forced into it - and
+-- on some setups (Wine, mismatched builds) loading MQ2DanNet is itself the failure. Nothing here loads
+-- a plugin unless no advertised transport is present at all, which keeps the legacy behaviour for a
+-- Windows client that has none of them and lets everyone else run on what they already have.
+function peer_detect()
+    if peerChan then return peerChan end
+    if not peer_transport_valid(peerTransport) then peerTransport = 'auto' end
+    local mono  = mq.TLO.Plugin('MQ2Mono')() ~= nil
+    local eqbc  = mq.TLO.Plugin('MQ2EQBC')() ~= nil
+    local dnet  = mq.TLO.Plugin('MQ2DanNet')() ~= nil
+
+    if peerTransport == 'e3' then
+        if mono then
+            peerChan = 'e3'
+        else
+            log('\\ar[sync] E3 peer transport selected, but MQ2Mono/E3 is not loaded - relays will not send\\ax')
+            return nil
+        end
+    elseif peerTransport == 'eqbc' then
+        if eqbc then
+            peerChan = 'eqbc'
+            if not eqbc_connected() then
+                log('\\ay[sync] EQBC peer transport selected, but MQ2EQBC is not connected - relays will drop until /bccmd connect succeeds\\ax')
+            end
+        else
+            log('\\ar[sync] EQBC peer transport selected, but MQ2EQBC is not loaded - relays will not send\\ax')
+            return nil
+        end
+    elseif peerTransport == 'dannet' then
+        if not dnet then
+            pcall(function() mq.cmd('/plugin mq2dannet load') end)
+            mq.delay(750)
+            dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil
+        end
+        if dnet then
+            peerChan = 'dannet'
+        else
+            log('\\ar[sync] DanNet peer transport selected, but MQ2DanNet would not load - relays will not send\\ax')
+            return nil
+        end
+    elseif mono then
+        -- MQ2Mono loaded is not the same as E3 running - /e3bct only exists while it is. The pause probe
+        -- resolves to true/false only when E3 answers (an unresolved key comes back as text, see
+        -- e3_is_paused). Only demote E3 when there is a CONNECTED EQBC to fall back on; with nothing
+        -- else usable, E3 keeps the benefit of the doubt exactly as before.
+        local v
+        pcall(function() v = mq.TLO.MQ2Mono.Query('e3', 'E3N.State.Basics.IsPaused')() end)
+        local s = (v == nil) and '' or tostring(v):lower()
+        if s == 'true' or s == 'false' or not (eqbc and eqbc_connected()) then
+            peerChan = 'e3'
+        else
+            log('[sync] MQ2Mono is loaded but E3 is not answering - using the connected EQBC session instead')
+            peerChan = 'eqbc'
+        end
+    elseif eqbc then
+        -- Loaded is enough: a momentary reconnect must not push us on to loading DanNet. Say so when it
+        -- is not connected yet, so a silent group has a line in the log explaining why.
+        peerChan = 'eqbc'
+        if not eqbc_connected() then
+            log('\\ay[sync] MQ2EQBC is loaded but not connected - relays will drop until /bccmd connect succeeds\\ax')
+        end
+    elseif dnet then
+        peerChan = 'dannet'
+    else
+        -- LAST RESORT, and the only place a plugin is loaded: no E3, no EQBC, no DanNet. This is the
+        -- legacy auto-load path and it is unchanged for the client that has nothing else.
+        pcall(function() mq.cmd('/plugin mq2dannet load') end)
+        mq.delay(750)
+        peerChan = 'dannet'
+        if mq.TLO.Plugin('MQ2DanNet')() == nil then
+            log('\\ar[sync] no peer transport found (E3, EQBC or DanNet) and MQ2DanNet would not load - nothing will reach the group\\ax')
+            return nil
+        end
+    end
+    log('[sync] peer transport: %s%s', peerChan, peerTransport ~= 'auto' and (' (selected ' .. peer_transport_label(peerTransport) .. ')') or '')
+    return peerChan
+end
+
 local function peer_cmdf(char, fmt, ...)
     net_count(fmt)
-    if not peerChan then
-        -- Prefer DanNet (/dex): its echo can be silenced. Ensure it's loaded; E3/EQBC only if DanNet can't come up.
-        local dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil
-        if not dnet then pcall(function() mq.cmd('/plugin mq2dannet load') end); mq.delay(750); dnet = mq.TLO.Plugin('MQ2DanNet')() ~= nil end
-        -- Loaded locally is NOT the same as able to reach anyone: a stale/mismatched DanNet build, or a
-        -- second MQ install, leaves this client alone on its own island. If we can see no peers but E3 is
-        -- there, use E3 - otherwise every relay vanishes into a void and nothing works but our own toon.
-        if dnet then
-            local peers = ''
-            pcall(function() peers = tostring(mq.TLO.DanNet.Peers() or '') end)
-            if peers == '' and mq.TLO.Plugin('MQ2Mono')() then
-                dnet = false
-                log('DanNet is loaded but sees no peers - falling back to E3 (/e3bct).')
-            end
-        end
-        if dnet then peerChan = 'dannet'
-        elseif mq.TLO.Plugin('MQ2Mono')() then peerChan = 'e3'
-        elseif mq.TLO.Plugin('MQ2EQBC')() then peerChan = 'eqbc'
-        else peerChan = 'dannet' end
-    end
+    if not peerChan then peer_detect() end
+    if not peerChan then return end
     local cmd = fmt:format(...)
     if peerChan == 'e3' then mq.cmdf('/e3bct %s %s', char, cmd)
-    elseif peerChan == 'eqbc' then mq.cmdf('/bct %s %s', char, cmd)
+    -- EQBC executes a tell only when the payload starts with '//' - a single '/' is delivered as chat
+    -- text and printed on the far end, never run. cmd already starts with '/', so one more in front.
+    elseif peerChan == 'eqbc' then mq.cmdf('/bct %s /%s', char, cmd)
     else mq.cmdf('/dex %s %s', char, cmd) end
 end
 local function peer_bcast(fmt, ...)   -- broadcast to the whole in-game group in ONE relay (5x less window spam than looping /dex)
     net_count(fmt)
-    -- mq.TLO directly, not myName: peer_bcast is defined ABOVE the myName local, so referring to it
-    -- here read a nil global and the detection ping went to an empty name.
-    if not peerChan then peer_cmdf(tostring(mq.TLO.Me.Name() or ''), '/echo') end   -- force channel detection + commandecho-off
+    if not peerChan then peer_detect() end
+    if not peerChan then return end
     local cmd = fmt:format(...)
     if peerChan == 'e3' then mq.cmdf('/e3bcga %s', cmd)
-    elseif peerChan == 'eqbc' then mq.cmdf('/bcga %s', cmd)
+    -- /bcg, not /bcga: /bcga includes the sender, /bcg is group-minus-self - the same set /dgge sends
+    -- to, so a broadcast handler never runs against the character that sent it. Same '//' rule as above.
+    elseif peerChan == 'eqbc' then mq.cmdf('/bcg /%s', cmd)
     else mq.cmdf('/dgge %s', cmd) end   -- DanNet: in-game group execute (all but self)
 end
 
@@ -1808,8 +1902,8 @@ local function group_members()
 end
 
 -- ---------------------------------------------------------------------------
--- Counts. Own count is local; a peer's count is a live DanNet query of FindItemCount (bags, i.e. what
--- can actually be traded).
+-- Counts. Own count is local; a peer's count comes from its pushed report, else a live DanNet query of
+-- FindItemCount, else (E3/EQBC) the /at_count_multi batch reply (bags, i.e. what can actually be traded).
 -- ---------------------------------------------------------------------------
 local myName = mq.TLO.Me.Name() or ''
 
@@ -1927,6 +2021,10 @@ pcall(function()
             elseif e then counts[pl][dec(e)] = tonumber(v) end
         end
         counts[pl].__got = true
+        -- WHEN it answered, so a pass can tell its own reply from one still in flight from an earlier
+        -- ask (the batch fallback re-asks silent peers; a late reply to round 1 must not satisfy round 2
+        -- of the NEXT pass with numbers from before the trade).
+        counts[pl].__gotAt = mq.gettime()
     end)
 end)
 
@@ -2281,6 +2379,82 @@ local function query_all_counts(peers, items)
         log('[counts] %d peer(s) reported; querying the other %d', fromPush, #need)
     end
     peers = need
+
+    -- ===== NON-DANNET FALLBACK: the batch request/reply that already exists =====
+    -- /dquery and DanNet(peer).Q are DanNet's. On E3 and EQBC the same question goes through
+    -- /at_count_multi -> /at_have_multi: the worker counts its own bags once and answers every item plus
+    -- its class in one message. Same reliability model as query_alt_currency - wait, re-ask only the
+    -- silent ones, three rounds - and the same rule as the DanNet pass below: a peer that never answers
+    -- is UNKNOWN for every item, never zero. held() ends in 'or 0', so a nil that was not marked
+    -- __unknown would read as 'carries none' and earn a full hand-out.
+    -- Unlike /dquery this needs the peer to be RUNNING AdventureTime, which the driver guarantees for
+    -- its own boxes (bring_up_group) and cannot for a player - who simply stays silent and unknown.
+    if not peerChan then peer_detect() end
+    if peerChan ~= 'dannet' then
+        local t0relay = mq.gettime()
+        local encoded = {}
+        for _, it in ipairs(items) do encoded[#encoded + 1] = enc(it) end
+        local list = table.concat(encoded, ',')
+        -- Class first, for free, exactly as the DanNet pass does below. The reply carries it too.
+        for _, p in ipairs(peers) do
+            if not peerClass[p:lower()] then
+                local c = (member_class(p) or ''):upper()
+                if c ~= '' and c ~= '?' then peerClass[p:lower()] = c end
+            end
+        end
+        local askedAt = mq.gettime()
+        local function answered(p)
+            local c = counts[p:lower()]
+            return c and c.__gotAt and c.__gotAt >= askedAt
+        end
+        local waiting = {}
+        for _, p in ipairs(peers) do
+            counts[p:lower()].__got = nil
+            waiting[#waiting + 1] = p
+        end
+        for round = 1, 3 do
+            for _, p in ipairs(waiting) do
+                pcall(function() peer_cmdf(p, '/at_count_multi %s %s', myName, list) end)
+                mq.delay(60)   -- spacing, same as the currency ask: bunched relays are what get dropped
+            end
+            local deadline = mq.gettime() + 2500
+            while mq.gettime() < deadline do
+                mq.doevents(); mq.delay(50)
+                local still = {}
+                for _, p in ipairs(waiting) do if not answered(p) then still[#still + 1] = p end end
+                waiting = still
+                if #waiting == 0 then break end
+            end
+            if #waiting == 0 then break end
+            if round < 3 then
+                log('[counts] no batch answer from %s - re-asking (round %d)', table.concat(waiting, ', '), round + 1)
+            end
+        end
+        local miss = 0
+        for _, p in ipairs(peers) do
+            local pl = p:lower()
+            if answered(p) then
+                local cls = tostring(counts[pl].__class or ''):upper()
+                if cls ~= '' and cls ~= '?' then peerClass[pl] = cls end
+            end
+            counts[pl].__class = peerClass[pl] or '?'   -- '?' = unknown; class_key() treats it as 'do not filter'
+            for _, it in ipairs(items) do
+                if counts[pl][it] == nil then
+                    counts[pl].__unknown = counts[pl].__unknown or {}
+                    counts[pl].__unknown[it] = true
+                    miss = miss + 1
+                end
+            end
+            counts[pl].__got = true
+        end
+        if #waiting > 0 then
+            log('\\ay[counts] %s never answered /at_count_multi - shown as ? (not running AdventureTime, or not ours)\\ax',
+                table.concat(waiting, ', '))
+        end
+        log('[counts] %s batch done in %dms - %d/%d answered%s', peerChan, mq.gettime() - t0relay,
+            (#peers * #items) - miss, #peers * #items, miss > 0 and string.format(', %d still unknown', miss) or '')
+        return
+    end
 
     local t0all = mq.gettime()
     -- Ask the group to hold its chatter. Generous window, refreshed below if the pass runs long.
@@ -3619,6 +3793,210 @@ function at_read(name)
     return newp
 end
 
+AT_UPDATE_STATUS = AT_UPDATE_STATUS or {
+    nextRead = 0,
+    available = false,
+    status = 'unknown',
+    latestSha = '',
+    installedSha = '',
+    checkedAtUtc = '',
+    error = '',
+}
+AT_UPDATE_ARMED_UNTIL = AT_UPDATE_ARMED_UNTIL or 0
+
+function at_path_trim(path)
+    return (tostring(path or ''):gsub('[\\/]+$', ''))
+end
+
+function at_mq_root()
+    local root = ''
+    pcall(function() root = tostring(mq.TLO.MacroQuest.Path() or '') end)
+    return at_path_trim(root)
+end
+
+function at_config_dir()
+    local cfg = ''
+    pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
+    if cfg == '' and mq.configDir then cfg = tostring(mq.configDir or '') end
+    return at_path_trim(cfg)
+end
+
+function at_read_all(path)
+    local f = io.open(tostring(path or ''), 'r')
+    if not f then return nil end
+    local body = f:read('*a')
+    f:close()
+    return body
+end
+
+function at_file_exists(path)
+    local f = io.open(tostring(path or ''), 'r')
+    if not f then return false end
+    f:close()
+    return true
+end
+
+function at_json_string(body, key)
+    body = tostring(body or '')
+    key = tostring(key or ''):gsub('([^%w_])', '%%%1')
+    return body:match('"' .. key .. '"%s*:%s*"([^"]*)"') or ''
+end
+
+function at_json_bool(body, key)
+    body = tostring(body or '')
+    key = tostring(key or ''):gsub('([^%w_])', '%%%1')
+    local v = body:match('"' .. key .. '"%s*:%s*(true)')
+        or body:match('"' .. key .. '"%s*:%s*(false)')
+    if v == 'true' then return true end
+    if v == 'false' then return false end
+    return nil
+end
+
+function at_update_status_path()
+    local cfg = at_config_dir()
+    if cfg == '' then return '' end
+    return cfg .. '\\adventuretime_update_status.json'
+end
+
+function at_short_sha(sha)
+    sha = tostring(sha or '')
+    if #sha > 12 then return sha:sub(1, 12) end
+    return sha
+end
+
+function at_refresh_update_status(force)
+    local now = mq.gettime()
+    if not force and now < (AT_UPDATE_STATUS.nextRead or 0) then return AT_UPDATE_STATUS end
+    AT_UPDATE_STATUS.nextRead = now + 30000
+
+    local path = at_update_status_path()
+    local body = (path ~= '') and at_read_all(path) or nil
+    if not body or body == '' then
+        AT_UPDATE_STATUS.available = false
+        AT_UPDATE_STATUS.status = 'unknown'
+        AT_UPDATE_STATUS.latestSha = ''
+        AT_UPDATE_STATUS.installedSha = ''
+        AT_UPDATE_STATUS.checkedAtUtc = ''
+        AT_UPDATE_STATUS.error = ''
+        return AT_UPDATE_STATUS
+    end
+
+    local status = at_json_string(body, 'status')
+    local available = at_json_bool(body, 'updateAvailable')
+    if available == nil then available = (status == 'update_available') end
+    AT_UPDATE_STATUS.available = available == true
+    AT_UPDATE_STATUS.status = status ~= '' and status or (AT_UPDATE_STATUS.available and 'update_available' or 'unknown')
+    AT_UPDATE_STATUS.latestSha = at_json_string(body, 'latestSha')
+    AT_UPDATE_STATUS.installedSha = at_json_string(body, 'installedSha')
+    AT_UPDATE_STATUS.checkedAtUtc = at_json_string(body, 'checkedAtUtc')
+    AT_UPDATE_STATUS.error = at_json_string(body, 'error')
+    return AT_UPDATE_STATUS
+end
+
+function at_find_patcher()
+    local root = at_mq_root()
+    if root == '' then return nil end
+    for _, dir in ipairs({ root, root .. '\\AdventureTimePatcher', root .. '\\Patcher' }) do
+        for _, name in ipairs({ 'AdventureTimePatcher.exe', 'AdventureTimeUpdater.exe' }) do
+            local path = dir .. '\\' .. name
+            if at_file_exists(path) then return path end
+        end
+    end
+    return nil
+end
+
+function at_win_quote(path)
+    return '"' .. tostring(path or ''):gsub('"', '') .. '"'
+end
+
+function at_shell_open(target, params)
+    target = tostring(target or ''):match('^%s*(.-)%s*$') or ''
+    if target == '' then return false end
+    params = tostring(params or ''):match('^%s*(.-)%s*$') or ''
+    if params == '' then params = nil end
+
+    local okFfi, ffi = pcall(require, 'ffi')
+    if okFfi and ffi then
+        if not AT_SHELL_CDEF_DONE then
+            pcall(ffi.cdef, [[
+                void* ShellExecuteA(void* hwnd, const char* lpOperation, const char* lpFile,
+                                    const char* lpParameters, const char* lpDirectory, int nShowCmd);
+            ]])
+            AT_SHELL_CDEF_DONE = true
+        end
+        local ok = pcall(function()
+            AT_SHELL32 = AT_SHELL32 or ffi.load('shell32')
+            local ret = AT_SHELL32.ShellExecuteA(nil, 'open', target, params, nil, 1)
+            local code = tonumber(ffi.cast('intptr_t', ret))
+            if not code or code <= 32 then error('ShellExecuteA failed: ' .. tostring(code)) end
+        end)
+        if ok then return true end
+    end
+
+    local ok = pcall(function()
+        if target:lower():match('^https?://') then
+            os.execute('start "" ' .. at_win_quote(target))
+        elseif params then
+            os.execute('start "" ' .. at_win_quote(target) .. ' ' .. params)
+        else
+            os.execute('start "" ' .. at_win_quote(target))
+        end
+    end)
+    return ok == true
+end
+
+function at_launch_patcher()
+    local exe = at_find_patcher()
+    if not exe then
+        local url = 'https://github.com/drel-git/AdventureTimePatcher/releases/latest'
+        if at_shell_open(url) then
+            log('\\ay[update] AdventureTimePatcher.exe not found - opened download page.\\ax')
+        else
+            log('\\ay[update] AdventureTimePatcher.exe not found. Open: %s\\ax', url)
+        end
+        return false
+    end
+    local root = at_mq_root()
+    local params = 'update --mq ' .. at_win_quote(root)
+    if at_shell_open(exe, params) then
+        log('\\ag[update] AdventureTimePatcher launched: %s\\ax', exe)
+        return true
+    end
+    log('\\ar[update] Could not launch AdventureTimePatcher: %s\\ax', exe)
+    return false
+end
+
+function at_draw_update_button(tag)
+    local st = at_refresh_update_status(false)
+    if not st.available then return end
+    local now = mq.gettime()
+    local armed = now < (AT_UPDATE_ARMED_UNTIL or 0)
+    local label = armed and ('Really update?##' .. tag) or ('Update available##' .. tag)
+    local pushed = 0
+    if ImGuiCol and ImGuiCol.Button then
+        if pcall(function() ImGui.PushStyleColor(ImGuiCol.Button, 0.58, 0.38, 0.16, 1.0) end) then pushed = pushed + 1 end
+        if pcall(function() ImGui.PushStyleColor(ImGuiCol.ButtonHovered, 0.72, 0.48, 0.20, 1.0) end) then pushed = pushed + 1 end
+        if pcall(function() ImGui.PushStyleColor(ImGuiCol.ButtonActive, 0.84, 0.56, 0.24, 1.0) end) then pushed = pushed + 1 end
+    end
+    local clicked = ImGui.Button(label, armed and 118 or 132, 0)
+    if pushed > 0 then pcall(function() ImGui.PopStyleColor(pushed) end) end
+    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+        pcall(function()
+            ImGui.SetTooltip(armed
+                and 'Click again to close AdventureTime on the group and run the patcher.'
+                or  'AdventureTime update is available. Click once, then confirm.')
+        end)
+    end
+    if clicked then
+        if armed then
+            updateLaunchRequested = true
+            AT_UPDATE_ARMED_UNTIL = 0
+        else
+            AT_UPDATE_ARMED_UNTIL = now + 5000
+        end
+    end
+end
+
 -- ONE SETTINGS FILE FOR THE GROUP. It was per character because a worker's save wrote all 35 keys from
 -- its own state - and a worker has no UI, so its layout keys are always defaults. One broadcast setting
 -- change and eleven workers overwrote the driver's customised layout with blanks. That is not a
@@ -3723,6 +4101,8 @@ local function save_settings()
                 f:write('popLocked=' .. table.concat(pl, ',') .. '\n')
             end
             f:write('uiWideButtons=' .. (uiWideButtons and '1' or '0') .. '\n')
+            f:write('peerTransport=' .. tostring(peerTransport or 'auto') .. '\n')
+            f:write('botControl=' .. tostring(botControl or 'auto') .. '\n')
             f:write('miniTimeline=' .. (miniTimeline and '1' or '0') .. '\n')
             f:write('miniRunning=' .. (miniRunning and '1' or '0') .. '\n')
             f:write('uiPulse=' .. (UI_PULSE and '1' or '0') .. '\n')
@@ -3861,6 +4241,8 @@ local function load_settings()
                 for part in v:gmatch('%d+') do popLocked[tonumber(part)] = true end
             end
             if k == 'uiWideButtons' then uiWideButtons = (v == '1' or v:lower() == 'true') end
+            if k == 'peerTransport' and peer_transport_valid(v) then peerTransport = v end
+            if k == 'botControl' and (v == 'auto' or v == 'e3' or v == 'rgmercs') then botControl = v end
             if k == 'miniTimeline' then miniTimeline = (v == '1' or v:lower() == 'true') end
             if k == 'miniRunning' then miniRunning = (v == '1' or v:lower() == 'true') end
             if k == 'uiPulse' then UI_PULSE = (v == '1' or v:lower() == 'true') end
@@ -8337,6 +8719,10 @@ pcall(function()
         local name = nm:gsub('_', ' ')
         counts[who:lower()] = counts[who:lower()] or {}
         counts[who:lower()][name] = tonumber(v) or 0
+        -- Stamp the report. give_out_one waits on this rather than polling a DanNet query slot, so
+        -- 'the pull has finished' is the same signal on every transport - and it fires whether the pull
+        -- got everything, some of it, or nothing.
+        counts[who:lower()].__altAt = mq.gettime()
         statusCounts[who:lower()] = counts[who:lower()]
     end)
     mq.bind('/at_altbal', function(who, nm, v)
@@ -9342,7 +9728,7 @@ end
         for _, nm in ipairs(group_members()) do
             if nm:lower() ~= myName:lower() then pcall(function() peer_cmdf(nm, '/at_e3 off') end) end
         end
-        log('handed E3 back to the whole group (/e3p off everywhere)')
+        log('handed bot control back to the whole group')
     end)
     -- WHAT DOES THE STAFF LOOK LIKE ON ME? Lunafeet and Khulian have reported staff=0 all night and never
     -- once produced a cooldown, while the cleric, shaman and bard all have. staff=0 rather than -1 means
@@ -10189,28 +10575,42 @@ function dnet_drop_all(why)
     return n
 end
 
--- DanNet.Peers is the list of clients we can actually reach. Not in it, not ours, leave them alone.
--- FAIL OPEN. An empty or unreadable peer list means DanNet has not discovered anyone yet - at startup
--- that is normal and lasts a second or two. Treating that as 'nobody is ours' would stop the group
--- coming up at all, which is far worse than the thing being fixed, so an unusable list keeps the old
--- behaviour of trying everyone.
+-- The transport's list of clients we can actually reach. Not in it, not ours, leave them alone.
+--   DanNet: DanNet.Peers    ('|'-delimited, sometimes server_charactername)
+--   EQBC:   EQBC.Names      (space-delimited character names, filled in after a names reply - the
+--                            plugin asks on every connect/disconnect, so it lags a moment)
+--   E3:     no roster read here - fails open and the /at_ping handshake decides who is really up.
+-- FAIL OPEN. An empty or unreadable peer list means the network has not discovered anyone yet - at
+-- startup that is normal and lasts a second or two. Treating that as 'nobody is ours' would stop the
+-- group coming up at all, which is far worse than the thing being fixed, so an unusable list keeps the
+-- old behaviour of trying everyone.
 netPeerSaid = false
 function net_peer_set()
-    local raw = ''
-    pcall(function() raw = tostring(mq.TLO.DanNet.Peers() or '') end)
+    if not peerChan then peer_detect() end
+    local raw, src = '', 'DanNet.Peers'
+    if peerChan == 'eqbc' then
+        src = 'EQBC.Names'
+        pcall(function() if eqbc_connected() then raw = tostring(mq.TLO.EQBC.Names() or '') end end)
+    elseif peerChan == 'e3' then
+        src = 'E3'
+    else
+        pcall(function() raw = tostring(mq.TLO.DanNet.Peers() or '') end)
+    end
     -- SAY WHAT THE LIST ACTUALLY IS, once. The filter below fails open on an unreadable list, which means
     -- a silent no-op looks identical to a list that genuinely contains everybody - and on 2026-08-22
     -- Elanta was launched anyway with no 'not ours' line to say which had happened.
     if not netPeerSaid then
         netPeerSaid = true
-        rezlog('[sync] DanNet.Peers reads: %s', (raw == '') and '(empty - filter fails open, everyone is treated as ours)' or raw)
+        rezlog('[sync] %s reads: %s', src, (raw == '') and '(empty - filter fails open, everyone is treated as ours)' or raw)
     end
     if raw == '' then return nil end
     local set = {}
-    -- The list is delimited by | on every build seen, but split on whitespace and commas too rather than
-    -- trusting that: a wrong guess here would silently empty the set and take the whole group down.
+    -- DanNet is delimited by | on every build seen and EQBC by spaces, but split on all three plus commas
+    -- rather than trusting either: a wrong guess here would silently empty the set and take the whole
+    -- group down.
     for nm in raw:gmatch('[^|%s,]+') do
-        -- Peers arrive as server_charactername on some setups; the trailing segment is the character.
+        -- DanNet peers arrive as server_charactername on some setups; the trailing segment is the
+        -- character. EQBC names are bare, and a character name cannot contain '_' anyway.
         set[(nm:match('([^_]+)$') or nm):lower()] = true
     end
     if next(set) == nil then return nil end
@@ -10898,6 +11298,7 @@ local windowOpen = true
 local distributing = false
 local giveRequested = false   -- set by the button; the MAIN LOOP runs give_out (delays can't yield in render)
 local closeAllRequested = false   -- set by the Close-all button; MAIN LOOP broadcasts and exits
+updateLaunchRequested = false     -- set by the update button; MAIN LOOP closes peers and launches patcher
 atExitWhy = nil                   -- set at whichever exit is taken, printed on the way out
 local collectRequested = false   -- set by the Collect-all button; MAIN LOOP runs collect_all
 local showStatus = false          -- toggle: show each toon's count per item (green if >= target, red if <)
@@ -14257,16 +14658,19 @@ function give_out_one(item, currency)
                 if who:lower() == myName:lower() then
                     altcur_pull(currency, pull)
                 else
+                    local askedAt = mq.gettime()
                     pcall(function() peer_cmdf(who, '/atpull %s %d', currency:gsub(' ', '_'), pull) end)
                     local deadline = mq.gettime() + math.min(180000, 6000 + math.ceil(pull / 200) * 2500)
-                    local want = held(who) + pull
+                    -- WAIT FOR THE REPORT, NOT A QUERY SLOT. altcur_pull ends with altcur_announce, whose
+                    -- /at_altbags lands in counts[who][currency] with a timestamp - on every transport.
+                    -- The old loop read DanNet(who).Q without ever firing a /dquery for it, so it saw the
+                    -- stale slot from the counts pass and ran to the deadline; and it waited for >= want,
+                    -- which a pull that produced fewer than asked could never satisfy. A fresh report is
+                    -- the pull saying it has finished, whatever it got.
                     while mq.gettime() < deadline do
                         mq.doevents(); mq.delay(500)
-                        local n = 0
-                        pcall(function()
-                            n = tonumber(mq.TLO.DanNet(who).Q('FindItemCount[=' .. item .. ']')()) or 0
-                        end)
-                        if n >= want then break end
+                        local c = counts[who:lower()]
+                        if c and c.__altAt and c.__altAt >= askedAt then break end
                     end
                 end
                 query_all_counts(peers, all_items())
@@ -14445,6 +14849,73 @@ end
 -- So count holders instead. /e3p on goes out only when the FIRST one takes hold and /e3p off only when
 -- the LAST one lets go, which makes releasing someone else's hold impossible by construction.
 E3HOLD = {}
+BOT_HOLD_MODE = BOT_HOLD_MODE or nil
+function bot_control_valid(v)
+    return v == 'auto' or v == 'e3' or v == 'rgmercs'
+end
+
+function bot_control_label(v)
+    return BOT_CONTROL_LABEL[v or 'auto'] or BOT_CONTROL_LABEL.auto
+end
+
+function rgmercs_running()
+    local ok, running = pcall(function()
+        return mq.TLO.Lua.Script('rgmercs').Status.Equal('RUNNING')() == true
+    end)
+    return ok and running == true
+end
+
+function rgmercs_run_move_paused()
+    if not rgmercs_running() then return false end
+    local ok, val = pcall(function()
+        return mq.TLO.RGMercs.Config('RunMovePaused')() == true
+    end)
+    return ok and val == true
+end
+
+function active_bot_control()
+    if not bot_control_valid(botControl) then botControl = 'auto' end
+    if botControl == 'auto' then
+        return rgmercs_running() and 'rgmercs' or 'e3'
+    end
+    return botControl
+end
+
+function bot_pause_cmd()
+    local mode = active_bot_control()
+    if mode == 'rgmercs' then
+        if not rgmercs_running() then
+            rezlog('\\ar[bot] RGMercs bot control selected, but rgmercs is not running - cannot pause automation\\ax')
+            return 'rgmercs', false
+        end
+        mq.cmd('/rgl pause')
+        if rgmercs_run_move_paused() then
+            rezlog('\\ay[bot] RGMercs Chase/Camp While Paused is ON. Turn off with /rgl set runmovepaused false\\ax')
+        end
+        return 'rgmercs', true
+    end
+    mq.cmd('/e3p on')
+    return 'e3', true
+end
+
+function bot_resume_cmd(mode)
+    mode = mode or BOT_HOLD_MODE or active_bot_control()
+    if mode == 'rgmercs' then
+        if not rgmercs_running() then
+            rezlog('\\ay[bot] RGMercs bot control selected, but rgmercs is not running - nothing to resume\\ax')
+            return 'rgmercs', false
+        end
+        mq.cmd('/rgl unpause')
+        return 'rgmercs', true
+    end
+    mq.cmd('/e3p off')
+    return 'e3', true
+end
+
+function bot_control_can_verify()
+    return (BOT_HOLD_MODE or active_bot_control()) == 'e3'
+end
+
 -- IS E3 ACTUALLY PAUSED? Not what we believe - what E3 says.
 -- E3 exposes Basics.IsPaused through its reflection lookup, and MQ2Mono.Query wraps whatever it is given
 -- in ${...} and runs it through Casting.Ifs_Results - the same resolver that handles ${E3N.State.*}. So
@@ -14496,7 +14967,10 @@ function e3_hold(owner, nowait)
     local was = e3_holders()
     E3HOLD[owner] = true
     if was == 0 then
-        mq.cmd('/e3p on')
+        local mode, sent = bot_pause_cmd()
+        if not sent then E3HOLD[owner] = nil; return end
+        BOT_HOLD_MODE = mode
+        if mode ~= 'e3' then return end
         if nowait then return end
         -- /e3p IS QUEUED, NOT IMMEDIATE. E3's own IsPaused() starts with
         --     EventProcessor.ProcessEventsInQueues("/e3p")
@@ -14536,7 +15010,7 @@ function e3_hold(owner, nowait)
             -- It took the command and is still running. Say it plainly rather than carrying on and
             -- wondering later why E3 healed through a placate or stepped on a /nowcast.
             rezlog('\\ar[e3] asked E3 to pause and it reports it is still RUNNING - retrying once\\ax')
-            mq.cmd('/e3p on')
+            bot_pause_cmd()
             mq.delay(2500, function() return e3_is_paused() == true end)
             local after = e3_is_paused()
             if after == false then
@@ -14558,10 +15032,11 @@ end
 -- already true.
 function e3_assert_held()
     if e3_holders() == 0 then return end
+    if not bot_control_can_verify() then return end
     if e3_is_paused() == false then
         rezlog('\\ar[e3] E3 came back up while %d hold(s) were still on it - pausing it again\\ax',
                e3_holders())
-        mq.cmd('/e3p on')
+        bot_pause_cmd()
         mq.delay(2500, function() return e3_is_paused() == true end)
     end
 end
@@ -14570,13 +15045,14 @@ function e3_release(owner)
     owner = owner or 'unknown'
     if not E3HOLD[owner] then return end
     E3HOLD[owner] = nil
-    if e3_holders() == 0 then mq.cmd('/e3p off') end
+    if e3_holders() == 0 then bot_resume_cmd(BOT_HOLD_MODE); BOT_HOLD_MODE = nil end
 end
 -- Unconditional: for the way out and for /atresume, where the point is to leave nothing held whatever
 -- anyone thinks they own.
 function e3_release_all()
     for k in pairs(E3HOLD) do E3HOLD[k] = nil end
-    mq.cmd('/e3p off')
+    bot_resume_cmd(BOT_HOLD_MODE)
+    BOT_HOLD_MODE = nil
 end
 
 -- STOW WHATEVER IS ON THE CURSOR. Returns true if the cursor ended up empty.
@@ -14624,6 +15100,7 @@ end
 -- said it was paused throughout. A log that states an assumption in the same words it would state a fact
 -- is worse than one that says nothing.
 function e3_pause_note()
+    if (BOT_HOLD_MODE or active_bot_control()) == 'rgmercs' then return 'RGMercs paused' end
     local st = e3_is_paused()
     if st == true  then return 'E3 paused' end
     -- No colour codes here: this string is passed as a %s into another format, and the log writer
@@ -14642,7 +15119,7 @@ function ep_resume(why)
     if not epPaused then return end
     epPaused = false
     e3_release('placate')
-    rezlog('[placate] E3 resumed (%s)', why or 'done')
+    rezlog('[placate] bot control resumed (%s)', why or 'done')
 end
 
 -- WHO CAN WORK THE PLACATE QUEUE. Enchanters and clerics both get a placate line, and everything
@@ -21267,6 +21744,8 @@ local function render()
             -- Deliberately NOT a new /at_close bind: that name is already the group shutdown, and binding
             -- it again here would have silently replaced it with something that only hides a window.
             draw_close_all('miniclose', false)
+            ImGui.SameLine()
+            at_draw_update_button('miniupdate')
             -- COTH ON THE HEADER, HARD RIGHT. As its own section it cost a separator and a full row for
             -- one button. Up here it costs nothing: the header row already exists and its right-hand end
             -- was empty. Pushed to the far edge rather than tucked beside Close all deliberately - those
@@ -21433,6 +21912,8 @@ local function render()
         -- moved around. Top row, fixed position, next to the other window-level controls.
         ImGui.SameLine()
         draw_close_all('mainclose', true)   -- global: shuts every instance, asks first
+        ImGui.SameLine()
+        at_draw_update_button('mainupdate')
         -- Counts, Tank XT and its Auto checkbox removed from this row - see the note by the tab bar.
         if #statusNames == 0 then ImGui.SameLine(); ImGui.TextDisabled('reading counts...') end
         if showSec.tribute then ImGui.Spacing(); draw_tribute_grid() end
@@ -21496,6 +21977,30 @@ local function render()
                 ImGui.Spacing()
                 ImGui.TextColored(0.45, 0.75, 0.95, 1.0,
                     'AdventureTime ' .. VERSION .. '   (build ' .. BUILD_TAG .. ')')
+                do
+                    local st = at_refresh_update_status(false)
+                    ImGui.SameLine()
+                    if st.available then
+                        ui_text(UI_WAIT, 'Update available')
+                    elseif st.status == 'up_to_date' then
+                        ui_text(UI_READY, 'Up to date')
+                    elseif st.error ~= '' then
+                        ui_text(UI_WAIT, 'Update check failed')
+                    else
+                        ui_text(UI_OFF, 'Update status unknown')
+                    end
+                    if ImGui.IsItemHovered and ImGui.IsItemHovered() then
+                        pcall(function()
+                            local latest = at_short_sha(st.latestSha)
+                            local installed = at_short_sha(st.installedSha)
+                            ImGui.SetTooltip(string.format(
+                                'Installed: %s\nLatest: %s\nChecked: %s',
+                                installed ~= '' and installed or 'unknown',
+                                latest ~= '' and latest or 'unknown',
+                                st.checkedAtUtc ~= '' and st.checkedAtUtc or 'never'))
+                        end)
+                    end
+                end
                 ImGui.Separator()
                 ImGui.Spacing()
                 -- SMART CAST GEMS. Set once per character and then forgotten, which is what Settings is
@@ -21584,6 +22089,59 @@ local function render()
                 end
                 ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 ui_text(UI_LABEL, 'Performance')
+                ui_text(UI_LABEL, 'Peer transport')
+                ImGui.SameLine()
+                ui_text(UI_OFF, 'How AdventureTime talks to other boxes.')
+                ImGui.SetNextItemWidth(150)
+                if ImGui.BeginCombo('##at_peer_transport', peer_transport_label(peerTransport)) then
+                    for _, key in ipairs({ 'auto', 'e3', 'eqbc', 'dannet' }) do
+                        if ImGui.Selectable(peer_transport_label(key), key == peerTransport) and key ~= peerTransport then
+                            peerTransport = key
+                            peer_transport_reset()
+                            save_settings()
+                            log('[sync] peer transport setting: %s', peer_transport_label(peerTransport))
+                        end
+                    end
+                    ImGui.EndCombo()
+                end
+                ImGui.SameLine()
+                ui_text(peerChan and UI_READY or UI_WAIT, 'Active: ' .. (peerChan and peer_transport_label(peerChan) or 'detecting'))
+                if ImGui.SmallButton('Re-detect##at_peer_transport_redetect') then
+                    peer_transport_reset()
+                end
+                ImGui.SameLine()
+                if ImGui.SmallButton('Test group##at_peer_transport_test') then
+                    peerTransportTestAt = mq.gettime() + 1
+                end
+                ImGui.TextDisabled('Auto keeps current behavior. Linux/Wine: use E3 or EQBC.')
+                ImGui.Spacing()
+                ui_text(UI_LABEL, 'Bot control')
+                ImGui.SameLine()
+                ui_text(UI_OFF, 'What AdventureTime pauses locally.')
+                ImGui.SetNextItemWidth(150)
+                if ImGui.BeginCombo('##at_bot_control', bot_control_label(botControl)) then
+                    for _, key in ipairs({ 'auto', 'e3', 'rgmercs' }) do
+                        if ImGui.Selectable(bot_control_label(key), key == botControl) and key ~= botControl then
+                            botControl = key
+                            save_settings()
+                            log('[bot] bot control setting: %s', bot_control_label(botControl))
+                        end
+                    end
+                    ImGui.EndCombo()
+                end
+                ImGui.SameLine()
+                do
+                    local activeBot = active_bot_control()
+                    local col = (activeBot == 'rgmercs' and rgmercs_running()) and UI_READY
+                        or (activeBot == 'e3' and UI_READY or UI_WAIT)
+                    ui_text(col, 'Active: ' .. bot_control_label(activeBot))
+                    if activeBot == 'rgmercs' and rgmercs_run_move_paused() then
+                        ImGui.SameLine()
+                        ui_text(UI_WAIT, 'Move while paused ON: /rgl set runmovepaused false')
+                    end
+                end
+                ImGui.TextDisabled('Auto uses RGMercs if running, otherwise E3.')
+                ImGui.Spacing(); ImGui.Separator(); ImGui.Spacing()
                 do
                     -- Local to this client, not group wide: it is about the machine, and every character
                     -- on one machine shares this settings file anyway.
@@ -22001,6 +22559,11 @@ end
 atMuted = false
 function mute_relay_echo()
     if atMuted then return end
+    -- Only touch DanNet's settings when DanNet is OUR transport. A client running E3 or EQBC may have
+    -- MQ2DanNet loaded for something else entirely, and its echo settings are not ours to change.
+    -- peerChan is nil until the first relay picks a transport; the tick retries until then.
+    if not peerChan then return end
+    if peerChan ~= 'dannet' then atMuted = true; return end   -- nothing to mute on E3/EQBC; stop retrying
     if not mq.TLO.Plugin('MQ2DanNet')() then return end
     pcall(function() mq.cmd('/squelch /dnet localecho off') end)
     pcall(function() mq.cmd('/squelch /dnet commandecho off') end)
@@ -22879,8 +23442,8 @@ DI.startedAt = mq.gettime()   -- clock the settling window from load, not from t
 
 -- Timed, because this was the multi-second startup gap and it took three attempts to find.
 -- Driver only, ONCE at startup: spread a headless worker to each GROUP member so they're present to take
--- commands (tank XTargets, etc.). Not a recurring ping - no pingpong. Counts still come straight from
--- DanNet whether or not they run this; this just lets them ACT on /at_* commands.
+-- commands (tank XTargets, etc.). Not a recurring ping - no pingpong. On DanNet counts can still be pulled
+-- from a peer that is not running this; on E3/EQBC the worker IS the count source, so this matters more.
 -- Startup sanity check: can we actually REACH the rest of the group? A client whose peer network is
 -- broken looks completely healthy from the inside - it parses its own INI, renders its own UI, and
 -- silently gets nothing from anyone else. Say so loudly instead of leaving it to be diagnosed.
@@ -22894,14 +23457,38 @@ local function check_peer_network()
         log('\\ayForm your group in-game, then reload (or hit Refresh on the Burns tab).\\ax')
         return
     end
-    local peers = ''
-    pcall(function() peers = tostring(mq.TLO.DanNet.Peers() or ''):lower() end)
-    -- A DEAD toon is off DanNet while it zones to bind, which looks exactly like a broken network - so
-    -- this fired mid-wipe and told the user to go rewrite their MQ2DanNet.ini when nothing was wrong.
+    if not peerChan then peer_detect() end
+    if peerChan == 'e3' then
+        -- No roster to read here: E3 reachability is proven by the /at_ping handshake in bring_up_group,
+        -- which logs who did and did not answer.
+        return
+    end
+    if peerChan == 'eqbc' and not eqbc_connected() then
+        log('\\ar*** PEER NETWORK PROBLEM ***\\ax')
+        log('\\arMQ2EQBC is loaded but NOT connected to an EQBC server - nothing can reach the group.\\ax')
+        log('\\ayCheck /bccmd status here, then /bccmd connect (server and port in MQ2EQBC.ini). Every box')
+        log('\\aymust connect to the SAME EQBCS server; /bccmd names shows who the server can see.\\ax')
+        return
+    end
+    -- The transport's roster, as one lowercase set. An EMPTY roster is deliberately NOT a pass here: on
+    -- DanNet an empty Peers list IS the split-network fault this check exists to catch (net_peer_set
+    -- fails open for launching, which is the right call there and the wrong one here).
+    local set = net_peer_set()
+    if not set and peerChan == 'eqbc' then
+        -- EQBC.Names is only filled in by a names reply from the server. The plugin asks on every
+        -- connect and disconnect, so this is normally already there - but not always by the time this
+        -- deferred check runs. Ask, say so, and let the /at_ping bring-up be the judge this time.
+        pcall(function() mq.cmd('/squelch /bccmd names') end)
+        log('[net] EQBC has not returned its names list yet - requested it; /at_ping decides who is reachable')
+        return
+    end
+    set = set or {}
+    -- A DEAD toon is off the network while it zones to bind, which looks exactly like a broken network -
+    -- so this fired mid-wipe and told the user to go rewrite their MQ2DanNet.ini when nothing was wrong.
     -- A corpse in the zone is proof they are simply dead, not misconfigured.
     local missing, dead = {}, {}
     for _, m in ipairs(mine) do
-        if not peers:find(m:lower(), 1, true) then
+        if not set[m:lower()] then
             if rez_corpse(m) > 0 then dead[#dead + 1] = m else missing[#missing + 1] = m end
         end
     end
@@ -22910,11 +23497,18 @@ local function check_peer_network()
     end
     if #missing == 0 then return end
     log('\\ar*** PEER NETWORK PROBLEM ***\\ax')
-    log('\\arCannot see %d of %d group member(s) on DanNet: %s\\ax', #missing, #mine, table.concat(missing, ', '))
+    log('\\arCannot see %d of %d group member(s) on %s: %s\\ax', #missing, #mine,
+        (peerChan == 'eqbc') and 'EQBC' or 'DanNet', table.concat(missing, ', '))
     log('\\ayNothing from those characters will arrive - no burns, no rez help, no potion counts.\\ax')
-    log('\\ayCheck: /dnet info on each toon. If they only list themselves, they are on separate')
-    log('\\ayDanNet islands - fix the Interface setting in MQ2DanNet.ini (config folder) so every')
-    log('\\ayclient matches, then FULLY restart them. See the AdventureTime readme.\\ax')
+    if peerChan == 'eqbc' then
+        log('\\ayCheck: /bccmd names here and /bccmd status on each missing toon. Every box must be')
+        log('\\ayconnected to the SAME EQBCS server (same host and port in MQ2EQBC.ini), and a toon that')
+        log('\\ayconnected under a different name (/bccmd connect <name>) will not match its character.\\ax')
+    else
+        log('\\ayCheck: /dnet info on each toon. If they only list themselves, they are on separate')
+        log('\\ayDanNet islands - fix the Interface setting in MQ2DanNet.ini (config folder) so every')
+        log('\\ayclient matches, then FULLY restart them. See the AdventureTime readme.\\ax')
+    end
 end
 
 -- ===== WHERE STARTUP TIME GOES =====
@@ -22953,8 +23547,8 @@ pacAnnounceAt = mq.gettime() + 8000
 load_combos()
 mini_order_normalise()   -- fills in defaults / drops unknown keys from a stale settings file
 -- The peer check was written and then never wired in, so the one diagnostic aimed at split/broken
--- networks has never run. Deferred rather than immediate: DanNet needs a moment to discover peers,
--- and asking too early reports everyone missing on a perfectly healthy setup.
+-- networks has never run. Deferred rather than immediate: DanNet needs a moment to discover peers and
+-- EQBC a moment for its names reply, and asking too early reports everyone missing on a healthy setup.
 -- A driver that has just (re)started has EMPTY state tables, while every worker still believes it has
 -- already reported - so nothing would ever arrive and the buttons would stay blank forever. Restarting
 -- the driver is not a roster change, so resync_group() never fired for it. Ask everyone to speak up.
@@ -23064,9 +23658,42 @@ while running do
         running = false
         break
     end
+    if updateLaunchRequested then
+        updateLaunchRequested = false
+        if at_find_patcher() then
+            atExitWhy = 'AdventureTime update launched'
+            log('[update] closing AdventureTime on the group before launching patcher.')
+            for _, m in ipairs(group_members()) do
+                if m:lower() ~= myName:lower() then peer_cmdf(m, '/at_close') end
+            end
+            mq.delay(300)
+            if at_launch_patcher() then
+                running = false
+                break
+            end
+        else
+            at_launch_patcher()
+        end
+    end
     if peerCheckAt > 0 and mq.gettime() >= peerCheckAt then
         peerCheckAt = 0
         pcall(check_peer_network)
+    end
+    if peerTransportProbeAt > 0 and mq.gettime() >= peerTransportProbeAt then
+        peerTransportProbeAt = 0
+        pcall(peer_detect)
+    end
+    if peerTransportTestAt > 0 and mq.gettime() >= peerTransportTestAt then
+        peerTransportTestAt = 0
+        pcall(function()
+            if not peerChan then peer_detect() end
+            if peerChan then
+                peer_bcast('/echo [AdventureTime] peer transport test from %s via %s',
+                    myName, peer_transport_label(peerChan))
+            else
+                log('\\ar[sync] peer transport test failed - no active peer transport\\ax')
+            end
+        end)
     end
     -- Group changed since the last look? Re-test. A peer on ANOTHER machine can drop off DanNet without
     -- leaving the in-game group, and nothing else in here would ever notice - the reports just stop.
