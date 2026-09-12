@@ -105,7 +105,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 --             my edit land" cost a round trip more than once before TSL had one.
 -- Shown together in the log header and the title bar, so a screenshot answers both.
 VERSION = '1.19'
-local BUILD_TAG = '1.19.57'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.19.58'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS. These were scattered as bare literals across ~40 call sites and had
 -- already drifted - "not usable" is 0.55 grey in some panels and 0.62 in others, and the same meaning
@@ -3948,7 +3948,7 @@ end
 function at_launch_patcher()
     local exe = at_find_patcher()
     if not exe then
-        local url = 'https://github.com/drel-git/AdventureTimePatcher/releases/latest'
+        local url = 'https://github.com/sebbun123/AdventureTimePatcher/releases/latest'
         if at_shell_open(url) then
             log('\\ay[update] AdventureTimePatcher.exe not found - opened download page.\\ax')
         else
