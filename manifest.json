@@ -1,0 +1,29 @@
+{
+  "name": "AdventureTime",
+  "version": "1.19",
+  "build": "1.19.59",
+  "released": "2026-09-20T03:38:57Z",
+  "files": [
+    {
+      "path": "adventuretime/init.lua",
+      "size": 1518421,
+      "sha256": "26edbba03e0f4b63431309fdd0d00e7a21e4121a84859d18e7e0989213c8dfec"
+    }
+  ],
+  "requires": {
+    "plugins": ["MQ2DanNet", "MQ2Mono"],
+    "optional_plugins": ["MQ2EQBC"],
+    "lua": ["mq", "ImGui", "lfs"]
+  },
+  "changes": [
+    "Peer transport Auto now prefers DanNet, then E3, then EQBC (was E3-first, which picked E3 on every box carrying MQ2Mono).",
+    "DanNet echo mute (localecho/commandecho off) now runs at load before the first relay instead of waiting for the 5s tick retry; first retry is 1s.",
+    "Settings > Peer transport: a saved E3/EQBC/DanNet selection now re-detects at load and is actually used (was overridden by Auto's earlier pick).",
+    "A selected-but-missing transport logs once and backs off 15s instead of re-detecting (and on DanNet, /plugin-loading with a 750ms delay) on every relay.",
+    "Settings hint text updated to describe the Auto order."
+  ],
+  "notes": [
+    "Peer transport is saved in the shared per-machine settings file; a group split across PCs needs it set on each.",
+    "On E3 transport, /e3bcga may include the sender - untested. Verify with '/e3bcga /echo hi'; switch to /e3bcg if it echoes locally."
+  ]
+}
