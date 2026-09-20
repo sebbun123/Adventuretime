@@ -1675,7 +1675,7 @@ local function save_targets()
 end
 
 -- ---------------------------------------------------------------------------
--- Peer network: prefer E3 (/e3bct), then EQBC (/bct), then DanNet (/dex). Detected once, in peer_detect.
+-- Peer network: prefer DanNet (/dex), then E3 (/e3bct), then EQBC (/bct). Detected once, in peer_detect.
 -- ---------------------------------------------------------------------------
 local peerChan
 peerTransport = peerTransport or 'auto'  -- auto, e3, eqbc, dannet. Saved in Settings.
@@ -1738,21 +1738,42 @@ function peer_transport_label(v)
     return PEER_TRANSPORT_LABEL[v or 'auto'] or PEER_TRANSPORT_LABEL.auto
 end
 
+-- A selected transport that is missing must not re-run detection on EVERY relay: that was a red log line
+-- per relay, and on the DanNet branch a /plugin load plus a 750ms delay per relay - a yield inside
+-- doevents when the relay came from a bind. Say it once, then back off before trying again.
+peerDetectSaid    = peerDetectSaid or false
+peerDetectRetryAt = peerDetectRetryAt or 0
+PEER_DETECT_BACKOFF_MS = 15000
+
 function peer_transport_reset()
     peerChan = nil
+    peerDetectSaid = false
+    peerDetectRetryAt = 0
     if atMuted ~= nil then atMuted = false end
     peerTransportProbeAt = mq.gettime() + 1
 end
 
--- Pick the peer transport ONCE, in the advertised order: E3, then EQBC, then DanNet.
+-- The failure path of peer_detect: log the reason ONCE per reset, arm the backoff, leave peerChan nil.
+function peer_detect_fail(msg)
+    if not peerDetectSaid then
+        peerDetectSaid = true
+        log(msg)
+    end
+    peerDetectRetryAt = mq.gettime() + PEER_DETECT_BACKOFF_MS
+    return nil
+end
+
+-- Pick the peer transport ONCE, in the advertised order: DanNet, then E3, then EQBC.
 -- GLOBAL, not local: the main chunk is at Lua's 200-local ceiling.
--- The order matters for more than preference. The old code loaded MQ2DanNet FIRST and only then looked
--- at E3/EQBC, so a client that already had a working EQBC session still had DanNet forced into it - and
--- on some setups (Wine, mismatched builds) loading MQ2DanNet is itself the failure. Nothing here loads
--- a plugin unless no advertised transport is present at all, which keeps the legacy behaviour for a
--- Windows client that has none of them and lets everyone else run on what they already have.
+-- DanNet first because it is what this script always ran on and what every downstream path is written
+-- for (/dquery counts, DanNet.Peers roster, /dgge group-minus-self, echo muting). E3/EQBC are the
+-- fallbacks for a client that has no DanNet, not the preference for one that has it - with the earlier
+-- E3-first order every box in the group picked E3, because they all carry MQ2Mono for /nowcast and /e3p.
+-- Nothing here loads a plugin unless no advertised transport is present at all, which keeps the legacy
+-- behaviour for a Windows client that has none of them and lets everyone else run on what they have.
 function peer_detect()
     if peerChan then return peerChan end
+    if peerDetectRetryAt > 0 and mq.gettime() < peerDetectRetryAt then return nil end
     if not peer_transport_valid(peerTransport) then peerTransport = 'auto' end
     local mono  = mq.TLO.Plugin('MQ2Mono')() ~= nil
     local eqbc  = mq.TLO.Plugin('MQ2EQBC')() ~= nil
@@ -1762,8 +1783,7 @@ function peer_detect()
         if mono then
             peerChan = 'e3'
         else
-            log('\\ar[sync] E3 peer transport selected, but MQ2Mono/E3 is not loaded - relays will not send\\ax')
-            return nil
+            return peer_detect_fail('\\ar[sync] E3 peer transport selected, but MQ2Mono/E3 is not loaded - relays will not send\\ax')
         end
     elseif peerTransport == 'eqbc' then
         if eqbc then
@@ -1772,8 +1792,7 @@ function peer_detect()
                 log('\\ay[sync] EQBC peer transport selected, but MQ2EQBC is not connected - relays will drop until /bccmd connect succeeds\\ax')
             end
         else
-            log('\\ar[sync] EQBC peer transport selected, but MQ2EQBC is not loaded - relays will not send\\ax')
-            return nil
+            return peer_detect_fail('\\ar[sync] EQBC peer transport selected, but MQ2EQBC is not loaded - relays will not send\\ax')
         end
     elseif peerTransport == 'dannet' then
         if not dnet then
@@ -1784,9 +1803,11 @@ function peer_detect()
         if dnet then
             peerChan = 'dannet'
         else
-            log('\\ar[sync] DanNet peer transport selected, but MQ2DanNet would not load - relays will not send\\ax')
-            return nil
+            return peer_detect_fail('\\ar[sync] DanNet peer transport selected, but MQ2DanNet would not load - relays will not send\\ax')
         end
+    elseif dnet then
+        -- Already loaded: use it. This is the normal case for every box in the group.
+        peerChan = 'dannet'
     elseif mono then
         -- MQ2Mono loaded is not the same as E3 running - /e3bct only exists while it is. The pause probe
         -- resolves to true/false only when E3 answers (an unresolved key comes back as text, see
@@ -1808,19 +1829,17 @@ function peer_detect()
         if not eqbc_connected() then
             log('\\ay[sync] MQ2EQBC is loaded but not connected - relays will drop until /bccmd connect succeeds\\ax')
         end
-    elseif dnet then
-        peerChan = 'dannet'
     else
-        -- LAST RESORT, and the only place a plugin is loaded: no E3, no EQBC, no DanNet. This is the
-        -- legacy auto-load path and it is unchanged for the client that has nothing else.
+        -- LAST RESORT, and the only place a plugin is loaded on auto: no DanNet, no E3, no EQBC. This is
+        -- the legacy auto-load path and it is unchanged for the client that has nothing else.
         pcall(function() mq.cmd('/plugin mq2dannet load') end)
         mq.delay(750)
-        peerChan = 'dannet'
         if mq.TLO.Plugin('MQ2DanNet')() == nil then
-            log('\\ar[sync] no peer transport found (E3, EQBC or DanNet) and MQ2DanNet would not load - nothing will reach the group\\ax')
-            return nil
+            return peer_detect_fail('\\ar[sync] no peer transport found (DanNet, E3 or EQBC) and MQ2DanNet would not load - nothing will reach the group\\ax')
         end
+        peerChan = 'dannet'
     end
+    peerDetectSaid, peerDetectRetryAt = false, 0
     log('[sync] peer transport: %s%s', peerChan, peerTransport ~= 'auto' and (' (selected ' .. peer_transport_label(peerTransport) .. ')') or '')
     return peerChan
 end
@@ -4241,7 +4260,20 @@ local function load_settings()
                 for part in v:gmatch('%d+') do popLocked[tonumber(part)] = true end
             end
             if k == 'uiWideButtons' then uiWideButtons = (v == '1' or v:lower() == 'true') end
-            if k == 'peerTransport' and peer_transport_valid(v) then peerTransport = v end
+            if k == 'peerTransport' and peer_transport_valid(v) and v ~= peerTransport then
+                peerTransport = v
+                -- THE SETTING WAS DEFUNCT BECAUSE OF ORDER. The transport is detected (and locked into
+                -- peerChan) by the priming relay near the mute block, which runs BEFORE this boot step -
+                -- so a saved E3/EQBC/DanNet choice arrived after Auto had already decided, and nothing
+                -- re-detected. Re-detect right here, on the main thread, so every relay from this point
+                -- on uses what the user picked; re-mute because reset clears the flag.
+                if peerChan then
+                    peer_transport_reset()
+                    peerTransportProbeAt = 0
+                    pcall(peer_detect)
+                    pcall(mute_relay_echo)
+                end
+            end
             if k == 'botControl' and (v == 'auto' or v == 'e3' or v == 'rgmercs') then botControl = v end
             if k == 'miniTimeline' then miniTimeline = (v == '1' or v:lower() == 'true') end
             if k == 'miniRunning' then miniRunning = (v == '1' or v:lower() == 'true') end
@@ -22113,7 +22145,7 @@ local function render()
                 if ImGui.SmallButton('Test group##at_peer_transport_test') then
                     peerTransportTestAt = mq.gettime() + 1
                 end
-                ImGui.TextDisabled('Auto keeps current behavior. Linux/Wine: use E3 or EQBC.')
+                ImGui.TextDisabled('Auto prefers DanNet, then E3, then EQBC. Linux/Wine: use E3 or EQBC.')
                 ImGui.Spacing()
                 ui_text(UI_LABEL, 'Bot control')
                 ImGui.SameLine()
@@ -22561,7 +22593,11 @@ function mute_relay_echo()
     if atMuted then return end
     -- Only touch DanNet's settings when DanNet is OUR transport. A client running E3 or EQBC may have
     -- MQ2DanNet loaded for something else entirely, and its echo settings are not ours to change.
-    -- peerChan is nil until the first relay picks a transport; the tick retries until then.
+    -- Detect here rather than bail: this is only ever called from the main chunk and the tick, both on
+    -- the main thread where peer_detect's possible mq.delay is legal. Returning early on a nil peerChan
+    -- was the regression - at load nothing had detected yet, so the mute waited for the 5s retry and all
+    -- the startup traffic (/at_ping, worker launches, /at_resync, first reports) printed in the meantime.
+    if not peerChan then peer_detect() end
     if not peerChan then return end
     if peerChan ~= 'dannet' then atMuted = true; return end   -- nothing to mute on E3/EQBC; stop retrying
     if not mq.TLO.Plugin('MQ2DanNet')() then return end
@@ -22570,15 +22606,18 @@ function mute_relay_echo()
     atMuted = true
     log('[sync] DanNet relay echo muted (localecho + commandecho off)')
 end
-mute_relay_echo()
--- Retried on the tick until it lands, then never again. The plugin can arrive seconds after we do.
-atMuteRetryAt = mq.gettime() + 5000
+-- Retried on the tick until it lands, then never again. The plugin can arrive seconds after we do, so
+-- the first retry is quick; after that the tick spaces them out.
+atMuteRetryAt = mq.gettime() + 1000
 -- PRIME THE PEER TRANSPORT BEFORE THE UI EXISTS. peer_cmdf detects its channel lazily, and that detection
 -- can mq.delay(750) while MQ2DanNet loads. Yielding inside an ImGui callback is a HARD CLIENT CRASH, not a
 -- Lua error - and peer_cmdf is reachable from button and checkbox handlers (the auto-rez, auto-accept and
 -- Call of the Wild toggles all relay to peers). Until now nothing decided which came first: if the main
 -- loop happened to relay something before you touched the window, it was fine; if you clicked first, the
 -- delay ran inside the render callback. Do the detection here, on the main thread, where yielding is legal.
+-- mute_relay_echo detects on the way in, so the transport is chosen AND its echo is off before the
+-- priming relay below - which is itself the first line that would otherwise print.
+pcall(mute_relay_echo)
 pcall(function() peer_cmdf(tostring(mq.TLO.Me.Name() or ''), '/echo') end)
 if DI.ladderOff then
     log('\\ar*** CLERIC SAVE LADDER IS OFF *** every save must come from a DI staff. /atladder on to restore.\\ax')
