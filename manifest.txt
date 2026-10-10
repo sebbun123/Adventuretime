@@ -1,4 +1,4 @@
-# AdventureTime manifest - generated 2026-10-09 05:39
+# AdventureTime manifest - generated 2026-10-10 14:33
 # Do not hand-edit the hashes; re-run make-manifest.ps1 instead.
-build	1.20.43
-file	init.lua	976fef8bed517800c0a3cffc78991151f2590b6af7859e054b1927db203adb28
+build	1.21
+file	init.lua	5d9c43a8b95e5b83b7aec7ca4e18225860f3d91c07bb71981bda486685f73d12

@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AdventureTime 1.20  -  group consumable distributor for MacroQuest
+--  AdventureTime 1.21  -  group consumable distributor for MacroQuest
 -- ===========================================================================
 --  Keeps a boxed group topped up on shared consumables (Project Lazarus
 --  "Draught" potions, Orb of Shadows, and Emerald) without hand-trading pots
@@ -76,8 +76,8 @@ local ARGS = { ... }
 AT_ENTRY = AT_ENTRY or 'adventuretime'
 local SHOW_UI = (ARGS[1] ~= 'worker')
 -- VERSION vs BUILD_TAG.
-VERSION = '1.20'
-local BUILD_TAG = '1.20.43'  -- bump on every change; prints on startup
+VERSION = '1.21'
+local BUILD_TAG = '1.21'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_POT_RGB = { 150, 130, 230 }
@@ -10637,6 +10637,7 @@ function burn_colour(st)
 end
 
 -- THE THIRD VIEW: ONE DOT PER TIER, not one per item.
+RUN_ORDER, RUN_SWAP_SECS = {}, 3
 function draw_burn_running()
     -- GROUPED BY CHARACTER.
     local byChar, order = {}, {}
@@ -10659,72 +10660,126 @@ function draw_burn_running()
         return
     end
 
+    -- TILES, LIKE THE GAME'S BUFF WINDOW. One column per character, two icons a row, the time under each
+    -- icon, the name at the head of the column. The icon darkens from the top as its time runs out; the
+    -- last ten seconds get an orange edge. Hover a tile for the burn's full name.
     local fs = 16
-    pcall(function() fs = ImGui.GetFontSize() or 16 end)
-    -- The bars line up across every character, so the label column is measured over ALL of them rather
-    -- than per group - otherwise each character's bars would start at a different x and the lengths
-    -- could not be compared by eye, which is the entire reason for drawing bars.
-    local labelW = 0
-    local iconW = (uiIcons and not ICON.broken) and (math.floor(fs) + 4) or 0
-    pcall(function()
-        for _, c in ipairs(order) do
-            for _, r in ipairs(byChar[c]) do
-                r.short = burn_short_name(r.it, (iconW > 0 and at_icon(r.it)) and MINI_BURN_CHARS or MINI_BURN_CHARS_NOICON)
-                local w = (ImGui.CalcTextSize(r.short) or 0) + ((iconW > 0 and at_icon(r.it)) and iconW or 0)
-                if w > labelW then labelW = w end
-            end
-        end
-    end)
-    labelW = math.min(math.ceil(labelW) + 30, 240)   -- 24: the indent under the name, plus a gap
-    local barW = 100
-    local barH = math.max(9, math.floor(fs * 0.6))
+    pcall(function() fs = math.floor(ImGui.GetFontSize() or 16) end)
+    local ts  = math.floor(ui_icon_size() * 1.15)               -- tile (icon) size
+    local tw  = ts
+    pcall(function() tw = math.max(ts, math.ceil(ImGui.CalcTextSize('0:00') or ts) + 2) end)
+    local gap = 4
+    local flags = (ImGuiTableFlags.SizingFixedFit or 0) + (ImGuiTableFlags.BordersInnerV or 0)
+    local padPushed = pcall(function() ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, 6, 2) end)
+    local opened = ImGui.BeginTable('##burnrun', #order, flags)
+    if not opened then
+        if padPushed then pcall(function() ImGui.PopStyleVar(1) end) end
+        return
+    end
+    for _ = 1, #order do ImGui.TableSetupColumn('') end
 
-    for ci, c in ipairs(order) do
-        if ci > 1 then ImGui.Dummy(1, 3) end
-        local rows = byChar[c]
-        -- Shortest first within the character: the one about to drop is the one you might re-fire.
-        table.sort(rows, function(a, b) return a.left < b.left end)
-        ui_text(UI_LABEL, c .. ':')
-        for _, r in ipairs(rows) do
-            local rgb = r.rgb
-            if not rgb then
-                local br, bg, bb = burn_colour(r.st)
-                rgb = { math.floor(br * 255), math.floor(bg * 255), math.floor(bb * 255) }
+    local function tile(r, c, idx)
+        local x, y = 0, 0
+        pcall(function() x, y = ImGui.GetCursorScreenPos() end)
+        local drew = ui_icon(r.it, nil, ts)
+        if drew then ImGui.SetCursorScreenPos(x, y) end
+        local hov = false
+        ImGui.InvisibleButton('##brt_' .. c .. '_' .. idx, ts, ts)
+        hov = ImGui.IsItemHovered and ImGui.IsItemHovered() or false
+        pcall(function()
+            local dl = ImGui.GetWindowDrawList()
+            local frac = math.max(0, math.min(1, r.left / math.max(1, r.total)))
+            if not drew then
+                dl:AddRectFilled(ImVec2(x, y), ImVec2(x + ts, y + ts), IM_COL32(60, 66, 82, 255), 3)
+                local ab = burn_short_name(r.it, 2)
+                dl:AddText(ImVec2(x + 3, y + (ts - fs) * 0.5), IM_COL32(220, 225, 235, 255), ab)
             end
-            ImGui.Dummy(18, fs)          -- indent, so the discs read as belonging to the name above
-            ImGui.SameLine(24)
-            local hov = false
-            if ui_icon(r.it, nil, math.floor(fs)) then
-                hov = ImGui.IsItemHovered and ImGui.IsItemHovered()
-                ImGui.SameLine(0, 4)
+            -- spent time, darkening down from the top
+            local spent = math.floor(ts * (1 - frac))
+            if spent > 0 then
+                dl:AddRectFilled(ImVec2(x, y), ImVec2(x + ts, y + spent), IM_COL32(0, 0, 0, 165), 0)
             end
-            ImGui.TextColored(0.80, 0.80, 0.80, 1.0, r.short or r.it)
-            hov = hov or (ImGui.IsItemHovered and ImGui.IsItemHovered())
-            if hov then pcall(function() ImGui.SetTooltip(r.it) end) end
-            ImGui.SameLine(labelW)
-            pcall(function()
-                local x, y = ImGui.GetCursorScreenPos()
-                local dl   = ImGui.GetWindowDrawList()
-                local top  = y + math.floor(fs * 0.5) - barH * 0.5
-                dl:AddRectFilled(ImVec2(x, top), ImVec2(x + barW, top + barH), IM_COL32(34, 38, 48, 255), 2)
-                local frac = math.max(0, math.min(1, r.left / math.max(1, r.total)))
-                if frac > 0 then
-                    dl:AddRectFilled(ImVec2(x, top), ImVec2(x + barW * frac, top + barH),
-                                     IM_COL32(rgb[1], rgb[2], rgb[3], 225), 2)
-                end
-                -- THE LAST TEN SECONDS GET AN EDGE. That is when re-firing becomes a decision rather
-                -- than a thing you would do later, so it should look different from merely running.
-                if r.left <= 10 then
-                    dl:AddRect(ImVec2(x, top), ImVec2(x + barW, top + barH),
-                               IM_COL32(255, 236, 160, 220), 2, 0, 1.5)
-                end
-                ImGui.Dummy(barW, fs)
-            end)
-            ImGui.SameLine()
-            ui_text((r.left <= 10) and UI_WAIT or UI_READY,
-                    string.format('%d:%02d', math.floor(r.left / 60), r.left % 60))
+            if r.left <= 10 then
+                dl:AddRect(ImVec2(x, y), ImVec2(x + ts, y + ts), IM_COL32(255, 170, 70, 235), 3, 0, 2)
+            elseif hov then
+                dl:AddRect(ImVec2(x - 1, y - 1), ImVec2(x + ts + 1, y + ts + 1), IM_COL32(255, 255, 255, 120), 3)
+            end
+        end)
+        if hov then
+            pcall(function() ImGui.SetTooltip(string.format('%s\n%s - %d:%02d left', r.it, c,
+                math.floor(r.left / 60), r.left % 60)) end)
         end
     end
+
+    -- names across the top
+    ImGui.TableNextRow()
+    for _, c in ipairs(order) do
+        ImGui.TableNextColumn()
+        local x0, w = 0, 0
+        pcall(function() x0 = ImGui.GetCursorPosX(); w = ImGui.CalcTextSize(c) or 0 end)
+        pcall(function() ImGui.SetCursorPosX(x0 + math.max(0, math.floor((tw * 2 + gap - w) / 2))) end)
+        ui_text(UI_LABEL, c)
+    end
+    ImGui.TableNextRow()
+    for _, c in ipairs(order) do
+        ImGui.TableNextColumn()
+        local rows = byChar[c]
+        -- Shortest first, but STEADY: tiles keep last frame's order and only pass each other when the
+        -- gap is more than RUN_SWAP_SECS, so two burns a second apart do not keep trading places.
+        do
+            local rank = {}
+            for i, n in ipairs(RUN_ORDER[c] or {}) do rank[n] = i end
+            table.sort(rows, function(x, y)
+                local rx, ry = rank[x.it] or 1e9, rank[y.it] or 1e9
+                if rx ~= ry then return rx < ry end
+                if x.left ~= y.left then return x.left < y.left end
+                return x.it < y.it
+            end)
+            local moved = true
+            while moved do
+                moved = false
+                for i = 1, #rows - 1 do
+                    if rows[i + 1].left < rows[i].left - RUN_SWAP_SECS then
+                        rows[i], rows[i + 1] = rows[i + 1], rows[i]
+                        moved = true
+                    end
+                end
+            end
+            local names = {}
+            for i, r in ipairs(rows) do names[i] = r.it end
+            RUN_ORDER[c] = names
+        end
+        local x0 = 0
+        pcall(function() x0 = ImGui.GetCursorPosX() end)
+        for k = 1, #rows, 2 do
+            -- icons
+            for m = 0, 1 do
+                local r = rows[k + m]
+                if r then
+                    if m == 1 then ImGui.SameLine(0, 0) end
+                    pcall(function() ImGui.SetCursorPosX(x0 + m * (tw + gap) + math.floor((tw - ts) / 2)) end)
+                    tile(r, c, k + m)
+                end
+            end
+            -- times under them
+            for m = 0, 1 do
+                local r = rows[k + m]
+                if r then
+                    local t = string.format('%d:%02d', math.floor(r.left / 60), r.left % 60)
+                    local w = tw
+                    pcall(function() w = ImGui.CalcTextSize(t) or tw end)
+                    if m == 1 then ImGui.SameLine(0, 0) end
+                    pcall(function() ImGui.SetCursorPosX(x0 + m * (tw + gap) + math.floor((tw - w) / 2)) end)
+                    ui_text((r.left <= 10) and UI_WAIT or UI_READY, t)
+                end
+            end
+        end
+        -- hold the column at two tiles wide even with one burn, so the names line up under a grid
+        pcall(function() ImGui.SetCursorPosX(x0) end)
+        ImGui.Dummy(tw * 2 + gap, 1)
+    end
+    ImGui.EndTable()
+    if padPushed then pcall(function() ImGui.PopStyleVar(1) end) end
 end
 
 
