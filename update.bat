@@ -84,7 +84,21 @@ try {
     Say "installed : $haveBuild"
     Say "available : $wantBuild"
     Say ""
-    if ($haveBuild -eq $wantBuild) { Say "Already up to date." 'Green'; return }
+    # SAME BUILD IS NOT ENOUGH: a hand-copied init.lua carries the new build number with no modules
+    # folder beside it. Up to date only when every file in the manifest is here with the right hash.
+    $broken = @()
+    foreach ($f in $files) {
+        $p = Join-Path $TargetDir $f.Path
+        if ($f.Sha -eq 'DELETE') { if (Test-Path $p) { $broken += $f.Path }; continue }
+        if (-not (Test-Path $p)) { $broken += $f.Path; continue }
+        if ((Get-FileHash -Path $p -Algorithm SHA256).Hash.ToLower() -ne $f.Sha) { $broken += $f.Path }
+    }
+    if ($haveBuild -eq $wantBuild) {
+        if ($broken.Count -eq 0) { Say "Already up to date." 'Green'; return }
+        Say "Same build, but these files are missing or different - fetching the build again:" 'Yellow'
+        foreach ($b in $broken) { Say "  $b" 'Yellow' }
+        Say ""
+    }
 
     # ---- ALL OR NOTHING ----------------------------------------------------
     # Everything is downloaded and hash-checked before a single file in the
