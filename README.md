@@ -39,9 +39,10 @@ The MacroQuest folder is the folder that contains `lua/` and `config/`.
 
 ## Manual Install
 
-1. Download `init.lua`.
+1. Download `init.lua` and the `modules` folder (`modules/burns.lua`, `modules/coth.lua`).
 2. Create a folder: `lua/adventuretime/`.
-3. Put `init.lua` inside the `adventuretime` folder.
+3. Put `init.lua` and the `modules` folder inside the `adventuretime` folder, so you have
+   `lua/adventuretime/init.lua` and `lua/adventuretime/modules/`.
 4. In game, type:
 
 ```txt

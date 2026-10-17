@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AdventureTime 1.22  -  group consumable distributor for MacroQuest
+--  AdventureTime 1.23  -  group consumable distributor for MacroQuest
 -- ===========================================================================
 --  Keeps a boxed group topped up on shared consumables (Project Lazarus
 --  "Draught" potions, Orb of Shadows, and Emerald) without hand-trading pots
@@ -113,12 +113,12 @@ local ARGS = { ... }
 -- workers it spawns on the rest of the group are started the same way and end up on the same backend.
 AT_ENTRY = AT_ENTRY or 'adventuretime'
 local SHOW_UI = (ARGS[1] ~= 'worker')
+MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
-VERSION = '1.22'
-local BUILD_TAG = '1.22.6'  -- bump on every change; prints on startup
+VERSION = '1.23'
+local BUILD_TAG = '1.23.0'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
-UI_POT_RGB = { 150, 130, 230 }
 UI_SECTION = {
     rez        = { dot = {  95, 165, 230 }, label = { 0.52, 0.70, 0.90 } },  -- blue
     di         = { dot = { 150, 120, 215 }, label = { 0.64, 0.56, 0.85 } },  -- violet
@@ -980,6 +980,14 @@ end
 -- find that out.
 function log(fmt, ...)   -- global (1.22.0): modules use it
     local msg = safe_fmt(fmt, ...)
+    -- WORKERS WRITE TO THE FILE ONLY (1.22.13), apart from red error lines. All five crash dumps from Oct 16-17 are
+    -- one call chain (and the same fault address as July's): MQ2ChatWnd adding a queued line to the MQ chat window -> EQ's
+    -- CStmlWnd::AppendSTML -> a null write inside eqgame.exe. Fewer lines through that window, fewer trips
+    -- through the code that crashes. The driver still echoes; workers are headless and read from the file.
+    if not SHOW_UI and not msg:find('\\ar', 1, true) then
+        log_to_file(msg)
+        return
+    end
     local line = '\\ao[AdventureTime]\\ax ' .. msg
     if line:find('$', 1, true) then
         printf('%s', line)
@@ -3133,8 +3141,6 @@ end
 -- Call of the Wild: the shaman/druid rez AA.
 COTW_AA     = 'Call of the Wild'
 -- SHORT NAMES FOR CHAT.
-REZ_SHORT = { crown = 'Crown', token = 'Token', cotw = 'CotW', divine = 'Divine Rez' }
-function rez_short(kind) return REZ_SHORT[kind or ''] or 'rez' end
 -- Divine Resurrection: the cleric rez AA.
 DIVINE_SPELL = 'Divine Resurrection'
 rezDivine    = true   -- Divine Res fires before CotW and the clickies whenever a holder is up
@@ -3274,12 +3280,27 @@ end
 local buffNameOf = {}   -- watched item/AA name -> the buff/song it applies ('' = none/unresolvable)
 local buffLatch  = {}   -- name -> seconds remaining captured when it went up (held so the push key is stable)
 -- WHERE DOES THIS EFFECT ACTUALLY LIVE?
-burnEffectWhere   = {}   -- watched name -> 'b' (buff table) or 's' (song table)
+burnEffectWhere   = {}   -- watched name -> 'b' (buff table), 's' (song table) or 'd' (the disc slot)
 burnEffectProbeAt = {}   -- watched name -> last time we paid to look in the song table
 BURN_SONG_PROBE_MS = 5000
 
 -- Seconds left on the buff a watched thing applies, or 0. Looks on ME only: a debuff lands on the mob and
 -- so never shows here, which is exactly the filter we want - no TargetType table to keep in step.
+-- WHEN DID THIS COOLDOWN START? (1.22.10) burnReadyAt: the last poll that read it ready. burnCdFrom: that time,
+-- frozen when the cooldown is first seen (false when AT loaded with it already running - nothing to go on).
+-- burnCdSeenAt: when the cooldown was first seen. Disc lines are tracked too, so an item can tell whether the
+-- disc it would claim was started by its own line.
+burnReadyAt, burnCdFrom, burnCdSeenAt, burnDiscCredit = {}, {}, {}, {}
+BURN_DISC_DECIDE_MS = 2500   -- one burn poll after the item's cooldown shows
+function burn_cd_mark(name, ready)
+    if ready then
+        burnReadyAt[name] = mq.gettime()
+        burnCdFrom[name], burnCdSeenAt[name], burnDiscCredit[name] = nil, nil, nil
+    elseif burnCdFrom[name] == nil then
+        burnCdFrom[name] = burnReadyAt[name] or false
+        burnCdSeenAt[name] = mq.gettime()
+    end
+end
 local function my_effect_secs(name, resolver, kind)
     local bn = buffNameOf[name]
     if bn == nil then
@@ -3322,15 +3343,56 @@ local function my_effect_secs(name, resolver, kind)
             end
         end
     end
+    -- A CLICK THAT RUNS AS A DISC (1.22.7): Forsaken Martialist Pants cast "Crystalpalm Discipline", which
+    -- lands in the disc slot, not the buff or song window - 01:49 log: on cooldown, "no buff", running disc
+    -- Crystalpalm Discipline. The duration comes from the spell's own duration.
+    -- ONE DISC RUNS AT A TIME, SO EACH START BELONGS TO ONE LINE (1.22.10). The Pants cast "Crystalpalm
+    -- Discipline", and Lunafeet also has the Crystalpalm line. If both went on cooldown and Crystalpalm
+    -- started once, one of them was refused - and it is the item: a refused disc line keeps its cooldown,
+    -- a refused click burns it. So the line wins: the item counts only when the disc started after the item
+    -- was last read ready, and no same-named disc line went on cooldown at that start. Decided one poll
+    -- after the item's cooldown shows, so the line's own cooldown has been read too. No delays needed.
+    if rem <= 0 then
+        local ad = ''
+        pcall(function() ad = tostring(mq.TLO.Me.ActiveDisc.Name() or '') end)
+        local mine = burnDiscCredit[name]
+        local now = mq.gettime()
+        -- Both waits matter: the line's cooldown is read on the burn poll too, up to 2s after its disc starts.
+        if ad ~= '' and ad == bn and mine == nil and discWatch and discWatch.name == ad
+           and (now - (burnCdSeenAt[name] or now)) >= BURN_DISC_DECIDE_MS
+           and (now - (discWatch.at or now)) >= BURN_DISC_DECIDE_MS then
+            local from = burnCdFrom[name]
+            local lineSeen = burnCdSeenAt[bn]
+            local lineOwns = (bn ~= name) and burnCdFrom[bn] ~= nil and lineSeen ~= nil
+                and lineSeen >= (discWatch.at or 0) - 2500 and lineSeen <= (discWatch.at or 0) + 3000
+            if lineOwns then
+                mine = false
+                rezlog('[burns] %s: %s was started by its own line - this click did not start it', name, ad)
+            elseif from and (discWatch.at or 0) > from then
+                mine = true
+            elseif from == false then
+                mine = false
+                rezlog('[burns] %s: its cooldown was already running when AT started - cannot tell whether it started %s', name, ad)
+            else
+                mine = false
+                rezlog('[burns] %s: %s was already running before this click - the click did not start it', name, ad)
+            end
+            burnDiscCredit[name] = mine
+        end
+        if ad ~= '' and ad == bn and mine then
+            pcall(function() rem = tonumber(mq.TLO.Spell(bn).MyDuration.TotalSeconds()) or 0 end)
+            if rem <= 0 then pcall(function() rem = tonumber(mq.TLO.Spell(bn).Duration.TotalSeconds()) or 0 end) end
+            if rem <= 0 then rem = 1 end
+            if burnEffectWhere[name] ~= 'd' then
+                burnEffectWhere[name] = 'd'
+                rezlog('[burns] %s runs as a disc (%s) - now tracked', name, bn)
+            end
+        end
+    end
     if rem <= 0 then buffLatch[name] = nil; return 0 end
     if not buffLatch[name] then buffLatch[name] = rem end   -- latch so dsecs doesn't churn the push key
     return buffLatch[name]
 end
--- Off by default: see the note in the disc branch of ability_state. Flip to true to restore disc
--- countdowns once the client crashes are understood.
-DISC_TIME_LEFT = false
-
--- A SWITCH TO TEST THE CRASH, not a feature.
 local DISC_TICK_SECS = 6   -- MQ spell durations are in ticks; if disc countdowns read 6x too long, set this to 1
 ABILITY_MISS_MS = 30000
 local function ability_state(name)
@@ -3348,6 +3410,7 @@ local function ability_state(name)
     if it then pcall(function() isItem = (tonumber(it.ID()) or 0) > 0 end) end
     if isItem then
         local t = 0; pcall(function() t = tonumber(it.TimerReady()) or 0 end)
+        burn_cd_mark(name, t <= 0)
         -- ONLY LOOK FOR THE EFFECT WHILE THE THING THAT GRANTS IT IS ON COOLDOWN.
         local ds = 0
         if t > 0 then
@@ -3373,6 +3436,7 @@ local function ability_state(name)
     end
     if isAA then
         -- Same rule as items: a ready AA has not been fired, so nothing it grants can be running.
+        burn_cd_mark(name, aaRdy)
         local ds = 0
         if not aaRdy then
             ds = my_effect_secs(name, function() return mq.TLO.Me.AltAbility(name).Spell.Name() end, 'a')
@@ -3392,10 +3456,12 @@ local function ability_state(name)
         local active = false; pcall(function() active = (tostring(mq.TLO.Me.ActiveDisc.Name() or '') == name) end)
         local dsecs = 0
         if active then
-            -- DISC COUNTDOWN IS OFF BY DEFAULT - deliberately, pending a crash investigation.
-            if DISC_TIME_LEFT then
-                dsecs = my_effect_secs(name, function() return mq.TLO.Spell(name).Name() end, 'd')
-            end
+            -- NOT A CRASH SUSPECT. The disc countdown was switched off on 2026-07-28 on suspicion of the
+            -- ACCESS_VIOLATIONs; four dumps then landed with it OFF (2026-08-01 03:54, 14:50, 14:51, 15:51),
+            -- all at the same fault address, a null-pointer write inside eqgame.exe. The 15:51 one caught the
+            -- toon idle - out of combat, not zoning, not casting. The open lead from then: buff/song reads
+            -- while out-of-combat rebuffs rewrite the tables. The switch is gone (1.22.7): it only ever
+            -- looked for the disc in the buff and song windows, where a disc never is.
             -- MyDuration is YOUR duration (level/focus applied) and is a ticktype, so .TotalSeconds
             -- gives seconds outright; base Duration in ticks is the last resort.
             if dsecs <= 0 then pcall(function() dsecs = tonumber(mq.TLO.Spell(name).MyDuration.TotalSeconds()) or 0 end) end
@@ -3403,7 +3469,10 @@ local function ability_state(name)
             if dsecs <= 0 then pcall(function() dsecs = (tonumber(mq.TLO.Spell(name).Duration()) or 0) * DISC_TICK_SECS end) end
         end
         local rdy = false; pcall(function() rdy = tlo_true(mq.TLO.Me.CombatAbilityReady(name)()) end)
-        if rdy then return true, true, 0, active, dsecs, 'd' end
+        burn_cd_mark(name, rdy)
+        -- A READY DISC IS NOT THE ONE RUNNING (1.22.10): the same name can be running from a click (the Pants
+        -- cast Crystalpalm Discipline), and that must not mark the Crystalpalm line as fired.
+        if rdy then return true, true, 0, false, 0, 'd' end
         local secs = -1; pcall(function() secs = tonumber(mq.TLO.Me.CombatAbilityTimer(name).TotalSeconds()) or -1 end)
         return true, false, (secs and secs > 0 and secs or -1), active, dsecs, 'd'
     end
@@ -3473,7 +3542,8 @@ function pot_buff_read(base)
             end
         end
         if gp.find then
-            local found, ok = '', pcall(function() found = tostring(mq.TLO.Me.FindBuff('name ' .. gp.find).Name() or '') end)
+            local found = ''
+            local ok = pcall(function() found = tostring(mq.TLO.Me.FindBuff('name ' .. gp.find).Name() or '') end)
             if ok and found ~= '' and found ~= 'NULL' then potBuffName[base] = found; return done(dur(found)) end
         end
         return done(0)
@@ -3499,7 +3569,10 @@ function pot_buff_read(base)
     local key = base:gsub('^Draught of ', '')      -- 2) a buff named after the draught
     -- ONE LOOKUP, not a walk: FindBuff searches by name for us. Only if this build cannot answer it at
     -- all does it fall back to reading the slots.
-    local found, ok = '', pcall(function() found = tostring(mq.TLO.Me.FindBuff('name ' .. key).Name() or '') end)
+    -- (1.23) `local found, ok = '', pcall(function() found = ... end)` never worked: the closure is built
+    -- before the local exists, so it wrote a global and this always read ''. Declared first now.
+    local found = ''
+    local ok = pcall(function() found = tostring(mq.TLO.Me.FindBuff('name ' .. key).Name() or '') end)
     if ok then
         if found ~= '' and found ~= 'NULL' then potBuffName[base] = found; return done(dur(found)) end
         return done(0)
@@ -7378,7 +7451,6 @@ pcall(function()
         pcall(function() sweep(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
         -- ALWAYS, WHATEVER WE THINK.
         pcall(function() mq.cmd('/makemevis') end)
-        invisLast = ''   -- force a fresh report so the coverage row updates at once
         if #gone > 0 then log('[invis] dropped: %s (+ /makemevis)', table.concat(gone, ', '))
         else log('[invis] no known invis buff to remove - sent /makemevis anyway') end
     end)
@@ -8260,6 +8332,14 @@ end
         burnWarn[char] = burnWarn[char] or {}
         burnWarn[char][item] = (warn:gsub('~', ' '))
     end)
+    -- the spell a burn line casts, for the hover (1.22.15): sent once, with its first report
+    mq.bind('/at_burnspell', function(char, spell, ...)
+        if not char or not spell then return end
+        local item = table.concat({...}, ' ')
+        if item == '' then return end
+        burnSpell[char] = burnSpell[char] or {}
+        burnSpell[char][item] = (spell:gsub('~', ' '))
+    end)
 end)
 
 -- Declared with the other persisted flags rather than here, so save_settings and load_settings - which
@@ -8406,7 +8486,7 @@ pcall(function()
         -- A FLOOR HERE TOO, not just on the driver.
         if (mq.gettime() - lastResyncHonored) < 10000 then return end
         lastResyncHonored = mq.gettime()
-        burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}; tribLast = nil
+        burnLast = {}; burnPending = {}; buffNameOf = {}; buffLatch = {}; tribLast = nil; burnSpellCache = {}
         potLast = {}; healLast = {}; cureLast = {}; magicLast = {}
         -- THREE THAT WERE MISSING, and they are missing in the same way: each push is change-gated on a
         -- key that survived the resync, so the driver heard nothing about them until the value happened
@@ -9135,7 +9215,6 @@ dcGiveWant      = nil     -- set by the Diamond Coin Give button; the MAIN LOOP 
 altCurRefresh   = nil     -- when to re-read balances after a withdraw
 miniMagic       = false   -- show the magic protection clicky buttons in the mini window
 miniBurnView    = 1       -- burns section: 0 = compact, 1 = tier matrix, 2 = full detail table
-miniBurnTable   = false   -- LEGACY, kept only so an old settings file can be migrated below
 -- Who appears first, left to right. Separate from rezPriority on purpose: that is who gets RESSED
 -- first, which is a different question from who you want to read first. Empty = plain group order.
 charOrder       = {}
@@ -9780,7 +9859,7 @@ POP_ICON_W = nil
 
 -- HOW FAR RIGHT THE ICON MAY SIT, per window. Keyed by window ('mini', or the panel number) because
 -- each one is a different width.
-POP_RIGHT = {}; WIN_LATCH = {}
+WIN_LATCH = {}
 
 -- WIDTH THAT GROWS AT ONCE AND SHRINKS ON PURPOSE. The mini and the pop-outs size themselves to their
 -- content, and their content changes width all the time: a timer appears and goes, a name button turns
@@ -9940,6 +10019,20 @@ function draw_burn_running()
         end
         -- Draughts are not here any more: they have their own strip under the Draughts buttons.
     end
+    -- SHRINK WHEN IT EMPTIES (1.22.14). Windows only get narrower on a shape change or every 30s (the
+    -- WIN_LATCH rule), and a burn ending is not one - the pop-out kept its widest size until it was closed
+    -- and popped out again. A character column coming or going, or the burn check opening or closing, now
+    -- counts as a shape change. Not the timers: those change every second.
+    local chk = -1
+    if BURNCHK then
+        chk = 0
+        for _, ch in ipairs(BURNCHK.order or {}) do
+            if next((BURNCHK.pending or {})[ch] or {}) or next((BURNCHK.nobuff or {})[ch] or {}) then chk = chk + 1 end
+        end
+    end
+    local shape = #order .. '|' .. chk
+    if RUN_SHAPE ~= nil and RUN_SHAPE ~= shape then WIN_LATCH = {} end
+    RUN_SHAPE = shape
     if #order == 0 then
         -- Nothing running is the normal state, and it should read as calm rather than as an error.
         if BURNCHK then draw_burncheck() return end
@@ -9981,7 +10074,7 @@ function draw_burn_running()
         ImGui.SameLine()
         ui_text((r.left <= 10) and UI_WAIT or UI_READY, string.format('%d:%02d', math.floor(r.left / 60), r.left % 60))
         if hov or ui_tip_hover() then
-            pcall(function() ImGui.SetTooltip(string.format('%s\n%s - %d:%02d left', r.it, c,
+            pcall(function() ImGui.SetTooltip(string.format('%s\n%s - %d:%02d left', burn_tip(c, r.it), c,
                 math.floor(r.left / 60), r.left % 60)) end)
         end
     end
@@ -15377,8 +15470,6 @@ INVIS_CAST_MAX = 3000
 -- Least time E3 stays paused after the cast goes out, whatever Me.Casting says.
 INVIS_HOLD_MIN = 2500
 invisFiredAt   = 0
--- Vestigial: it was the change key for the push that no longer happens.
-invisLast  = ''
 
 -- Me.Invis[NORMAL] and Me.Invis[UNDEAD] return nothing on this build - only the bare Me.Invis answers.
 INVIS_ALSO = {
@@ -16239,7 +16330,7 @@ function draw_burn_table(filter)
                     -- The timer slot is held open only in a column that has a timer somewhere in it; a
                     -- column of nothing but ready burns needs no room for one.
                     if stamp == '' and not burnColStamp then
-                        if hov then pcall(function() ImGui.SetTooltip(it) end) end
+                        if hov then pcall(function() ImGui.SetTooltip(burn_tip(nil, it, st)) end) end
                         return
                     end
                     ImGui.SameLine(0, 5)
@@ -16252,7 +16343,7 @@ function draw_burn_table(filter)
                     else
                         ImGui.Dummy(BURN_STAMP_W, 1)
                     end
-                    if hov then pcall(function() ImGui.SetTooltip(it) end) end
+                    if hov then pcall(function() ImGui.SetTooltip(burn_tip(nil, it, st)) end) end
                     return
                 end
                 -- Measure so the name gets exactly the leftover width. If this ImGui build doesn't
@@ -16286,7 +16377,7 @@ function draw_burn_table(filter)
                         ImGui.TextColored(cr, cg, cb, 1.0, stamp)
                     end
                 end
-                if ui_tip_hover() then pcall(function() ImGui.SetTooltip(it) end) end   -- full name on hover
+                if ui_tip_hover() then pcall(function() ImGui.SetTooltip(burn_tip(nil, it, st)) end) end   -- full name + what it casts
             end
             -- Each character's column flows independently: its own tier headings, its own items, no
             -- blank padding to line up with whoever has the most.
@@ -16398,7 +16489,7 @@ function pop_place(key, panel)
     end
     -- Every window involved just changed what it contains, so the latched right edge is stale. Drop it
     -- all and let the next frame measure the real content again - see pop_align.
-    POP_RIGHT = {}; WIN_LATCH = {}
+    WIN_LATCH = {}
 end
 POP_PANELS = 8       -- room to pop several out individually and still merge some together
 
@@ -16643,7 +16734,7 @@ local function render()
             if shape ~= miniShapeKey then
                 miniShapeKey = shape
                 if miniShapeKey ~= nil then miniSizeWanted = true end
-                POP_RIGHT = {}; WIN_LATCH = {}
+                WIN_LATCH = {}
             end
         end
         if miniSizeWanted then
@@ -16723,7 +16814,7 @@ local function render()
                             miniFold[k] = (not folded) or nil
                             -- Folding usually removes the widest thing in the window, and the latched
                             -- right edge cannot see that on its own. Drop it - see pop_align.
-                            POP_RIGHT = {}; WIN_LATCH = {}
+                            WIN_LATCH = {}
                             save_settings()
                         end
                         if ui_tip_hover() then
@@ -16913,7 +17004,7 @@ local function render()
                             g = math.max(1, math.min(12, math.floor(tonumber(g) or 8)))
                             if g ~= cur then
                                 pacGem[nm:lower()] = g
-                                dirty = true
+                                save_settings()   -- (1.23) was `dirty = true`, which nothing read
                                 pcall(function() peer_bcast('/at_pacgem %s %d', nm, g) end)
                             end
                             if ui_tip_hover() then
@@ -16967,7 +17058,7 @@ local function render()
                 end
                 do
                     if ui_toggle('##ui_wide', uiWideButtons) then
-                        uiWideButtons = not uiWideButtons; save_settings(); POP_RIGHT = {}; WIN_LATCH = {}
+                        uiWideButtons = not uiWideButtons; save_settings(); WIN_LATCH = {}
                     end
                     ImGui.SameLine(); ImGui.Text('Line up name buttons')
 
@@ -16977,7 +17068,7 @@ local function render()
                     end
                 end
                 do
-                    if ui_toggle('##ui_icons', uiIcons) then uiIcons = not uiIcons; save_settings(); POP_RIGHT = {}; WIN_LATCH = {} end
+                    if ui_toggle('##ui_icons', uiIcons) then uiIcons = not uiIcons; save_settings(); WIN_LATCH = {} end
                     ImGui.SameLine(); ImGui.Text('EverQuest icons')
                     if ui_tip_hover() then
                         pcall(function() ImGui.SetTooltip(
@@ -17285,7 +17376,7 @@ local function render()
                                 if miniBurnView ~= wasV then
                                     -- RESIZE ON EVERY SWITCH, not only on the way into detail.
                                     miniSizeWanted = true
-                                    POP_RIGHT = {}; WIN_LATCH = {}
+                                    WIN_LATCH = {}
                                     dirty = true
                                 end
                             end
@@ -18705,6 +18796,13 @@ while running do
             atAliveAt = mq.gettime()
             pcall(at_alive_touch)
         end
+        -- EMPTY THE MQ CHAT WINDOW NOW AND THEN, ON WORKERS (1.22.13). It holds 700 lines; once full, every
+        -- new line also makes EQ trim the oldest, inside the AppendSTML call the crash dumps die in. Kept
+        -- short of full, that trim never runs. Unproven as a fix - it costs one command an hour.
+        if not SHOW_UI and MQCLEAR_EVERY_MS > 0 and (mq.gettime() - (mqClearAt or 0)) > MQCLEAR_EVERY_MS then
+            mqClearAt = mq.gettime()
+            pcall(function() mq.cmd('/mqclear') end)
+        end
         atphase('invis'); pcall(invis_fire_tick)
         -- Bag counts, pushed. Change-gated so a stable inventory costs nothing, with a slow keepalive so
         -- a driver that restarted still gets a picture without asking.
@@ -18896,6 +18994,11 @@ while running do
                 local w = (d.warn:gsub(' ', '~'))
                 if driverName then peer_cmdf(driverName, '/at_burnwarn %s %s %s', myName, w, nm)
                 else peer_bcast('/at_burnwarn %s %s %s', myName, w, nm) end
+            end
+            if d.spell and d.spell ~= '' then
+                local sp = (d.spell:gsub(' ', '~'))
+                if driverName then peer_cmdf(driverName, '/at_burnspell %s %s %s', myName, sp, nm)
+                else peer_bcast('/at_burnspell %s %s %s', myName, sp, nm) end
             end
             sent = sent + 1
             if sent >= 1 then break end
@@ -19118,10 +19221,13 @@ while running do
                         burnWarn[myName][name] = warn
                         burnExpect[myName] = burnExpect[myName] or {}
                         burnExpect[myName][name] = entry.expect or nil
+                        burnSpell[myName] = burnSpell[myName] or {}
+                        burnSpell[myName][name] = burn_spell_of(name, kind)
                     else              -- queue it; the drain below spreads the burst over a second or so
                         burnPending[name] = { tier = tier, secs = secs, av = (active and 1 or 0), dsecs = math.floor(dsecs or 0), kind = kind, ord = ord, tkey = (keyList:gsub(' ', '~')),   -- '~' so 'Quick Burn' survives arg splitting
                                               warn = (prev == nil) and warn or nil,
-                                              expect = (prev == nil) and entry.expect or nil }
+                                              expect = (prev == nil) and entry.expect or nil,
+                                              spell = ((prev == nil) and burn_spell_of(name, kind)) or (burnPending[name] or {}).spell }
                     end
                 end
             end
@@ -19660,6 +19766,7 @@ pcall(function() mq.unbind('/atnv') end)
 pcall(function() mq.unbind('/atburnaudit') end)
 pcall(function() mq.unbind('/atburncheck') end)
 pcall(function() mq.unbind('/at_burnwarn') end)
+pcall(function() mq.unbind('/at_burnspell') end)
 pcall(function() mq.unbind('/at_burnexp') end)
 pcall(function() mq.unbind('/atrange') end)
 pcall(function() mq.unbind('/atreclaim') end)
