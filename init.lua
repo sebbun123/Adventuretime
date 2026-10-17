@@ -1,5 +1,5 @@
 -- ===========================================================================
---  AdventureTime 1.21  -  group consumable distributor for MacroQuest
+--  AdventureTime 1.22  -  group consumable distributor for MacroQuest
 -- ===========================================================================
 --  Keeps a boxed group topped up on shared consumables (Project Lazarus
 --  "Draught" potions, Orb of Shadows, and Emerald) without hand-trading pots
@@ -114,8 +114,8 @@ local ARGS = { ... }
 AT_ENTRY = AT_ENTRY or 'adventuretime'
 local SHOW_UI = (ARGS[1] ~= 'worker')
 -- VERSION vs BUILD_TAG.
-VERSION = '1.21'
-local BUILD_TAG = '1.22.5'  -- bump on every change; prints on startup
+VERSION = '1.22'
+local BUILD_TAG = '1.22.6'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_POT_RGB = { 150, 130, 230 }
@@ -8388,6 +8388,8 @@ pcall(function()
     end)
     -- E3 REFUSING A CAST.
     mq.event('at_e3_refused', '#*#CheckFor#*#', function(line)
+        -- NOT CHAT (1.22.6): someone in guild chat asking about CheckFor matched this on all six.
+        if tostring(line or ''):find(", '", 1, true) then return end
         rezlog('[di] E3 refused a cast: %s', tostring(line or '?'))
     end)
     mq.event('at_di_blocked', 'Your #1# did not take hold on #2#.#*#', function(line, spell, who)
