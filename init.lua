@@ -37,6 +37,33 @@
 --  a different server or consumable set. Provided as-is; have fun out there.
 -- ===========================================================================
 
+-- THE WHOLE RUN, CAUGHT (1.21.1). An error used to go only to the MQ console and the character simply
+-- stopped (1.20.46 logs: Lunafeet, Stylin and Sunetoo each went silent with no last word, and the driver
+-- restarted them minutes later). The file runs itself once more inside xpcall, so the traceback lands in the
+-- AT log as well; the error still stops the script as before. Globals only: the main chunk is at Lua's
+-- 200-local ceiling, and the main loop cannot be a function (more than 60 upvalues). If loadfile is not
+-- there, it simply runs as it always did.
+if not AT_RUN_WRAPPED and type(loadfile) == 'function' and type(xpcall) == 'function' then
+    AT_RUN_WRAPPED = true
+    AT_RUN_SRC = tostring((debug.getinfo(1, 'S') or {}).source or ''):gsub('^@', '')
+    AT_RUN_CHUNK = (AT_RUN_SRC ~= '') and loadfile(AT_RUN_SRC) or nil
+    if AT_RUN_CHUNK then
+        AT_RUN_OK, AT_RUN_ERR = xpcall(AT_RUN_CHUNK, debug.traceback, ...)
+        if not AT_RUN_OK then
+            pcall(function()
+                local f = AT_LOG_FILE_PATH and io.open(AT_LOG_FILE_PATH, 'a')
+                if f then
+                    f:write(os.date('[%H:%M:%S] ') .. '[error] AdventureTime stopped on an error: ' .. tostring(AT_RUN_ERR) .. '\n')
+                    f:close()
+                end
+            end)
+            pcall(function() print('\ar[AdventureTime] stopped on an error - the traceback is in the AT log\ax') end)
+            error(AT_RUN_ERR, 0)
+        end
+        return
+    end
+end
+
 local mq    = require('mq')
 
 -- =========================================================================== WHICH HANDLER IS
@@ -65,6 +92,17 @@ do
 end
 
 local ImGui = require('ImGui')
+-- MODULES (1.22.0). Parts of AdventureTime live in modules/ next to this file, each loaded in place with
+-- at_module(name) - where its code used to sit in this file. They share state through globals (this chunk is at
+-- Lua's 200-local ceiling; a local here cannot be seen from another file).
+AT_SRC_DIR = (AT_RUN_SRC and AT_RUN_SRC ~= '' and AT_RUN_SRC or (tostring((debug.getinfo(1, 'S') or {}).source or ''):gsub('^@', '')))
+AT_SRC_DIR = AT_SRC_DIR:match('^(.*[/\\])') or ''
+function at_module(name)
+    local path = AT_SRC_DIR .. 'modules/' .. name .. '.lua'
+    local chunk, err = loadfile(path)
+    if not chunk then error('AdventureTime: cannot load ' .. path .. ' (' .. tostring(err) .. ') - is the modules folder there?', 0) end
+    return chunk()
+end
 
 local scriptName = 'AdventureTime'
 -- A human-launched instance shows the UI and drives; instances the driver auto-starts get the
@@ -77,7 +115,7 @@ AT_ENTRY = AT_ENTRY or 'adventuretime'
 local SHOW_UI = (ARGS[1] ~= 'worker')
 -- VERSION vs BUILD_TAG.
 VERSION = '1.21'
-local BUILD_TAG = '1.21'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.22.5'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_POT_RGB = { 150, 130, 230 }
@@ -743,6 +781,7 @@ do
     local who = '?'
     pcall(function() who = mq.TLO.Me.Name() or '?' end)
     LOG_FILE_PATH = (dir or '') .. 'AdventureTime_' .. who .. '_log.txt'
+    AT_LOG_FILE_PATH = LOG_FILE_PATH   -- for the run's error catch at the top of the file (1.21.1)
     -- The old crash breadcrumb file is gone; clear any copy left from earlier builds.
     pcall(os.remove, (dir or '') .. 'AdventureTime_' .. who .. '_lastphase.txt')
     -- KEEP THE PREVIOUS RUNS.
@@ -939,7 +978,7 @@ end
 -- The '$' guard is because /echo expands ${...} before printing. Nothing here should contain one, but
 -- an item or mob name is not ours to vouch for, and a stray TLO expansion in a log line is a bad way to
 -- find that out.
-local function log(fmt, ...)
+function log(fmt, ...)   -- global (1.22.0): modules use it
     local msg = safe_fmt(fmt, ...)
     local line = '\\ao[AdventureTime]\\ax ' .. msg
     if line:find('$', 1, true) then
@@ -950,7 +989,7 @@ local function log(fmt, ...)
     end
     log_to_file(msg)
 end
-local function rezlog(fmt, ...)   -- file-only (keeps the [rez] chatter out of the MQ window)
+function rezlog(fmt, ...)   -- file-only (keeps the [rez] chatter out of the MQ window)
     log_to_file(safe_fmt(fmt, ...))
 end
 
@@ -1795,7 +1834,7 @@ function peer_detect()
     return peerChan
 end
 
-local function peer_cmdf(char, fmt, ...)
+function peer_cmdf(char, fmt, ...)
     net_count(fmt)
     if not peerChan then peer_detect() end
     if not peerChan then return end
@@ -1806,7 +1845,7 @@ local function peer_cmdf(char, fmt, ...)
     elseif peerChan == 'eqbc' then mq.cmdf('/bct %s /%s', char, cmd)
     else mq.cmdf('/dex %s %s', char, cmd) end
 end
-local function peer_bcast(fmt, ...)   -- broadcast to the whole in-game group in ONE relay (5x less window spam than looping /dex)
+function peer_bcast(fmt, ...)   -- broadcast to the whole in-game group in ONE relay (5x less window spam than looping /dex)
     net_count(fmt)
     if not peerChan then peer_detect() end
     if not peerChan then return end
@@ -1842,7 +1881,7 @@ GROUP_MEMO_MS = 1000
 -- global or hang off an existing table.
 GROUP_MEMO_AT, GROUP_MEMO_VAL = 0, nil
 
-local function group_members()
+function group_members()
     if GROUP_MEMO_VAL and (mq.gettime() - GROUP_MEMO_AT) < GROUP_MEMO_MS then
         return GROUP_MEMO_VAL
     end
@@ -1875,7 +1914,7 @@ end
 -- Counts. Own count is local; a peer's count comes from its pushed report, else a live DanNet query of
 -- FindItemCount, else (E3/EQBC) the /at_count_multi batch reply (bags, i.e. what can actually be traded).
 -- ---------------------------------------------------------------------------
-local myName = mq.TLO.Me.Name() or ''
+myName = mq.TLO.Me.Name() or ''   -- global (1.22.0): modules use it
 
 -- ===== EVERQUEST ICONS =====
 -- The game's own item and spell icons, drawn through MacroQuest's texture animations: 'A_DragItem' for
@@ -3065,7 +3104,7 @@ burnSumAt   = {}   -- driver: char -> { updated = when its last digest arrived }
 local function burnQueueLen() local n = 0; for _ in pairs(burnPending) do n = n + 1 end; return n end
 local discWatch      = nil   -- { name=, at=, expected= } : the disc currently running, for the fade log
 local lastDiscPoll   = 0
-local burnState      = {}    -- driver: burnState[char][item] = { secs=, updated= }
+burnState      = {}    -- driver: burnState[char][item] = { secs=, updated= }
 local driverName     = (not SHOW_UI) and ARGS[2] or nil   -- worker: driver name passed at launch (fallback: /at_ping)
 local tributeState   = {}   -- name -> {active=bool, favor=num, updated=} : pushed by peers, never queried
 local burnClass      = {}     -- driver: char -> class short name (for the role filter)
@@ -3316,6 +3355,7 @@ local function ability_state(name)
         else
             buffLatch[name] = nil       -- ready again: whatever it granted is done
         end
+        if burn_nobuff_diag then burn_nobuff_diag(name, t, ds, it) end   -- 1.22.3: why a buff item showed no buff
         abilityKind[name] = 'i'
         return true, (t == 0), t, (ds > 0), ds, 'i'
     end
@@ -3608,244 +3648,7 @@ function pot_state(base)
     return carries, up, secs, dsecs
 end
 
--- Parse THIS toon's own [Burn] 5minBurn lines from its E3 INI -> bare names (strip the /...
-local function e3_path_override()
-    local dir
-    local ok, src = pcall(function() return debug.getinfo(1, 'S').source end)
-    if ok and src then dir = tostring(src):gsub('^@', ''):match('^(.*[/\\])') end
-    local fh = io.open((dir or '') .. 'AdventureTime_e3path.txt', 'r')
-    if not fh then return nil end
-    local line = fh:read('*l'); fh:close()
-    if not line then return nil end
-    line = line:gsub('^%s+', ''):gsub('%s+$', ''):gsub('[/\\]+$', '')
-    if line == '' or line:sub(1, 1) == ';' then return nil end
-    return line
-end
-
--- Last resort when none of the guessed paths hit: LOOK for the file.
-local function find_e3_ini(who, roots)
-    local ok, lfs = pcall(require, 'lfs')
-    if not ok or type(lfs) ~= 'table' then return nil end
-    local SKIP = { resources = true, logs = true, icons = true, images = true, temp = true,
-                   cache = true, ['.git'] = true, backup = true, backups = true, fonts = true }
-    local MAX_DIRS, MAX_DEPTH, seen = 600, 4, 0
-
-    local function walk(dir, depth)
-        if depth > MAX_DEPTH or seen > MAX_DIRS then return nil end
-        seen = seen + 1
-        local okIt, it = pcall(function() return lfs.dir(dir) end)
-        if not okIt or not it then return nil end
-        -- Match ANY <Char>_*.ini rather than one exact name. The server suffix differs between
-        -- machines ('Lazarus' vs 'Project Lazarus'), and globbing sidesteps that entirely.
-        local pat = '^' .. who:lower():gsub('%W', '%%%0') .. '_.+%.ini$'
-        local subs, hitFile = {}, nil
-        local okScan = pcall(function()
-            for entry in it do
-                if entry ~= '.' and entry ~= '..' then
-                    local p = dir .. '\\' .. entry
-                    local a
-                    pcall(function() a = lfs.attributes(p) end)
-                    if a and a.mode == 'directory' then
-                        if not SKIP[entry:lower()] then subs[#subs + 1] = p end
-                    elseif not hitFile and entry:lower():match(pat) then
-                        hitFile = entry
-                    end
-                end
-            end
-        end)
-        if not okScan then return nil end
-        if hitFile then return dir, hitFile end
-        for _, sd in ipairs(subs) do
-            local hit, hf = walk(sd, depth + 1)   -- both values: capturing only the dir loses the name
-            if hit then return hit, hf end
-        end
-        return nil
-    end
-
-    for _, r in ipairs(roots) do
-        if r and r ~= '' then
-            local hit, hitFile = walk((r:gsub('[/\\]+$', '')), 1)
-            if hit then return hit, hitFile end
-        end
-    end
-    return nil
-end
-
--- Remember a discovered folder so the next load takes the fast path instead of walking again.
-local function write_e3_path(dir)
-    local d
-    local ok, src = pcall(function() return debug.getinfo(1, 'S').source end)
-    if ok and src then d = tostring(src):gsub('^@', ''):match('^(.*[/\\])') end
-    local fh = io.open((d or '') .. 'AdventureTime_e3path.txt', 'w')
-    if not fh then return end
-    fh:write('; found automatically - delete this file to search again\n')
-    fh:write(dir .. '\n')
-    fh:close()
-end
-
-
--- AT'S OWN BURN LIST, per toon, in the Settings folder.
-function burn_file_path()
-    local base = (AT_MODULE_DIR ~= nil and AT_MODULE_DIR ~= '') and (AT_MODULE_DIR .. 'Settings\\') or ''
-    if base == '' then
-        local cfg = ''
-        pcall(function() cfg = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-        base = (cfg ~= '') and (cfg .. '\\') or ''
-    end
-    return base .. 'adventuretime_burns_' .. ((myName ~= '') and myName or 'unknown') .. '.txt'
-end
-BURN_FILE_USED = nil   -- path the current BURN_WATCH came from, for the Burns tab
-
-function burn_file_write_template(path)
-    local fh = io.open(path, 'w')
-    if not fh then return false end
-    fh:write('; AdventureTime burn list for ' .. myName .. '\n')
-    fh:write('; One line per ability the Burns tab should watch: <tier>=<exact item, AA or spell name>\n')
-    fh:write('; Tiers are listed in the order they first appear. Lines starting with ; are ignored.\n')
-    fh:write('; RGMercs: open its Rotations window, find the Burn rotation, and copy the names here.\n')
-    fh:write('; Save, then press Reload INIs on the Burns tab.\n')
-    fh:write('[Burn]\n')
-    fh:write(';Quick Burn=Some Clicky Name\n')
-    fh:write(';Long Burn=Some AA Name\n')
-    fh:close()
-    return true
-end
-
-local function parse_burns()
-    local own = burn_file_path()
-    local of = io.open(own, 'r')
-    if of then
-        local list = parse_burn_file(of, own)
-        -- AN EMPTY LIST DOES NOT SHADOW THE INI.
-        if (list and #list > 0) or cast_backend() ~= 'e3' then
-            BURN_FILE_USED = own
-            return list
-        end
-        log('[burns] %s has no active lines - reading the E3 ini instead', path_show(own))
-        return parse_burns_e3()
-    end
-    if cast_backend() ~= 'e3' then
-        -- RGMercs build with no list yet: leave a template where the person will look, say so once.
-        BURN_FILE_USED = nil
-        if burn_file_write_template(own) then
-            log('\\ay[burns] no burn list yet - wrote a template to %s. Fill it in and press Reload INIs.\\ax',
-                path_show(own))
-        else
-            log('\\ay[burns] no burn list at %s and could not create one\\ax', path_show(own))
-        end
-        return nil
-    end
-    return parse_burns_e3()
-end
-
-function parse_burns_e3()
-    -- The server TLO is NOT reliable for this: it returns 'Lazarus' on one machine and 'Project
-    -- Lazarus' on another, and E3 names the file after the short form.
-    local srv = ''
-    pcall(function() srv = tostring(mq.TLO.MacroQuest.Server() or '') end)
-    if srv == 'NULL' then srv = '' end
-    local fnames, fseen = {}, {}
-    local function addfn(v)
-        if v and v ~= '' then
-            local nm = myName .. '_' .. v .. '.ini'
-            if not fseen[nm] then fseen[nm] = true; fnames[#fnames + 1] = nm end
-        end
-    end
-    addfn(srv)                                   -- whatever the client calls it
-    addfn(srv:match('(%S+)%s*$'))                -- last word: 'Project Lazarus' -> 'Lazarus'
-    addfn((srv:gsub('%s+', '')))                 -- spaces stripped: 'ProjectLazarus'
-    addfn('Lazarus')                             -- the known-good form on Laz
-    local fn = fnames[1] or (myName .. '_Lazarus.ini')
-    local cfg, root = '', ''
-    pcall(function() cfg  = tostring(mq.TLO.MacroQuest.Path('config')() or '') end)
-    pcall(function() root = tostring(mq.TLO.MacroQuest.Path('root')()   or '') end)
-    local dirs = {}
-    local ovr = e3_path_override()
-    if ovr then dirs[#dirs + 1] = ovr; dirs[#dirs + 1] = ovr .. '\\e3 Bot Inis' end
-    if cfg ~= '' then
-        dirs[#dirs + 1] = cfg .. '\\e3 Bot Inis'            -- Path[config] = ...\config
-        dirs[#dirs + 1] = cfg .. '\\config\\e3 Bot Inis'    -- if Path[config] = MQ root
-    end
-    -- Every folder derives from MQ's OWN paths - no install-specific fallback, so this runs anywhere.
-    if root ~= '' then
-        dirs[#dirs + 1] = root .. '\\config\\e3 Bot Inis'
-        dirs[#dirs + 1] = root .. '\\e3 Bot Inis'
-        dirs[#dirs + 1] = root .. '\\..\\config\\e3 Bot Inis'   -- MQ installed beside E3
-    end
-    local candidates = {}
-    for _, d in ipairs(dirs) do
-        for _, nm in ipairs(fnames) do candidates[#candidates + 1] = d .. '\\' .. nm end
-    end
-    local f, path
-    for _, cand in ipairs(candidates) do
-        local fh = io.open(cand, 'r')
-        if fh then f, path = fh, cand; break end
-    end
-    if not f then
-        -- Guesses exhausted: go looking for it, then remember where it was so we only do this once.
-        local found, foundFile = find_e3_ini(myName, { cfg, root, (root ~= '' and root .. '\\..' or nil) })
-        if found and foundFile then
-            local fh = io.open(found .. '\\' .. foundFile, 'r')
-            if fh then
-                f, path = fh, found .. '\\' .. foundFile
-                log('[burns] found E3 config by searching: %s', path_show(path))
-                write_e3_path(found)
-            end
-        end
-    end
-    if not f then
-        log('\\ar[burns] no INI found for %s\\ax', fn)
-        for _, c in ipairs(candidates) do log('   tried: %s', c) end
-        log('\\ayA search of the MQ folders did not find it either. Put the folder holding %s', fn)
-        log('\\ayinto a file named AdventureTime_e3path.txt next to this script - one line, no')
-        log('\\ayquotes - then reload.\\ax')
-        return nil
-    end
-    BURN_FILE_USED = path
-    return parse_burn_file(f, path)
-end
-
-function parse_burn_file(f, path)
-    -- rank for a key: known keys keep their escalation order; anything else sorts after them by the
-    -- order it first appeared in the file, so unrecognised names still display sensibly.
-    local rankOf, seen, nextRank, sec = {}, {}, 0, ''
-    local function rank_for(key)
-        if not rankOf[key] then nextRank = nextRank + 1; rankOf[key] = nextRank end
-        return rankOf[key]
-    end
-    local tierOf, keyOf = {}, {}
-    for line in f:lines() do
-        local hdr = line:match('^%s*%[(.-)%]')
-        if hdr then sec = hdr:lower() end
-        if sec == 'burn' then
-            local key, val = line:match('^%s*([^;=%[][^=]-)%s*=%s*(.+)')
-            if key and val then
-                local r  = rank_for(key)
-                local nm = val:match('^([^/\r\n]+)')
-                if nm then nm = nm:gsub('%s+$', '') end
-                if nm and nm ~= '' then
-                    if not tierOf[nm] or r < tierOf[nm] then tierOf[nm] = r; keyOf[nm] = key end   -- LOWEST tier wins
-                end
-                if not seen[key] then seen[key] = true end
-            end
-        elseif sec == 'rez' then   -- crown/token rez items -> rank 0 (their own 'Rez' section)
-            local val = line:match('^%s*[Aa]uto Rez Spells%s*=%s*(.+)') or line:match('^%s*Rez Spells%s*=%s*(.+)')
-            if val then
-                local nm = val:match('^([^/\r\n]+)')
-                if nm then nm = nm:gsub('%s+$', '') end
-                if nm and nm ~= '' and not tierOf[nm] then tierOf[nm] = 0; keyOf[nm] = 'Rez' end
-            end
-        end
-    end
-    f:close()
-    local list, keys = {}, {}
-    for nm, ti in pairs(tierOf) do list[#list + 1] = { name = nm, tier = ti, tkey = keyOf[nm] or '?' } end
-    for k in pairs(seen) do keys[#keys + 1] = k end
-    table.sort(keys, function(a, b) return rank_for(a) < rank_for(b) end)
-    log('[burns] parsed %d burn item(s) from %s', #list, path_show(path))
-    log('[burns] tiers found: %s', table.concat(keys, ', '))
-    return list
-end
+at_module('burns')   -- the [Burn] list and the burn check (modules/burns.lua)
 
 -- No INI, or an empty [Burn]: watch NOTHING rather than inventing an item.
 BURN_WATCH = parse_burns() or {}
@@ -4587,253 +4390,7 @@ function rez_roster_sync()
     if changed then save_rez_order(); bcast_rez_order() end
 end
 
--- ===== Call of the Hero: gather the group by CASCADE ===== CoTH summons the target TO the caster, so
--- anyone already gathered who holds an emblem becomes a new summoner.
-COTH = {
-    ITEM   = 'Wayfarers Brotherhood Emblem',
-    OPTS   = '/CastType|Item/NoInterrupt',   -- it has a cast time, so it can be interrupted
-    RANGE  = 50,           -- within this of the anchor POINT counts as gathered
-    JUMPED = 75,           -- moving further than this in one go is a summon, not walking
-    active = false,
-    state  = {},           -- name -> { emblem, dist, updated } : emblem timer + distance to the anchor
-    at     = nil,          -- { x, y, z, zone, who } : the anchor POINT, and who set it (for LOS)
-    skip   = {},           -- name -> when I may consider them again, after they told me no
-    grey   = {},           -- name -> when I cast at them: assumed arrived until they say otherwise
-    absent = {},           -- summoner -> when they first read as away, so a blip does not lose their job
-    startedAt = 0, lastPush = 0, lastPoll = 0,
-    pending = nil,         -- { name, at, cast } : who I am summoning and how it is going
-}
-
--- Am I standing at the anchor point AND able to see it?
-function coth_here(nm)
-    -- HOLD THE TABLE, do not keep reading the global.
-    local anchor = COTH.at
-    if not anchor then return false end
-    if nm and nm:lower() ~= myName:lower() then
-        -- THEIR VERDICT, not our arithmetic on their numbers.
-        local st = COTH.state[nm]
-        if not st then return false end
-        if st.here ~= nil then return st.here == 1 end
-        return (st.dist or -1) >= 0 and st.dist <= COTH.RANGE and (st.los or 0) == 1
-    end
-    local z = 0
-    pcall(function() z = tonumber(mq.TLO.Zone.ID()) or 0 end)
-    if anchor.zone ~= 0 and z ~= anchor.zone then return false end
-    local d = coth_dist_to_anchor()
-    if d > COTH.RANGE then return false end
-    -- CLOSE ENOUGH IS CLOSE ENOUGH.
-    if d <= COTH_LOS_FREE then return true end
-    return coth_los() == 1
-end
-
--- 1 = I can see the anchor character, or there is nobody to check against. 0 = they are there and I
--- cannot see them.
-function coth_los()
-    local anchor = COTH.at
-    local by = anchor and anchor.by
-    if not by or by == '' or by:lower() == myName:lower() then return 1 end
-    local id = 0
-    pcall(function() id = tonumber(mq.TLO.Spawn('pc =' .. by).ID()) or 0 end)
-    if id <= 0 then return 1 end                      -- not in zone: cannot tell, do not block on it
-    local los = false
-    pcall(function() los = tlo_true(mq.TLO.Spawn('pc =' .. by).LineOfSight()) end)
-    return los and 1 or 0
-end
-
-function coth_dist_to_anchor()
-    local anchor = COTH.at
-    if not anchor then return 99999 end
-    local x, y, z = 0, 0, 0
-    pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
-    pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
-    pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
-    local dx, dy, dz = x - anchor.x, y - anchor.y, z - anchor.z
-    return math.floor(math.sqrt(dx*dx + dy*dy + dz*dz))
-end
-
--- Can I actually click the emblem?
-function coth_emblem()
-    local id = 0
-    pcall(function() id = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).ID()) or 0 end)
-    if id <= 0 then return -1 end
-    local t = -1
-    pcall(function() t = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
-    if t < 0 then t = 0 end
-    return t
-end
-
-function coth_read_self()
-    local em = coth_emblem()
-    local d  = COTH.at and coth_dist_to_anchor() or -1
-    return em, d, coth_los()
-end
-
--- Everyone still away from the anchor point, emblem holders first: each one we pull becomes a summoner,
--- so pulling them first is what turns one summoner into three.
-function coth_targets()
-    local hold, rest, now = {}, {}, mq.gettime()
-    for _, nm in ipairs(group_members()) do
-        if nm:lower() ~= myName:lower() then
-            local st = COTH.state[nm]
-            -- Fresh evidence only.
-            local skipped = COTH.skip[nm] and now < COTH.skip[nm]
-            local grey    = COTH.grey[nm] and (now - COTH.grey[nm]) < COTH_GREY_MS
-            if st and (now - (st.updated or 0)) < 6000 and not coth_here(nm)
-               and not skipped and not grey then
-                if (st.emblem or -1) >= 0 then hold[#hold + 1] = nm else rest[#rest + 1] = nm end
-            end
-        end
-    end
-    -- EMBLEM HOLDERS IN CASTING-SPEED ORDER.
-    table.sort(hold, function(a, b)
-        local ra, rb = coth_rank(a), coth_rank(b)
-        if ra ~= rb then return ra < rb end
-        return a < b
-    end)
-    table.sort(rest)
-    for _, nm in ipairs(rest) do hold[#hold + 1] = nm end
-    -- A BARD GOES TO THE BACK.
-    local ordered, bards = {}, {}
-    for _, nm in ipairs(hold) do
-        if (member_class(nm) or ''):upper() == 'BRD' then bards[#bards + 1] = nm
-        else ordered[#ordered + 1] = nm end
-    end
-    for _, nm in ipairs(bards) do ordered[#ordered + 1] = nm end
-    return ordered
-end
-
--- NOBODY REASSIGNS.
-
--- IS EVERYBODY ACTUALLY HERE?
-function coth_all_here()
-    for _, nm in ipairs(group_members()) do
-        if nm:lower() == myName:lower() then
-            if not coth_here() then return false, nm end
-        else
-            local st = COTH.state[nm]
-            if not st then return false, nm end
-            if not coth_here(nm) then return false, nm end
-        end
-    end
-    return true
-end
-
--- Everyone at the anchor with a ready emblem, in one order every client computes identically.
-function coth_summoners()
-    local out, now = {}, mq.gettime()
-    for _, nm in ipairs(group_members()) do
-        local st = COTH.state[nm]
-        if nm:lower() == myName:lower() then
-            if coth_here() and coth_emblem() == 0 then out[#out + 1] = nm end
-        elseif st and (now - (st.updated or 0)) < 6000 and coth_here(nm) and (st.emblem or -1) == 0 then
-            out[#out + 1] = nm
-        end
-    end
-    table.sort(out)
-    return out
-end
-
--- HOW MANY EMBLEMS ARE IN THIS GROUP AT ALL?
-function coth_emblem_holders()
-    local n, now = 0, mq.gettime()
-    for _, nm in ipairs(group_members()) do
-        if nm:lower() == myName:lower() then
-            if coth_emblem() >= 0 then n = n + 1 end
-        else
-            local st = COTH.state[nm]
-            if st and (st.emblem or -1) >= 0 and (now - (st.updated or 0)) < 60000 then n = n + 1 end
-        end
-    end
-    return n
-end
-
-function coth_set(on, at)
-    if on then
-        -- CAPTURE THE POINT, not the person. Whoever starts it fixes the spot; if they wander off
-        -- afterwards the gather still means the same place.
-        if at then
-            COTH.at = at
-        else
-            local x, y, z, zn = 0, 0, 0, 0
-            pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
-            pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
-            pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
-            pcall(function() zn = tonumber(mq.TLO.Zone.ID()) or 0 end)
-            COTH.at = { x = x, y = y, z = z, zone = zn, by = myName }
-            pcall(function() peer_bcast('/at_cothat %d %d %d %d %s', x, y, z, zn, myName) end)
-        end
-        COTH.active, COTH.startedAt, COTH.pending = true, mq.gettime(), nil
-        COTH.skip, COTH.grey, COTHW = {}, {}, nil
-        COTH.saidDone, COTH.quietAt, COTH.saidWait = nil, nil, nil
-        COTH.saidScarce = nil
-        -- Fresh gather, fresh answers: last run's charm reports say nothing about this one.
-        COTH.swapped, COTH.saidWaitSwap, COTH.saidSwapDone = {}, nil, nil
-        COTH.mine = 0
-        -- AND SWAP MY OWN, EXPLICITLY.
-        cothSwapWant = { auto = true }
-        pcall(function() peer_bcast('/at_cothgo on') end)
-        rezlog('[coth] gather started - anchor point %d,%d,%d',
-               COTH.at and COTH.at.x or 0, COTH.at and COTH.at.y or 0, COTH.at and COTH.at.z or 0)
-        -- SAY SO IF I CANNOT HELP. A gather where nobody can summon looks identical to one that is simply
-        -- slow, and that is worth ten seconds of nobody understanding why nothing happened.
-        local em = coth_emblem()
-        if em < 0 then
-            -- ASK TWICE BEFORE SAYING NO.
-            local c = coth_find_charm()
-            if c then
-                log('[coth] my emblem is in %s - putting it on before I summon', c)
-            else
-                log('\\ay[coth] I have no %s - I cannot summon anybody\\ax', COTH.ITEM)
-            end
-        elseif em > 0 then
-            log('[coth] my emblem is %ds into reuse - I will summon when it is ready', em)
-        end
-    else
-        COTH.active, COTH.pending, COTH.at, COTHW = false, nil, nil, nil
-        COTH.dbg = ''
-        pcall(function() peer_bcast('/at_cothgo off') end)
-        cothSwapWant = { back = true, auto = true }   -- same reason: I do not hear my own broadcast
-        rezlog('[coth] gather stopped')
-    end
-end
-
--- Runs on the SUMMONED character: has my own position jumped?
-COTHW = nil
-function coth_watch_tick()
-    local w = COTHW
-    if not w then return end
-    local x, y, z = 0, 0, 0
-    pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
-    pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
-    pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
-    local dx, dy, dz = x - w.x, y - w.y, z - w.z
-    local moved = math.floor(math.sqrt(dx*dx + dy*dy + dz*dz))
-    -- ARRIVED IS A PLACE, NOT A DISTANCE.
-    local here = false
-    pcall(function() here = (coth_dist_to_anchor() <= COTH.RANGE) and (coth_los() == 1) end)
-    if moved >= COTH.JUMPED or here then
-        -- MY WHOLE PICTURE AT THE MOMENT I LAND. If I am about to decide I am NOT with the group, this
-        -- line says which half failed - too far from the point, or no line of sight to the anchor.
-        local a = COTH.at
-        rezlog('[coth] arrived after %s cast - moved %d, now %d from the anchor (limit %d, los=%d to %s)%s',
-               w.by, moved, coth_dist_to_anchor(), COTH.RANGE, coth_los(), a and a.by or '?',
-               (moved < COTH.JUMPED) and ' [short summon - counted by position, not distance]' or '')
-        -- Arrival is the expected case and does not need announcing to five other people; the summoner
-        -- hears it directly and the log has it.
-        pcall(function() peer_bcast('/at_cotharrived %s', myName) end)
-        COTHW = nil
-        return
-    end
-    -- Not moved yet.
-    if not w.cast then return end
-    if (mq.gettime() - w.castAt) > COTH_SETTLE then
-        rezlog('[coth] %s finished casting and I did not move - telling them', w.by)
-        pcall(function() mq.cmdf('/gsay CoTH: %s cast but I did NOT move - still %d away',
-                                 w.by, coth_dist_to_anchor()) end)
-        pcall(function() peer_cmdf(w.by, '/at_cothhere %s no failed', myName) end)
-        COTHW = nil
-    end
-end
+at_module('coth')   -- Call of the Hero: the gathers and the charm swap (modules/coth.lua)
 
 -- Invis alignment test: fires the combo on a timer and records how far apart the two casters landed.
 INVT = { on = false, n = 0, total = 0, bucket = {}, seen = {}, until_ = 0, every = 15000, nextAt = 0,
@@ -4882,368 +4439,8 @@ pacAddWanted  = nil    -- set by /atpacify; the tick queues it
 cothSetWanted = nil    -- set by the CoTH buttons; the tick calls coth_set, because it broadcasts
 magicWanted   = nil    -- set by a Countermeasures button; the tick casts it
 pacDelWanted  = nil    -- set by the placate 'x' button; the tick tells the group
--- How long to leave a target alone after it says no.
-COTH_BARD_CAST = 11000
--- How many summons a bard does before handing over, if anyone else can take it.
-COTH_BARD_MAX  = 2
--- ...UNLESS THE EMBLEM IS SCARCE.
-COTH_BARD_SCARCE = 2
-
--- WHO SHOULD SPEND THE EMBLEM WHEN MORE THAN ONE COULD.
-COTH_CLASS_RANK = {
-    DRU = 1, CLR = 1, SHM = 1,                 -- healers: beneficial spell haste is near universal
-    ENC = 2, NEC = 2, WIZ = 2, MAG = 2,        -- pure casters
-    RNG = 3, BST = 3, SHD = 3, PAL = 3,        -- hybrids
-    BRD = 4,                                   -- already stands back on its own; last if it does not
-}
-COTH_RANK_DEFAULT = 4
--- How many the anchor takes before class order applies to it.
-COTH_ANCHOR_CASTS = 2
-
--- MY OWN CLASS, read locally, which is the one read that cannot fail for want of a spawn.
-function coth_my_class()
-    local c = ''
-    pcall(function() c = tostring(mq.TLO.Me.Class.ShortName() or '') end)
-    return (c ~= '' and c ~= 'NULL') and c:upper() or '?'
-end
-
--- THE REPORT FIRST, the local read second. What the character said about itself beats what we can see of
--- it from here - and during a gather we can usually see nothing at all.
-function coth_rank(nm)
-    local st = COTH.state[nm]
-    local c = st and st.class or ''
-    if c == '' then c = (member_class(nm) or ''):upper() end
-    return COTH_CLASS_RANK[c] or COTH_RANK_DEFAULT
-end
--- How long the driver will hold the first summon waiting for charms to go on. Generous: the swap is
--- cursor work behind an E3 pause that itself waits up to 2.5s for E3 to actually stop.
-COTH_SWAP_WAIT = 12000
 -- How long a fired rung stays assumed-spent before the client's own timers are believed again.
 DI_SPENT_CAP = 20000
-COTH_LOS_FREE  = 25
--- How long to keep reporting after deciding the gather is over. Covers the gap where somebody else has
--- not reached the same conclusion and is still deciding from my last report.
-COTH_LINGER    = 15000
-COTH_GREY_MS   = 8000
-COTH_ASK_MS    = 400
-COTH_SKIP_BUSY = 15000
-COTH_SKIP_FAIL = 4000
--- How many times the charm may be put back in one gather before we stop fighting whatever removes it.
-COTH_RESEAT_MAX = 3
-COTH_SETTLE  = 3000    -- after the cast lands, how long to allow for the client to actually move me
-COTH_GIVE_UP = 25000   -- backstop for a target that never answers at all: crashed, zoned, gone
--- AND A BACKSTOP FOR THE WHOLE GATHER.
-COTH_RUN_MAX = 300000
-
-local function coth_tick()
-    -- GIVE UP ON THE WHOLE RUN, not just on one target. See COTH_RUN_MAX.
-    if COTH.active and COTH.startedAt and (mq.gettime() - COTH.startedAt) > COTH_RUN_MAX then
-        local left = {}
-        for _, nm in ipairs(group_members()) do
-            local st = COTH.state[nm]
-            if st and (st.here or 0) == 0 and nm:lower() ~= myName:lower() then left[#left + 1] = nm end
-        end
-        rezlog('\\ay[coth] gather ran %ds without finishing - stopping%s\\ax', COTH_RUN_MAX / 1000,
-               (#left > 0) and (' (still out: ' .. table.concat(left, ', ') .. ')') or '')
-        COTH.active, COTH.pending = false, nil
-        -- Same restore the clean finish does, so nobody is left wearing the emblem charm.
-        cothSwapWant = { back = true, auto = true }
-        if (COTH.at and COTH.at.by or ''):lower() == myName:lower() then
-            pcall(function() peer_bcast('/at_cothgo off') end)
-        end
-        return
-    end
-    -- Still reporting after the gather ends, briefly: see COTH.quietAt below.
-    local now = mq.gettime()
-    if not COTH.active then
-        if COTH.quietAt and (now - COTH.quietAt) < COTH_LINGER then
-            local em, d, los = coth_read_self()
-            if (now - COTH.lastPush) > 1000 then
-                COTH.lastPush = now
-                pcall(function()
-                    peer_bcast('/at_coth %s %d %d %d %d %s', myName, em, d, los,
-                               coth_here() and 1 or 0, coth_my_class())
-                end)
-            end
-        end
-        return
-    end
-
-    -- Report my own emblem and distance so the others can plan.
-    if (now - COTH.lastPush) > 1000 then
-        COTH.lastPush = now
-        -- Send the VERDICT alongside the parts. The parts stay for the panel and for diagnosing a
-        -- disagreement; the verdict is what everyone actually acts on.
-        local em, d, los = coth_read_self()
-        local here = coth_here() and 1 or 0
-        -- SAY WHEN MY OWN VERDICT CHANGES, with the numbers behind it.
-        if here ~= COTH.saidHere then
-            COTH.saidHere = here
-            local a = COTH.at
-            rezlog('[coth] I am now %s: %d from the anchor (limit %d), los=%d to %s, zone %s',
-                   (here == 1) and 'WITH THE GROUP' or 'AWAY', d, COTH.RANGE, los,
-                   a and a.by or '?', a and tostring(a.zone) or '?')
-        end
-        COTH.state[myName] = { emblem = em, dist = d, los = los, here = here, updated = now }
-        pcall(function() peer_bcast('/at_coth %s %d %d %d %d %s', myName, em, d, los, here,
-                                    coth_my_class()) end)
-    end
-
-    -- NOBODY SUMMONS UNTIL EVERYONE HAS SWAPPED.
-    if (COTH.mine or 0) == 0 and (now - (COTH.startedAt or now)) < COTH_SWAP_WAIT then
-        local waiting = {}
-        COTH.swapped = COTH.swapped or {}
-        for _, nm in ipairs(group_members()) do
-            if not COTH.swapped[nm] then waiting[#waiting + 1] = nm end
-        end
-        if #waiting > 0 then
-            COTH.dbg = 'waiting for charms: ' .. table.concat(waiting, ', ')
-            if not COTH.saidWaitSwap then
-                COTH.saidWaitSwap = true
-                rezlog('[coth] holding the first summon until the charms are on (%s)',
-                       table.concat(waiting, ', '))
-            end
-            return
-        end
-        -- SAY WHEN THE HOLD LIFTS, and how long it took.
-        if COTH.saidWaitSwap and not COTH.saidSwapDone then
-            COTH.saidSwapDone = true
-            local el = (now - (COTH.startedAt or now)) / 1000
-            rezlog('[coth] charms are on after %.1fs%s - summoning can start',
-                   el, (el >= (COTH_SWAP_WAIT / 1000) - 0.5) and ' (TIMED OUT, somebody never reported)' or '')
-        end
-    end
-
-    -- Am I waiting on somebody? Nothing else happens until that resolves.
-    if COTH.pending then
-        local p = COTH.pending
-        if (now - p.at) > COTH_GIVE_UP then
-            rezlog('\\ay[coth] %s never answered in %ds - giving up on them\\ax', p.name, COTH_GIVE_UP / 1000)
-            COTH.pending = nil
-        end
-        COTH.dbg = 'waiting on ' .. p.name
-        return
-    end
-
-    -- FINISHED ONLY WHEN EVERY MEMBER SAYS THEY ARE HERE, not when the queue happens to be empty.
-    local left = coth_targets()
-    local allHere, waitingOn = coth_all_here()
-    if allHere then
-        COTH.active, COTH.dbg = false, 'group gathered'
-        -- KEEP REPORTING FOR A MOMENT.
-        COTH.quietAt = now
-        -- ONCE. Every character reached this and logged it on its own pass, so one finished gather
-        -- produced six identical lines.
-        if not COTH.saidDone then
-            COTH.saidDone = true
-            -- HOW LONG IT TOOK, from the moment the gather started.
-            local secs = (now - (COTH.startedAt or now)) / 1000
-            rezlog('[coth] gather complete in %.1fs - everyone is with the group', secs)
-            -- PUT THE CHARM BACK HERE, because this is where a gather really ends.
-            cothSwapWant = { back = true, auto = true }
-            if (COTH.at and COTH.at.by or ''):lower() == myName:lower() then
-                pcall(function()
-                    mq.cmdf('/gsay CoTH: Everyone is here. Took %.0f seconds to summon the group.', secs)
-                end)
-            end
-        end
-        return
-    end
-    -- NOT finished.
-    if #left == 0 then
-        COTH.dbg = 'waiting on ' .. tostring(waitingOn)
-        if not COTH.saidWait or (now - COTH.saidWait) > 5000 then
-            COTH.saidWait = now
-            rezlog('[coth] nobody to summon right now - still waiting on %s', tostring(waitingOn))
-        end
-        return
-    end
-
-    -- Can I summon at all?
-    if not coth_here() then COTH.dbg = 'not at the anchor myself'; return end
-    local em = coth_emblem()
-    if em ~= 0 then COTH.dbg = (em < 0) and 'no emblem' or ('emblem ' .. em .. 's'); return end
-
-    -- WHO COULD BE HELPING, AND WHO IS NOT. A gather where one character does all the work while three
-    -- stand there able-bodied is the symptom; this says which of the two tests each one failed.
-    if not COTH.saidWho or (now - COTH.saidWho) > 10000 then
-        COTH.saidWho = now
-        local parts = {}
-        for _, nm in ipairs(group_members()) do
-            if nm:lower() ~= myName:lower() then
-                local st = COTH.state[nm]
-                parts[#parts + 1] = string.format('%s[%s/%s]', nm,
-                    st and tostring(st.here) or '?', st and tostring(st.emblem) or '?')
-            end
-        end
-        rezlog('[coth] group (here/emblem): %s', table.concat(parts, ' '))
-    end
-
-    -- Am I a bard? Needed twice below - for the always-casting exemption and for the blind cast - so it
-    -- is read once here rather than derived at each site.
-    local iAmBard = (member_class(myName) or ''):upper() == 'BRD'
-
-    -- A BARD THAT STARTED THIS STEPS BACK ONCE OTHERS CAN CARRY IT.
-    if iAmBard and (COTH.mine or 0) >= COTH_BARD_MAX then
-        -- ONE OTHER SUMMONER IS NOT ENOUGH WHEN IT IS THE ONLY OTHER SUMMONER.
-        local holders = coth_emblem_holders()
-        if holders > COTH_BARD_SCARCE then
-            local others = 0
-            for _, nm in ipairs(coth_summoners()) do
-                if nm:lower() ~= myName:lower() then others = others + 1 end
-            end
-            if others > 0 then
-                COTH.dbg = string.format('bard: %d others can summon now, standing back', others)
-                return
-            end
-        else
-            COTH.dbg = string.format('bard: only %d emblem(s) in the group - carrying on', holders)
-            if not COTH.saidScarce then
-                COTH.saidScarce = true
-                rezlog('[coth] only %d emblem(s) between us - the bard keeps summoning rather than standing back',
-                       holders)
-            end
-        end
-    end
-
-    -- LET THE FASTER CASTER TAKE IT.
-    do
-        local iAmAnchor = ((COTH.at and COTH.at.by) or ''):lower() == myName:lower()
-        if not (iAmAnchor and (COTH.mine or 0) < COTH_ANCHOR_CASTS) then
-            local myRank, better = coth_rank(myName), nil
-            for _, nm in ipairs(coth_summoners()) do
-                if nm:lower() ~= myName:lower() and coth_rank(nm) < myRank then
-                    better = nm; break
-                end
-            end
-            if better then
-                COTH.dbg = string.format('%s casts faster and is ready - standing back', better)
-                if not COTH.saidRank or (now - COTH.saidRank) > 8000 then
-                    COTH.saidRank = now
-                    rezlog('[coth] %s (%s) is ready and casts faster than me (%s) - letting them take it',
-                           better, member_class(better) or '?', member_class(myName) or '?')
-                end
-                return
-            end
-        end
-    end
-
-    -- TAKE THE FIRST ONE NOBODY HAS. coth_targets is already ordered - emblem holders first - and skip
-    -- holds anyone who has told me no recently, whether that was 'busy' or a failed summon.
-    local mine
-    for _, tgt in ipairs(left) do
-        if not (COTH.skip[tgt] and now < COTH.skip[tgt]) then mine = tgt; break end
-    end
-    if not mine then COTH.dbg = 'everyone left is spoken for'; return end
-
-    -- NOT WHILE ALREADY CASTING.
-    if not iAmBard then
-        local busy = 0
-        pcall(function() busy = tonumber(mq.TLO.Me.Casting.ID()) or 0 end)
-        if busy > 0 then COTH.dbg = 'already casting'; return end
-    end
-
-    local tid = 0
-    pcall(function() tid = tonumber(mq.TLO.Spawn('pc =' .. mine).ID()) or 0 end)
-    if tid <= 0 then COTH.dbg = mine .. ' is not in zone'; return end
-
-    -- ASK FIRST, THEN SPEND THE EMBLEM.
-    pcall(function() peer_cmdf(mine, '/at_cothwatch %s', myName) end)
-    COTH.pending = { name = mine, at = now }
-    mq.delay(COTH_ASK_MS, function() return COTH.pending == nil end)
-    if COTH.pending == nil then
-        -- They said no while we waited. Nothing spent; the next pass picks somebody else.
-        return
-    end
-    -- AND LOOK AGAIN BEFORE SPENDING IT.
-    if coth_here(mine) then
-        rezlog('[coth] %s got here while I was asking - not summoning them', mine)
-        COTH.pending = nil
-        return
-    end
-    -- TELL EVERYONE THEY ARE MINE, now that the target has agreed.
-    pcall(function() peer_bcast('/at_cothmine %s', mine) end)
-    local ts = COTH.state[mine] or {}
-    rezlog('[coth] summoning %s (their report: dist=%s los=%s here=%s, %.1fs old)',
-           mine, tostring(ts.dist), tostring(ts.los), tostring(ts.here),
-           (mq.gettime() - (ts.updated or mq.gettime())) / 1000)
-    -- IN GROUP CHAT, not just the log.
-    pcall(function() mq.cmdf('/gsay CoTH: summoning %s', mine) end)
-    -- NOTHING ON THE CURSOR, OR NOTHING HAPPENS.
-    local clear, stuck = cursor_stow('coth')
-    if not clear then
-        rezlog('\\ar[coth] NOT casting - "%s" is stuck on the cursor and casting with a held item '
-            .. 'disconnects the client. Clear it and the next pass will summon %s.\\ax',
-               tostring(stuck or '?'), mine)
-        COTH.pending = nil
-        return
-    end
-    at_cast(COTH.ITEM .. COTH.OPTS, tid)
-    -- BARDS GET NO CAST BAR FROM THE EMBLEM.
-    if iAmBard then
-        rezlog('[coth] bard: no cast bar to watch, firing blind and assuming it lands')
-        mq.delay(COTH_BARD_CAST)
-        pcall(function() peer_cmdf(mine, '/at_cothcast %s', myName) end)
-        COTH.grey[mine] = mq.gettime()
-        COTH.pending = nil
-        COTH.mine = (COTH.mine or 0) + 1
-        rezlog('[coth]   cast sent for %s - assuming they made it, moving on', mine)
-        return
-    end
-
-    -- WAIT FOR IT TO START BEFORE WAITING FOR IT TO END.
-    local castFrom = mq.gettime()
-    local started, sawBar = false, false
-    mq.delay(3000, function()
-        sawBar = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0
-        local t = -1
-        pcall(function() t = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
-        started = sawBar or (t > 0)
-        return started
-    end)
-    if not started then
-        rezlog('\\ay[coth] the emblem never went out for %s (no cast bar, timer still ready) - releasing\\ax', mine)
-        COTH.pending = nil
-        COTH.skip[mine] = mq.gettime() + COTH_SKIP_FAIL
-        return
-    end
-    -- Now wait for it to LAND.
-    if sawBar then
-        -- Stop waiting if the gather is called off mid-cast; there is nothing to report to afterwards.
-        mq.delay(20000, function()
-            return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 or not COTH.active
-        end)
-    else
-        rezlog('[coth] no cast bar on this character - waiting out the emblem cast time instead')
-        local ms = 0
-        pcall(function()
-            ms = (tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).Clicky.CastTime.TotalSeconds()) or 0) * 1000
-        end)
-        if ms <= 0 then ms = 10000 end
-        mq.delay(ms, function() return not COTH.active end)
-    end
-    if not COTH.active then return end
-    if COTH.pending then
-        pcall(function() peer_cmdf(mine, '/at_cothcast %s', myName) end)
-    end
-    -- ASSUME IT LANDED AND CARRY ON.
-    COTH.grey[mine] = mq.gettime()
-    COTH.pending = nil
-    COTH.mine = (COTH.mine or 0) + 1
-    -- Only meaningful when a cast bar was seen: without one the wait above was a fixed sleep and timing
-    -- it would just measure our own delay.
-    local took = (mq.gettime() - castFrom) / 1000
-    if sawBar then
-        COTH.castSecs = took
-        -- READ THE SLOT, NOT OUR OWN BOOKKEEPING.
-        local wornNow = false
-        pcall(function() wornNow = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
-        rezlog('[coth]   cast finished for %s in %.1fs (emblem %s) - assuming they made it, moving on',
-               mine, took, wornNow and 'WORN' or 'in a bag')
-    else
-        rezlog('[coth]   cast finished for %s - assuming they made it, moving on', mine)
-    end
-end
 
 -- Same baton idea as the rez, but simpler: fixed target (the tank), no corpse, no handshake. Kept in ONE
 -- global table rather than a dozen locals - this chunk is at Lua's 200-local ceiling.
@@ -5823,10 +5020,45 @@ function diq_zone_elsewhere(nm)
     return rr.zone ~= myZone
 end
 
+-- A DECLINE THAT WILL STILL BE TRUE NEXT TIME (1.21.1). 'no-staff' and 'nothing-owned' hold until that
+-- character's own DI report changes (or DIQ_DECLINE_HOLD passes); invis and feigning hold DIQ_DECLINE_SHORT.
+-- The quiet check used to clear DIQ.tried and ask the same character again every few seconds (1.20.46
+-- logs: Sebbun asked Lopan 395 times in 36 minutes, staff=-1 dg=0, every answer the same 'no').
+DIQ_DECLINE_HOLD  = 600000
+DIQ_DECLINE_SHORT = 60000
+DIQ.declined = DIQ.declined or {}
+function diq_state_sig(nm)
+    local s
+    for k, v in pairs(DI.state or {}) do if k:lower() == nm:lower() then s = v; break end end
+    if not s then return 'none' end
+    local st = s.staff or -1
+    return string.format('%s|%s', (st == 0) and 'ready' or ((st < 0) and 'none' or 'cd'), tostring(s.dgReady or 0))
+end
+function diq_note_decline(nm, why)
+    why = tostring(why or '')
+    local hold
+    if why:find('no-staff', 1, true) or why:find('nothing-owned', 1, true) then hold = DIQ_DECLINE_HOLD
+    elseif why == 'invis' or why == 'feigning' then hold = DIQ_DECLINE_SHORT end
+    if not hold then return end
+    DIQ.declined[nm:lower()] = { sig = diq_state_sig(nm), untilT = mq.gettime() + hold, why = why }
+end
+function diq_declined(nm)
+    local d = DIQ.declined[nm:lower()]
+    if not d then return false end
+    if mq.gettime() >= d.untilT or diq_state_sig(nm) ~= d.sig then
+        DIQ.declined[nm:lower()] = nil
+        return false
+    end
+    return true
+end
+
 function diq_candidates()
     local out, elsewhere, away = {}, 0, {}
     for nm, s in pairs(DI.state or {}) do
         local skipZone = false
+        if nm:lower() ~= myName:lower() and not DIQ.tried[nm:lower()] and diq_declined(nm) then
+            DIQ.tried[nm:lower()] = true   -- same answer as last time: not asked again until it can change
+        end
         if nm:lower() ~= myName:lower() and not DIQ.tried[nm:lower()] then
             skipZone = diq_zone_elsewhere(nm)
             if skipZone then elsewhere = elsewhere + 1; away[#away + 1] = nm:lower() end
@@ -5963,8 +5195,7 @@ function di_rung_verify()
             return
         end
     end
-    DI.rungCheck = nil
-    if not c.gem or c.gem <= 0 then return end          -- not a gem spell, nothing to read
+    if not c.gem or c.gem <= 0 then DI.rungCheck = nil; return end   -- not a gem spell, nothing to read
     -- ONE MORE LOOK BEFORE CALLING IT A FAILURE.
     local s = -1
     local function gemLeft()
@@ -5984,9 +5215,12 @@ function di_rung_verify()
     end
     s = gemLeft()
     if s == 0 then
-        mq.delay(DI_VERIFY_GRACE, function() return gemLeft() > 0 end)
-        s = gemLeft()
+        -- Watched on later ticks, not waited for here (1.21.2: this held the whole loop 3s - Nityrc's log,
+        -- 16:23:33, di_verify 3055ms): the check stays in hand until the timer moves or the grace runs out.
+        c.graceUntil = c.graceUntil or (mq.gettime() + DI_VERIFY_GRACE)
+        if mq.gettime() < c.graceUntil then return end
     end
+    DI.rungCheck = nil
     if s > 0 then
         -- THE CAST WENT OUT. So the only remaining question is where it landed, and there is exactly one
         -- wrong answer we can see from here: on the caster.
@@ -6631,7 +5865,7 @@ function win_exists_raw(w)
     return sv ~= '' and sv:upper() ~= 'NULL'
 end
 
-local function win_open_raw(w)
+function win_open_raw(w)
     local v
     local ok = pcall(function() v = mq.TLO.Window(w).Open() end)
     if not ok or v == nil then return false, 'nil' end
@@ -7372,6 +6606,18 @@ pcall(function()
         end
     end)
     -- THE ANCHOR POINT.
+    -- /atburncheck <burn name> | off (1.21.3): an extra line on the burn hotkey, after /e3burns. The items of that
+    -- burn that are ready right now are listed under Running now until each one fires. Nothing is sent to E3.
+    mq.bind('/atburncheck', function(...)
+        local name = table.concat({...}, ' '):match('^%s*(.-)%s*$')
+        if not SHOW_UI then
+            if driverName then pcall(function() peer_cmdf(driverName, '/atburncheck %s', name) end) end
+            return
+        end
+        if name == '' then log('/atburncheck <burn name> (as in your E3 [Burn] section) | /atburncheck off'); return end
+        if name:lower() == 'off' then burncheck_stop('cleared'); return end
+        burncheck_start(name)
+    end)
     mq.bind('/atcoth', function(arg)
         local a = arg and tostring(arg):lower() or ''
         -- /atcoth group - I am the only summoner and the rest of the group are other people's characters,
@@ -8762,6 +8008,22 @@ end
             rezlog('[diq] %s asked for a save - declining: %s', tank, reason)
             return
         end
+        -- IN RANGE, OR SAY NO NOW (1.21.2): a save that cannot reach is a 'no' the asker can act on at once,
+        -- not a cast that fails after it has stopped asking anyone else.
+        do
+            local range, dist = 0, -1
+            pcall(function()
+                if best.staff then range = tonumber(mq.TLO.FindItem('=' .. DI.STAFF).Spell.Range()) or 0
+                else range = tonumber(mq.TLO.Spell(best.name).Range()) or 0 end
+            end)
+            pcall(function() dist = tonumber(mq.TLO.Spawn('pc =' .. tank).Distance()) or -1 end)
+            if range > 0 and dist > range then
+                local reason = string.format('out-of-range-%dm/%dm', math.floor(dist), math.floor(range))
+                pcall(function() peer_cmdf(tank, '/at_diack %s no %s', myName, reason) end)
+                rezlog('[diq] %s asked for a save - declining: %s (%s)', tank, reason, best.name)
+                return
+            end
+        end
         rezlog('[diq] %s asked for a save - casting %s', tank, best.name)
         pcall(function() peer_cmdf(tank, '/at_diack %s yes %s', myName, (best.name):gsub(' ', '_')) end)
         -- Fired exactly the way the ladder fires it, including the spent-stamp that stops di_rung_list
@@ -8832,7 +8094,12 @@ end
             else
                 rezlog('[diq] %s cannot (%s) - next', who, tostring(what or '?'))
                 DIQ.tried[who:lower()] = true
+                diq_note_decline(who, what)
                 DIQ.asked = nil
+                -- A 'no' after its own claim frees the claim too (1.21.1): the claim branch below never ran
+                -- for it, so the tank sat out DIQ_CAST_MS for a cast that had already said it would not come
+                -- (1.20.46 logs: 2m19s with no save, Nityrc and Khulian swapped 9 times).
+                if DIQ.casting and DIQ.casting:lower() == who:lower() then DIQ.casting = nil end
             end
         elseif DIQ.casting and who:lower() == DIQ.casting:lower() and verdict ~= 'yes' then
             -- A character that CLAIMED and then found its cast never started.
@@ -8974,7 +8241,24 @@ end
         if item == '' then return end
         burnClass[char] = class
         burnState[char] = burnState[char] or {}
-        burnState[char][item] = { tier = tonumber(tier) or 1, secs = tonumber(secs) or 0, active = (tonumber(active) == 1), dsecs = tonumber(dsecs) or 0, kind = kind or 'i', ord = tonumber(ord) or 0, tkey = ((tkey or '?'):gsub('~', ' ')), updated = mq.gettime() }
+        local keyList = ((tkey or '?'):gsub('~', ' '))
+        burnState[char][item] = { tier = tonumber(tier) or 1, secs = tonumber(secs) or 0, active = (tonumber(active) == 1), dsecs = tonumber(dsecs) or 0, kind = kind or 'i', ord = tonumber(ord) or 0, tkey = (keyList:match('^[^+]+') or '?'), keys = burn_key_set(keyList), updated = mq.gettime() }
+    end)
+    -- a burn line whose spell cannot work from a burn (1.21.3): shown with it in the burn check
+    -- this burn item puts a buff on its user: the burn check waits for the buff, not only the cooldown (1.21.5)
+    mq.bind('/at_burnexp', function(char, ...)
+        if not char then return end
+        local item = table.concat({...}, ' ')
+        if item == '' then return end
+        burnExpect[char] = burnExpect[char] or {}
+        burnExpect[char][item] = true
+    end)
+    mq.bind('/at_burnwarn', function(char, warn, ...)
+        if not char or not warn then return end
+        local item = table.concat({...}, ' ')
+        if item == '' then return end
+        burnWarn[char] = burnWarn[char] or {}
+        burnWarn[char][item] = (warn:gsub('~', ' '))
     end)
 end)
 
@@ -9371,7 +8655,7 @@ end
 -- exactly `qty` of `item` from OUR bags to `receiver`.
 local giving = false
 
-local function clear_cursor()
+function clear_cursor()
     if (mq.TLO.Cursor.ID() or 0) ~= 0 then
         mq.cmd('/autoinventory'); mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
     end
@@ -10656,19 +9940,17 @@ function draw_burn_running()
     end
     if #order == 0 then
         -- Nothing running is the normal state, and it should read as calm rather than as an error.
+        if BURNCHK then draw_burncheck() return end
         ImGui.TextDisabled('nothing running')
         return
     end
 
-    -- TILES, LIKE THE GAME'S BUFF WINDOW. One column per character, two icons a row, the time under each
-    -- icon, the name at the head of the column. The icon darkens from the top as its time runs out; the
-    -- last ten seconds get an orange edge. Hover a tile for the burn's full name.
+    -- A LIST, LIKE THE BURN CHECK BELOW IT (1.22.1: icon + name read better than the icon-only tiles). One column
+    -- per character, one burn a line: the icon (darkening from the top as its time runs out, an orange edge in the
+    -- last ten seconds), its short name, and the time left. Hover for the full name.
     local fs = 16
     pcall(function() fs = math.floor(ImGui.GetFontSize() or 16) end)
-    local ts  = math.floor(ui_icon_size() * 1.15)               -- tile (icon) size
-    local tw  = ts
-    pcall(function() tw = math.max(ts, math.ceil(ImGui.CalcTextSize('0:00') or ts) + 2) end)
-    local gap = 4
+    local ts = math.max(12, math.floor(ui_icon_size() * 0.9))
     local flags = (ImGuiTableFlags.SizingFixedFit or 0) + (ImGuiTableFlags.BordersInnerV or 0)
     local padPushed = pcall(function() ImGui.PushStyleVar(ImGuiStyleVar.CellPadding, 6, 2) end)
     local opened = ImGui.BeginTable('##burnrun', #order, flags)
@@ -10678,34 +9960,25 @@ function draw_burn_running()
     end
     for _ = 1, #order do ImGui.TableSetupColumn('') end
 
-    local function tile(r, c, idx)
+    local function line(r, c, idx)
         local x, y = 0, 0
         pcall(function() x, y = ImGui.GetCursorScreenPos() end)
         local drew = ui_icon(r.it, nil, ts)
-        if drew then ImGui.SetCursorScreenPos(x, y) end
-        local hov = false
-        ImGui.InvisibleButton('##brt_' .. c .. '_' .. idx, ts, ts)
-        hov = ImGui.IsItemHovered and ImGui.IsItemHovered() or false
-        pcall(function()
-            local dl = ImGui.GetWindowDrawList()
-            local frac = math.max(0, math.min(1, r.left / math.max(1, r.total)))
-            if not drew then
-                dl:AddRectFilled(ImVec2(x, y), ImVec2(x + ts, y + ts), IM_COL32(60, 66, 82, 255), 3)
-                local ab = burn_short_name(r.it, 2)
-                dl:AddText(ImVec2(x + 3, y + (ts - fs) * 0.5), IM_COL32(220, 225, 235, 255), ab)
-            end
-            -- spent time, darkening down from the top
-            local spent = math.floor(ts * (1 - frac))
-            if spent > 0 then
-                dl:AddRectFilled(ImVec2(x, y), ImVec2(x + ts, y + spent), IM_COL32(0, 0, 0, 165), 0)
-            end
-            if r.left <= 10 then
-                dl:AddRect(ImVec2(x, y), ImVec2(x + ts, y + ts), IM_COL32(255, 170, 70, 235), 3, 0, 2)
-            elseif hov then
-                dl:AddRect(ImVec2(x - 1, y - 1), ImVec2(x + ts + 1, y + ts + 1), IM_COL32(255, 255, 255, 120), 3)
-            end
-        end)
-        if hov then
+        if drew then
+            pcall(function()
+                local dl = ImGui.GetWindowDrawList()
+                local frac = math.max(0, math.min(1, r.left / math.max(1, r.total)))
+                local spent = math.floor(ts * (1 - frac))   -- spent time, darkening down from the top
+                if spent > 0 then dl:AddRectFilled(ImVec2(x, y), ImVec2(x + ts, y + spent), IM_COL32(0, 0, 0, 165), 0) end
+                if r.left <= 10 then dl:AddRect(ImVec2(x, y), ImVec2(x + ts, y + ts), IM_COL32(255, 170, 70, 235), 3, 0, 2) end
+            end)
+            ImGui.SameLine()
+        end
+        ImGui.Text(burn_short_name(r.it, BURNCHK_CHARS or 13))
+        local hov = ui_tip_hover()
+        ImGui.SameLine()
+        ui_text((r.left <= 10) and UI_WAIT or UI_READY, string.format('%d:%02d', math.floor(r.left / 60), r.left % 60))
+        if hov or ui_tip_hover() then
             pcall(function() ImGui.SetTooltip(string.format('%s\n%s - %d:%02d left', r.it, c,
                 math.floor(r.left / 60), r.left % 60)) end)
         end
@@ -10715,16 +9988,13 @@ function draw_burn_running()
     ImGui.TableNextRow()
     for _, c in ipairs(order) do
         ImGui.TableNextColumn()
-        local x0, w = 0, 0
-        pcall(function() x0 = ImGui.GetCursorPosX(); w = ImGui.CalcTextSize(c) or 0 end)
-        pcall(function() ImGui.SetCursorPosX(x0 + math.max(0, math.floor((tw * 2 + gap - w) / 2))) end)
         ui_text(UI_LABEL, c)
     end
     ImGui.TableNextRow()
     for _, c in ipairs(order) do
         ImGui.TableNextColumn()
         local rows = byChar[c]
-        -- Shortest first, but STEADY: tiles keep last frame's order and only pass each other when the
+        -- Shortest first, but STEADY: rows keep last frame's order and only pass each other when the
         -- gap is more than RUN_SWAP_SECS, so two burns a second apart do not keep trading places.
         do
             local rank = {}
@@ -10749,37 +10019,11 @@ function draw_burn_running()
             for i, r in ipairs(rows) do names[i] = r.it end
             RUN_ORDER[c] = names
         end
-        local x0 = 0
-        pcall(function() x0 = ImGui.GetCursorPosX() end)
-        for k = 1, #rows, 2 do
-            -- icons
-            for m = 0, 1 do
-                local r = rows[k + m]
-                if r then
-                    if m == 1 then ImGui.SameLine(0, 0) end
-                    pcall(function() ImGui.SetCursorPosX(x0 + m * (tw + gap) + math.floor((tw - ts) / 2)) end)
-                    tile(r, c, k + m)
-                end
-            end
-            -- times under them
-            for m = 0, 1 do
-                local r = rows[k + m]
-                if r then
-                    local t = string.format('%d:%02d', math.floor(r.left / 60), r.left % 60)
-                    local w = tw
-                    pcall(function() w = ImGui.CalcTextSize(t) or tw end)
-                    if m == 1 then ImGui.SameLine(0, 0) end
-                    pcall(function() ImGui.SetCursorPosX(x0 + m * (tw + gap) + math.floor((tw - w) / 2)) end)
-                    ui_text((r.left <= 10) and UI_WAIT or UI_READY, t)
-                end
-            end
-        end
-        -- hold the column at two tiles wide even with one burn, so the names line up under a grid
-        pcall(function() ImGui.SetCursorPosX(x0) end)
-        ImGui.Dummy(tw * 2 + gap, 1)
+        for k, r in ipairs(rows) do line(r, c, k) end
     end
     ImGui.EndTable()
     if padPushed then pcall(function() ImGui.PopStyleVar(1) end) end
+    if BURNCHK then draw_burncheck() end
 end
 
 
@@ -13781,57 +13025,6 @@ function ep_stow_cursor()
 end
 
 -- RE-ENTRANT ON PURPOSE, up to EP_STRIP_PASSES.
-COTH_SPELL = 'Call of the Hero'
-
-function coth_item_has_emblem(item)
-    local nm = ''
-    pcall(function() nm = tostring(item.Name() or '') end)
-    if nm == '' or nm == 'NULL' then return false end
-    for a = 1, 6 do
-        local stype = 0
-        pcall(function() stype = tonumber(item['AugSlot' .. a]()) or 0 end)
-        if stype > 0 and stype ~= 20 and stype ~= 30 then
-            local an = ''
-            pcall(function() an = tostring(item.AugSlot(a).Item.Name() or '') end)
-            if an == COTH.ITEM then return true end
-        end
-    end
-    -- Fallback: the item itself is the clicky rather than hosting an aug that is.
-    local sp, cl = '', ''
-    pcall(function() sp = tostring(mq.TLO.FindItem('=' .. nm).Spell.Name() or '') end)
-    pcall(function() cl = tostring(mq.TLO.FindItem('=' .. nm).Clicky.Name() or '') end)
-    local want = COTH_SPELL:lower()
-    return sp:lower() == want or cl:lower() == want
-end
-
--- Returns: name, alreadyWorn. nil when this character has no such item at all.
-function coth_find_charm()
-    local worn = ''
-    pcall(function() worn = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if worn ~= '' and worn ~= 'NULL' then
-        local hit = false
-        pcall(function() hit = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
-        if hit then return worn, true end
-    end
-    -- Twelve, not ten: augcheck walks pack1..12 and there is no reason to look at fewer.
-    for pk = 1, 12 do
-        local slots = 0
-        pcall(function() slots = tonumber(mq.TLO.Me.Inventory('pack' .. pk).Container()) or 0 end)
-        for s = 1, slots do
-            local id = 0
-            pcall(function() id = tonumber(mq.TLO.Me.Inventory('pack' .. pk).Item(s).ID()) or 0 end)
-            if id > 0 then
-                local hit, nm = false, ''
-                pcall(function()
-                    hit = coth_item_has_emblem(mq.TLO.Me.Inventory('pack' .. pk).Item(s))
-                    nm  = tostring(mq.TLO.Me.Inventory('pack' .. pk).Item(s).Name() or '')
-                end)
-                if hit and nm ~= '' then return nm, false end
-            end
-        end
-    end
-    return nil, false
-end
 
 -- =========================================================================== RAID MOVES - reorganise
 -- groups without touching the window
@@ -14823,548 +14016,6 @@ function draw_raid()
         end
         ImGui.Spacing()
     end
-end
-
--- =========================================================================== SOLO GATHER - /atcoth
--- group.
-COTHG = { active = false, at = nil, castAt = 0, done = 0, saidWait = 0, startedAt = 0 }
-COTHG_GIVE_UP = 300000   -- a whole run cannot outlast this, however stubborn the list is
-
--- Everyone in the group except me, with what the CLIENT can see: spawn id and how far away they are.
--- A member with no spawn is in another zone and cannot be summoned - said once rather than retried.
-function cothg_targets()
-    local out = {}
-    local n = 0
-    pcall(function() n = tonumber(mq.TLO.Group.Members()) or 0 end)
-    for i = 1, n do
-        local nm, id, dist = '', 0, -1
-        pcall(function() nm = tostring(mq.TLO.Group.Member(i).Name() or '') end)
-        pcall(function() id = tonumber(mq.TLO.Group.Member(i).Spawn.ID()) or 0 end)
-        pcall(function() dist = tonumber(mq.TLO.Group.Member(i).Spawn.Distance3D()) or -1 end)
-        -- Distance3D exists (checked against MacroQuest's own MQ2SpawnType), but a failed read would
-        -- come back -1 and read as 'far', which summons somebody standing next to me.
-        if dist < 0 then
-            pcall(function() dist = tonumber(mq.TLO.Group.Member(i).Spawn.Distance()) or -1 end)
-        end
-        if nm ~= '' and nm:lower() ~= myName:lower() then
-            out[#out + 1] = { name = nm, id = id, dist = dist }
-        end
-    end
-    return out
-end
-
-function cothg_set(on)
-    if on then
-        local x, y, z = 0, 0, 0
-        pcall(function() x = tonumber(mq.TLO.Me.X()) or 0 end)
-        pcall(function() y = tonumber(mq.TLO.Me.Y()) or 0 end)
-        pcall(function() z = tonumber(mq.TLO.Me.Z()) or 0 end)
-        COTHG.active, COTHG.at = true, { x = x, y = y, z = z }
-        COTHG.castAt, COTHG.done, COTHG.saidWait = 0, 0, 0
-        COTHG.startedAt = mq.gettime()
-        rezlog('[cothg] solo gather started - I am the only summoner')
-        -- SAY IT OUT LOUD.
-        pcall(function() mq.cmd('/gsay CoTH: Gathering the group') end)
-        -- The charm goes on the same way it does for a group gather, through the same code and the same
-        -- recovery file. Off means click it from the bag, exactly as the toggle promises everywhere else.
-        if cothSwap then cothSwapWant = { auto = true } end
-    else
-        COTHG.active = false
-        rezlog('[cothg] solo gather stopped after %d summon(s)', COTHG.done or 0)
-        cothSwapWant = { back = true, auto = true }
-    end
-end
-
-function cothg_tick()
-    if not COTHG.active then return end
-    local now = mq.gettime()
-    if (now - (COTHG.startedAt or now)) > COTHG_GIVE_UP then
-        rezlog('\\ay[cothg] giving up after %ds\\ax', COTHG_GIVE_UP / 1000)
-        pcall(function() mq.cmd('/gsay CoTH: giving up - some of you will need to make your own way.') end)
-        cothg_set(false)
-        return
-    end
-    -- Nothing starts until the charm is settled. cothSwapWant is cleared by the swap tick, so this is
-    -- simply 'a swap has been asked for and has not run yet'.
-    if cothSwapWant then return end
-
-    local far, missing = {}, {}
-    for _, m in ipairs(cothg_targets()) do
-        if m.id <= 0 then missing[#missing + 1] = m.name
-        elseif m.dist < 0 or m.dist > COTH.RANGE then far[#far + 1] = m end
-    end
-    if #far == 0 then
-        rezlog('[cothg] everyone is here after %d summon(s)%s', COTHG.done or 0,
-               (#missing > 0) and (' - not in zone: ' .. table.concat(missing, ', ')) or '')
-        local secs = (now - (COTHG.startedAt or now)) / 1000
-        -- Only worth saying if something actually happened - announcing a gather where nobody needed
-        -- summoning is noise in somebody else's chat window.
-        if (COTHG.done or 0) > 0 then
-            pcall(function()
-                mq.cmdf('/gsay CoTH: everyone is here - %d summoned in %.0f seconds.', COTHG.done, secs)
-            end)
-        end
-        -- NAME WHO IS STILL OUT. This is the one thing a person can act on and the script cannot: a
-        -- member in another zone has to walk or gate, and nobody knows that unless they are told.
-        if #missing > 0 then
-            pcall(function()
-                mq.cmdf('/gsay CoTH: cannot reach %s - not in this zone.', table.concat(missing, ', '))
-            end)
-        end
-        cothg_set(false)
-        return
-    end
-    -- FURTHEST FIRST. With one summoner the order is only about not wasting a cast on somebody who was
-    -- about to walk in anyway.
-    table.sort(far, function(a, b) return (a.dist or 0) > (b.dist or 0) end)
-
-    local em = coth_emblem()
-    if em ~= 0 then
-        if em > 0 and (now - (COTHG.saidWait or 0)) > 10000 then
-            COTHG.saidWait = now
-            rezlog('[cothg] emblem back in %ds - %d still out', em, #far)
-        elseif em < 0 then
-            rezlog('\\ay[cothg] I have no %s - stopping\\ax', COTH.ITEM)
-            pcall(function() mq.cmd('/gsay CoTH: I cannot find my emblem - stopping.') end)
-            cothg_set(false)
-        end
-        return
-    end
-
-    local t = far[1]
-    -- SAME CURSOR GUARD AS THE GROUP GATHER. This path had none at all - it cast straight into whatever
-    -- was held, and casting with an item on the cursor disconnects the client.
-    local clear, stuck = cursor_stow('cothg')
-    if not clear then
-        rezlog('\\ar[cothg] NOT casting - "%s" is stuck on the cursor. Clear it and the next pass '
-            .. 'will summon %s.\\ax', tostring(stuck or '?'), t.name)
-        return
-    end
-    rezlog('[cothg] summoning %s (%d away)', t.name, t.dist or -1)
-    pcall(function() mq.cmdf('/gsay CoTH: summoning %s now.', t.name) end)
-    at_cast(COTH.ITEM .. COTH.OPTS, t.id)
-    -- SAME TWO-PART WAIT AS THE GROUP GATHER: see the cast start, then see it finish. A bard gets no bar
-    -- from the emblem, so the reuse timer starting counts as proof it went out.
-    local castFrom, started, sawBar = mq.gettime(), false, false
-    mq.delay(3000, function()
-        sawBar = (tonumber(mq.TLO.Me.Casting.ID()) or 0) > 0
-        local tr = -1
-        pcall(function() tr = tonumber(mq.TLO.FindItem('=' .. COTH.ITEM).TimerReady()) or -1 end)
-        started = sawBar or (tr > 0)
-        return started
-    end)
-    if not started then
-        rezlog('\\ay[cothg] the emblem never went out for %s\\ax', t.name)
-        return
-    end
-    if sawBar then
-        mq.delay(20000, function()
-            return (tonumber(mq.TLO.Me.Casting.ID()) or 0) == 0 or not COTHG.active
-        end)
-    else
-        mq.delay(11000, function() return not COTHG.active end)
-    end
-    if not COTHG.active then return end
-    COTHG.done = (COTHG.done or 0) + 1
-    local wornNow = false
-    pcall(function() wornNow = coth_item_has_emblem(mq.TLO.Me.Inventory('charm')) end)
-    rezlog('[cothg]   cast finished for %s in %.1fs (emblem %s)', t.name,
-           (mq.gettime() - castFrom) / 1000, wornNow and 'WORN' or 'in a bag')
-end
-
--- =========================================================================== CHARM SWAP - test only,
--- nothing calls this from the CoTH run yet
--- =========================================================================== Spell haste applies to a
--- clicky only when ...
-cothCharmSaved = nil     -- what was in the charm slot before we touched it ('' = empty)
-cothCharmWorn  = nil     -- what WE seated, so a charm that comes back off can be spotted and re-seated
-cothCharmReseat = 0      -- how many times we have had to put it back this gather
-cothSwapWant   = nil     -- set by the bind, drained by the main loop: this does cursor work and delays
-
--- OUR OWN HOLD, NOT THE PLACATE'S.
-cothSwapHeld = false
-function coth_swap_hold()
-    if cothSwapHeld then return end
-    cothSwapHeld = true
-    e3_hold('cothswap')
-end
-function coth_swap_unhold(why)
-    if not cothSwapHeld then return end
-    cothSwapHeld = false
-    e3_release('cothswap')
-    rezlog('[coth] E3 released (%s)', why or 'done')
-end
-
-function coth_charm_recovery_path()
-    local who = ''
-    pcall(function() who = tostring(mq.TLO.Me.Name() or 'unknown') end)
-    return at_read('adventuretime_cothcharm_' .. who .. '.txt')
-end
-
-function coth_charm_recovery_write()
-    local fh = io.open(coth_charm_recovery_path(), 'w')
-    if not fh then return end
-    fh:write('charm=' .. (cothCharmSaved or '') .. '\n')
-    fh:close()
-end
-
-function coth_charm_recovery_clear()
-    pcall(function() os.remove(coth_charm_recovery_path()) end)
-end
-
-function coth_charm_recovery_read()
-    local fh = io.open(coth_charm_recovery_path(), 'r')
-    if not fh then return nil end
-    local v = nil
-    for line in fh:lines() do
-        local k, val = line:match('^(%w+)=(.*)$')
-        if k == 'charm' and val and val ~= '' then v = val end
-    end
-    fh:close()
-    return v
-end
-
--- Pick an item up by name and confirm THE RIGHT one is on the cursor before doing anything with it.
-function coth_pickup(name, tries)
-    for n = 1, (tries or 4) do
-        pcall(function() mq.cmdf('/itemnotify "%s" leftmouseup', name) end)
-        mq.delay(900, function() return tostring(mq.TLO.Cursor.Name() or '') == name end)
-        if tostring(mq.TLO.Cursor.Name() or '') == name then return true end
-        rezlog('[coth]   could not pick up %s, retry %d', name, n)
-        mq.delay(300)
-    end
-    return false
-end
-
--- Seat whatever is on the cursor into the charm slot and confirm the slot reads it back.
-COTH_SETTLE_MS = 500
-
-function coth_seat_charm(name, tries)
-    for n = 1, (tries or 4) do
-        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
-        mq.delay(900, function()
-            return tostring(mq.TLO.Me.Inventory('charm').Name() or '') == name
-        end)
-        local seated = ''
-        pcall(function() seated = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-        if seated == name then
-            -- READ IT AGAIN AFTER IT SETTLES.
-            mq.delay(COTH_SETTLE_MS)
-            local again = ''
-            pcall(function() again = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-            if again == name then return true end
-            rezlog('\\ay[coth]   %s seated then came back as "%s" - reseating\\ax',
-                   name, (again ~= '') and again or '(empty)')
-            -- Whatever is there now is not what we asked for, and it may be sitting on the cursor. Clear
-            -- before trying again, or the next click swaps the two round instead of fixing anything.
-            cursor_stow('coth')
-        else
-            rezlog('[coth]   %s did not seat in charm, retry %d', name, n)
-        end
-        mq.delay(300)
-    end
-    return false
-end
-
-
-function coth_charm_take_off()
-    local now = ''
-    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if now == '' or now == 'NULL' then return true, '' end
-    for n = 1, 4 do
-        pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
-        mq.delay(900, function() return tostring(mq.TLO.Cursor.Name() or '') == now end)
-        if tostring(mq.TLO.Cursor.Name() or '') == now then
-            -- ON THE CURSOR IS NOT PUT AWAY.
-            for st = 1, 3 do
-                ep_stow_cursor()
-                mq.delay(700, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-                if (mq.TLO.Cursor.ID() or 0) == 0 then
-                    mq.delay(COTH_SETTLE_MS)
-                    rezlog('[coth]   took off %s and stowed it', now)
-                    return true, now
-                end
-                rezlog('[coth]   %s did not stow, retry %d of 3', now, st)
-            end
-            rezlog('\\ar[coth] %s is stuck on the cursor - putting it back on\\ax', now)
-            pcall(function() mq.cmd('/itemnotify charm leftmouseup') end)
-            mq.delay(700)
-            clear_cursor()
-            return false, now
-        end
-        rezlog('[coth]   charm pickup did not take, retry %d of 4', n)
-        mq.delay(300)
-    end
-    return false, now
-end
-
--- IS AN ATTUNE PROMPT BLOCKING US?
-COTH_BOX = 'ConfirmationDialogBox'
-COTH_ATTUNE_WORDS = { 'attune', 'permanently', 'make this item', 'no trade' }
-
-function coth_attune_box()
-    if not win_open_raw(COTH_BOX) then return false, '' end
-    local txt = ''
-    pcall(function() txt = tostring(mq.TLO.Window(COTH_BOX).Child('CD_TextOutput').Text() or '') end)
-    local low = txt:lower()
-    for _, w in ipairs(COTH_ATTUNE_WORDS) do
-        if low:find(w, 1, true) then return true, txt end
-    end
-    -- A confirmation box we do not recognise is still a confirmation box, and it still blocks the
-    -- inventory. Say so rather than silently retrying into it.
-    return true, txt
-end
-
--- NO, NEVER YES.
-function coth_dismiss_box()
-    for _, b in ipairs({ 'CD_No_Button', 'No_Button', 'CD_Cancel_Button' }) do
-        pcall(function() mq.cmdf('/nomodkey /notify %s %s leftmouseup', COTH_BOX, b) end)
-        mq.delay(120)
-        if not win_open_raw(COTH_BOX) then return true end
-    end
-    return not win_open_raw(COTH_BOX)
-end
-
-function coth_charm_equip_inner(want)
-    local now = ''
-    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if now == want then
-        rezlog('[coth] %s is already worn - nothing to swap', want)
-        return true
-    end
-    local have = 0
-    pcall(function() have = tonumber(mq.TLO.FindItem('=' .. want).ID()) or 0 end)
-    if have <= 0 then
-        rezlog('\\ar[coth] cannot find "%s" - not swapping\\ax', want)
-        return false
-    end
-    -- A BOX ALREADY OPEN BLOCKS EVERYTHING. Cheap to check, and starting a swap into a modal dialog is
-    -- how the take-off succeeds and nothing can be put back.
-    if win_open_raw(COTH_BOX) then
-        rezlog('\\ay[coth] a confirmation box is open - not starting a swap into it\\ax')
-        return false
-    end
-    -- E3 PAUSED FOR THE SWAP, same reason the placate strip does it: a live E3 grabs the cursor and
-    -- re-equips underneath us. Every exit below resumes it.
-    coth_swap_hold()
-    -- BAGS ARE NOT OPENED FOR THIS.
-    cothCharmSaved = now
-    -- WHAT WE PUT ON, so the guard below can tell 'still worn' from 'quietly came off'. Recorded next to
-    -- what we took off, because the pair is what a recovery needs.
-    cothCharmWorn, cothCharmReseat = want, 0
-    coth_charm_recovery_write()
-    rezlog('[coth] charm slot holds "%s" - swapping in %s', (now ~= '') and now or '(empty)', want)
-
-    clear_cursor()
-    mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-
-    local off = coth_charm_take_off()
-    if not off then
-        rezlog('\\ar[coth] could not clear the charm slot - leaving it alone\\ax')
-        coth_swap_unhold('coth swap failed')
-        return false
-    end
-    mq.delay(COTH_SETTLE_MS)
-    if not coth_pickup(want) then
-        rezlog('\\ar[coth] %s never reached the cursor - putting the original back\\ax', want)
-        clear_cursor()
-        pcall(function() coth_charm_restore('swap aborted') end)
-        return false
-    end
-    mq.delay(COTH_SETTLE_MS)
-    if not coth_seat_charm(want) then
-        -- WHY it would not seat, not just that it would not. Four identical retries told nobody that a
-        -- dialog was sitting there waiting to be answered.
-        local boxed, txt = coth_attune_box()
-        if boxed then
-            rezlog('\\ar[coth] %s put up a confirmation box: "%s"\\ax', want, tostring(txt):sub(1, 90))
-            rezlog('\\ay[coth] equip it by hand once and answer the box - cancelling and putting the '
-                .. 'original back\\ax')
-            coth_dismiss_box()
-        else
-            rezlog('\\ar[coth] %s would not seat in the charm slot\\ax', want)
-        end
-        ep_stow_cursor()
-        pcall(function() coth_charm_restore('swap aborted') end)
-        return false
-    end
-    -- The slot was empty before this, so nothing should have come back to the cursor. Clearing it anyway
-    -- is free and the alternative is carrying somebody's charm into the next click.
-    ep_stow_cursor()
-    mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-    mq.delay(COTH_SETTLE_MS)
-    -- READ IT BACK ONE LAST TIME, after the dust settles. The old code trusted the verify inside the seat
-    -- and that is precisely the check that passed while the swap was quietly coming undone.
-    local final = ''
-    pcall(function() final = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if final ~= want then
-        rezlog('\\ar[coth] charm reads "%s" after the swap, wanted %s\\ax', final, want)
-        pcall(function() coth_charm_restore('swap did not hold') end)
-        return false
-    end
-    rezlog('[coth] charm swap done - %s is worn', want)
-    return true
-end
-
-function coth_charm_restore_inner(why)
-    local original = cothCharmSaved or coth_charm_recovery_read()
-    if original == nil then
-        coth_swap_unhold(why or 'nothing to restore')
-        return true
-    end
-    local now = ''
-    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if now == original then
-        rezlog('[coth] charm already back to "%s" (%s)', original, why or 'restore')
-        cothCharmSaved = nil
-        cothCharmWorn, cothCharmReseat = nil, 0
-        coth_charm_recovery_clear()
-        coth_swap_unhold(why or 'coth swap done')
-        return true
-    end
-    clear_cursor()
-    mq.delay(400, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-    -- SAME ORDER AS THE SWAP, in reverse.
-    local ok = coth_charm_take_off()
-    if ok and original ~= '' then
-        mq.delay(COTH_SETTLE_MS)
-        if coth_pickup(original) then
-            mq.delay(COTH_SETTLE_MS)
-            ok = coth_seat_charm(original)
-            ep_stow_cursor()
-        else
-            ok = false
-            rezlog('\\ar[coth] %s is not findable in bags - charm slot left empty\\ax', original)
-        end
-    end
-    mq.delay(500, function() return (mq.TLO.Cursor.ID() or 0) == 0 end)
-    mq.delay(COTH_SETTLE_MS)
-    -- Read it back rather than trusting the seat, for the reason the swap now does the same.
-    local final = ''
-    pcall(function() final = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if ok and final == original then
-        rezlog('[coth] charm restored to "%s" (%s)', (original ~= '') and original or '(empty)', why or 'restore')
-        cothCharmSaved = nil
-        cothCharmWorn, cothCharmReseat = nil, 0
-        coth_charm_recovery_clear()
-    else
-        -- KEEP THE RECORD. cothCharmSaved is what the backstop and /atcothswap back work from, so clearing
-        -- it on a failed restore would throw away the only note of what belongs in that slot.
-        ok = false
-        rezlog('\\ar[coth] charm reads "%s", wanted "%s" - leaving the record in place to retry\\ax',
-               (final ~= '') and final or '(empty)', original)
-    end
-    coth_swap_unhold(why or 'coth swap done')
-    return ok
-end
-
--- ONE HOLD PER CALL, RELEASED WHATEVER HAPPENS.
-function coth_charm_equip(want)
-    if COTH_OPEN_BAGS then bags_hold() end
-    local ran, res = pcall(coth_charm_equip_inner, want)
-    if COTH_OPEN_BAGS then bags_drop() end
-    if not ran then
-        rezlog('\\ar[coth] charm swap errored: %s\\ax', tostring(res))
-        return false
-    end
-    return res
-end
-
-function coth_charm_restore(why)
-    if COTH_OPEN_BAGS then bags_hold() end
-    local ran, res = pcall(coth_charm_restore_inner, why)
-    if COTH_OPEN_BAGS then bags_drop() end
-    if not ran then
-        rezlog('\\ar[coth] charm restore errored: %s\\ax', tostring(res))
-        return false
-    end
-    return res
-end
-
--- Drained from the main loop, not the bind: this does cursor work and second-long delays, and a bind
--- runs inside doevents where blocking is how you hold the whole loop down.
-if cothSwap == nil then cothSwap = true end
-
-COTH_SWAP_MAX = 180000   -- backstop: never stay swapped longer than this, whatever the gather is doing
-
--- TELL THE GROUP, AND TELL MYSELF.
-function coth_report_swap(state)
-    COTH.swapped = COTH.swapped or {}
-    COTH.swapped[myName] = state
-    pcall(function() peer_bcast('/at_cothswapped %s %s', myName, state) end)
-end
-cothSwapAt    = 0
-
--- IT CAME OFF AGAIN.
-function coth_charm_guard()
-    if not cothCharmWorn or cothCharmWorn == '' then return end
-    local now = ''
-    pcall(function() now = tostring(mq.TLO.Me.Inventory('charm').Name() or '') end)
-    if now == cothCharmWorn then return end
-    if (cothCharmReseat or 0) >= COTH_RESEAT_MAX then return end
-    cothCharmReseat = (cothCharmReseat or 0) + 1
-    rezlog('\\ay[coth] %s came back off - slot now holds "%s" - reseating (%d of %d)\\ax',
-           cothCharmWorn, (now ~= '') and now or '(empty)', cothCharmReseat, COTH_RESEAT_MAX)
-    -- Clear the cursor first: whatever displaced the charm may still be on it, and clicking with a full
-    -- cursor swaps the two round instead of fixing anything.
-    cursor_stow('coth')
-    if (mq.TLO.Cursor.ID() or 0) ~= 0 then
-        rezlog('\\ar[coth] cursor will not clear - not reseating into a held item\\ax')
-        return
-    end
-    if coth_pickup(cothCharmWorn) and coth_seat_charm(cothCharmWorn) then
-        rezlog('[coth] %s is back on', cothCharmWorn)
-    elseif cothCharmReseat >= COTH_RESEAT_MAX then
-        rezlog('\\ar[coth] %s has come off %d times this gather - something is re-equipping underneath '
-            .. 'us. Leaving it alone rather than fighting the client.\\ax', cothCharmWorn, cothCharmReseat)
-    end
-end
-
-function coth_swap_tick()
-    coth_charm_guard()
-    -- BACKSTOP FIRST.
-    if cothCharmSaved and cothSwapAt > 0 and (mq.gettime() - cothSwapAt) > COTH_SWAP_MAX then
-        cothSwapAt = 0
-        rezlog('\\ay[coth] swapped for over %ds - putting the charm back\\ax', COTH_SWAP_MAX / 1000)
-        pcall(function() coth_charm_restore('stayed swapped too long') end)
-        return
-    end
-    if not cothSwapWant then return end
-    local w = cothSwapWant
-    cothSwapWant = nil
-
-    if w.back then
-        cothSwapAt = 0
-        coth_charm_restore(w.auto and 'gather finished' or 'asked by hand')
-        return
-    end
-
-    -- The automatic path has no name to work from: find it. A character with no emblem simply has
-    -- nothing to do, which is the honest answer for most of the group and needs no special case.
-    local name = w.name
-    local wornAlready = false
-    if w.auto then
-        name, wornAlready = coth_find_charm()
-    end
-    -- SWITCHED OFF: answer immediately and do nothing. Reporting still matters - a character that is not
-    -- swapping must say so, or the gather waits the full COTH_SWAP_WAIT for an answer never coming.
-    if w.auto and not cothSwap then
-        coth_report_swap('off')
-        return
-    end
-    if w.auto and (not name or wornAlready) then
-        -- Nothing to swap. Report anyway - the driver is counting answers, and a character that cannot
-        -- help still has to say so or the whole gather waits on it.
-        coth_report_swap(name and 'worn' or 'none')
-        return
-    end
-    if not name then
-        rezlog('[coth] no charm holding the %s was found', COTH.ITEM)
-        return
-    end
-    local ok = coth_charm_equip(name)
-    if ok then cothSwapAt = mq.gettime() end
-    if w.auto then coth_report_swap(ok and 'ok' or 'fail') end
 end
 
 -- Re-running is safe as long as epSaved is not clobbered: a slot stripped on pass one now reads empty,
@@ -16642,6 +15293,8 @@ AT_COMMANDS = {
     { group = 'Group actions' },
     { cmd = '/atcoth',          desc = 'gather the group to where I am standing' },
     { cmd = '/atcoth off',      desc = 'stop the gather' },
+    { cmd = '/atburncheck <burn>', desc = 'after /e3burns on the burn hotkey: show what has not fired yet' },
+    { cmd = '/atburncheck off', desc = 'clear the burn check' },
     { cmd = '/atwipe',          desc = 'hold all rezzes until the group zones' },
     { cmd = '/atwipe off',      desc = 'release the hold' },
     { cmd = '/atresume',        desc = 'resume after a hold' },
@@ -17442,8 +16095,11 @@ end
 function revive_check()
     if not SHOW_UI then return end
     local now, limit = mq.gettime(), expected_gap() * 2 + 3000
+    -- NOT OURS, LEFT ALONE (1.21.2): a group member the network does not see is somebody else's character -
+    -- it was pinged every 2 minutes and told to start a worker it does not have (bring_up_group skips them too).
+    local netSet = net_peer_set()
     for _, nm in ipairs(group_members()) do
-        if nm:lower() ~= myName:lower() then
+        if nm:lower() ~= myName:lower() and net_is_peer(nm, netSet) then
             local last = 0
             for _, t in ipairs({ burnState[nm], potState[nm], healState[nm], cureState[nm],
                                  DI.state[nm], rezReady[nm], tributeState[nm], burnSumAt[nm] }) do
@@ -19437,6 +18093,7 @@ if SHOW_UI then
     log('   \\ay/atpac\\ax re-announces my pacify ceiling (run it after memming a new rank).')
     log('   \\ay/atwipe\\ax holds all rezzes until the group zones (\\ay/atwipe off\\ax to release).')
     log('   \\ay/atburnaudit\\ax writes a file listing every burn, its real reuse, and whether its tier fits.')
+    log('   \\ay/atburncheck <burn>\\ax after /e3burns on your burn hotkey: what has not fired yet shows under Running now.')
 
 -- RECOVER STRIPPED GEAR AT STARTUP.
 epRecoverAt = mq.gettime() + 5000
@@ -19548,6 +18205,13 @@ local function check_peer_network()
         log('[net] %s off the network, but dead - that is expected while they zone', table.concat(dead, ', '))
     end
     if #missing == 0 then return end
+    -- SOME SEEN, SOME NOT (1.21.2): the network works, so the ones it does not see are somebody else's
+    -- characters, not a broken setup - said plainly, without the fix-your-ini advice.
+    if #missing + #dead < #mine then
+        log('[net] not on %s - somebody else\'s character(s), left alone: %s',
+            (peerChan == 'eqbc') and 'EQBC' or 'DanNet', table.concat(missing, ', '))
+        return
+    end
     log('\\ar*** PEER NETWORK PROBLEM ***\\ax')
     log('\\arCannot see %d of %d group member(s) on %s: %s\\ax', #missing, #mine,
         (peerChan == 'eqbc') and 'EQBC' or 'DanNet', table.concat(missing, ', '))
@@ -20205,6 +18869,7 @@ while running do
         pcall(function() mq.cmdf('/tribute %s', mode) end)   -- /tribute on|off already applies to the whole group
         tributeRequested = true   -- refresh the readout so the button + roster reflect the new state
     end
+    if SHOW_UI and BURNCHK then pcall(burncheck_tick) end
     if burnRefreshRequested then
         burnRefreshRequested = false
         burnState = {}; burnClass = {}          -- drop the whole table so stale toons/items clear out
@@ -20221,6 +18886,15 @@ while running do
             burnPending[nm] = nil
             if driverName then peer_cmdf(driverName, '/at_burn %s %s %d %d %d %d %s %d %s %s', myName, myClass, d.tier, d.secs, d.av, d.dsecs, d.kind or 'i', d.ord or 0, d.tkey or '?', nm)
             else peer_bcast('/at_burn %s %s %d %d %d %d %s %d %s %s', myName, myClass, d.tier, d.secs, d.av, d.dsecs, d.kind or 'i', d.ord or 0, d.tkey or '?', nm) end
+            if d.expect then
+                if driverName then peer_cmdf(driverName, '/at_burnexp %s %s', myName, nm)
+                else peer_bcast('/at_burnexp %s %s', myName, nm) end
+            end
+            if d.warn then
+                local w = (d.warn:gsub(' ', '~'))
+                if driverName then peer_cmdf(driverName, '/at_burnwarn %s %s %s', myName, w, nm)
+                else peer_bcast('/at_burnwarn %s %s %s', myName, w, nm) end
+            end
             sent = sent + 1
             if sent >= 1 then break end
         end
@@ -20429,12 +19103,23 @@ while running do
                 local prev = burnLast[name]
                 if prev == nil or prev ~= key then   -- report on ready<->down OR active<->inactive flip
                     burnLast[name] = key
+                    -- every burn it is listed under, lowest first, '+' between (1.21.3): the driver keeps the
+                    -- first as the tier it shows and all of them for /atburncheck
+                    local keyList = table.concat(entry.keys or { entry.tkey or '?' }, '+')
+                    local warn = burn_target_warn(name, kind)
+                    entry.expect = burn_expects_buff(name, kind)   -- a field, not a local: the main chunk is at Lua's 200-local ceiling
                     if SHOW_UI then   -- I'm the driver: update my own table directly, no network
                         burnClass[myName] = myClass
                         burnState[myName] = burnState[myName] or {}
-                        burnState[myName][name] = { tier = tier, secs = secs, active = active, dsecs = dsecs or 0, kind = kind, ord = ord, tkey = (entry.tkey or '?'), updated = mq.gettime() }
+                        burnState[myName][name] = { tier = tier, secs = secs, active = active, dsecs = dsecs or 0, kind = kind, ord = ord, tkey = (entry.tkey or '?'), keys = burn_key_set(keyList), updated = mq.gettime() }
+                        burnWarn[myName] = burnWarn[myName] or {}
+                        burnWarn[myName][name] = warn
+                        burnExpect[myName] = burnExpect[myName] or {}
+                        burnExpect[myName][name] = entry.expect or nil
                     else              -- queue it; the drain below spreads the burst over a second or so
-                        burnPending[name] = { tier = tier, secs = secs, av = (active and 1 or 0), dsecs = math.floor(dsecs or 0), kind = kind, ord = ord, tkey = ((entry.tkey or '?'):gsub(' ', '~')) }   -- '~' so 'Quick Burn' survives arg splitting
+                        burnPending[name] = { tier = tier, secs = secs, av = (active and 1 or 0), dsecs = math.floor(dsecs or 0), kind = kind, ord = ord, tkey = (keyList:gsub(' ', '~')),   -- '~' so 'Quick Burn' survives arg splitting
+                                              warn = (prev == nil) and warn or nil,
+                                              expect = (prev == nil) and entry.expect or nil }
                     end
                 end
             end
@@ -20754,6 +19439,9 @@ while running do
     -- doevents says whether a lag spike and a pile of arrivals are the same event.
     NETIN.tick = 0
     atphase('doevents'); mq.doevents()
+    -- doevents is timed into THIS tick (1.21.1): it was the last phase, recorded only after the slow check
+    -- had read the tick and been reset, so the next tick's report named 'doevents' with this one's time.
+    atphase('tick_end')
     if NETIN.tick > NETIN.worstTick then
         NETIN.worstTick, NETIN.worstAt = NETIN.tick, mq.gettime()
     end
@@ -20832,6 +19520,7 @@ while running do
         AT_HEAVY_N = AT_HEAVY_N + 1
     end
     AT_tickWorst, AT_tickWorstMs = nil, 0
+    AT_phaseStart = nil   -- the bookkeeping after tick_end is not carried into the next tick's worst (1.21.1)
     atphase('idle')
     AT_phaseStart = nil
     -- THE TICK RATE IS THE REAL DIAL, and it was the one thing low spec mode never touched.
@@ -20967,6 +19656,9 @@ pcall(function() mq.unbind('/atcurrency') end)
 pcall(function() mq.unbind('/atcothaug') end)
 pcall(function() mq.unbind('/atnv') end)
 pcall(function() mq.unbind('/atburnaudit') end)
+pcall(function() mq.unbind('/atburncheck') end)
+pcall(function() mq.unbind('/at_burnwarn') end)
+pcall(function() mq.unbind('/at_burnexp') end)
 pcall(function() mq.unbind('/atrange') end)
 pcall(function() mq.unbind('/atreclaim') end)
 pcall(function() mq.unbind('/attab') end)

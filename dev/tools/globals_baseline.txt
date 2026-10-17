@@ -1,0 +1,2 @@
+# globals read but never set when the baseline was taken (host-provided or known)
+AT_FORCE_BOT
