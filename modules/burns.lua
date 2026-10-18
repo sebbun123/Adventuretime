@@ -325,11 +325,20 @@ pcall(function()
         local on = tostring(who or ''):gsub('[%.%s]+$', '')
         local by = tostring(line or ''):match('Blocked by ([^%.%)]+)')
         burnBlocked[sp:lower()] = { by = by, on = on, at = mq.gettime() }
-        if on:lower() == tostring(myName or ''):lower() then
+        -- ONLY BURN SPELLS GO IN THE LOG (1.23.5): procs and group buffs (Chaotic Blood Focus, Shared Survival)
+        -- fail to stack all fight and filled the logs.
+        if on:lower() == tostring(myName or ''):lower() and burn_spell_is_mine(sp) then
             rezlog('[burns] %s did not take hold on me - blocked by %s', sp, by or '(the game did not say)')
         end
     end)
 end)
+function burn_spell_is_mine(sp)
+    local l = tostring(sp or ''):lower()
+    for n, v in pairs(burnSpellCache or {}) do
+        if tostring(v):lower() == l or tostring(n):lower() == l then return true end
+    end
+    return false
+end
 -- 1.23.1: AAs too (Improved Twincast on Azyue), with the slot count, and the numbers go to the driver.
 function burn_nobuff_diag(name, t, ds, it, kind)
     kind = kind or 'i'
@@ -388,7 +397,11 @@ function burn_nobuff_diag(name, t, ds, it, kind)
     -- WHAT IT WOULD NOT STACK WITH (1.23.2): every buff and song up now that the game says this spell will not
     -- stack with - the likely blocker when there was room (Azyue's Twincast at 31/39).
     local blockers = {}
+    local scanAt = mq.gettime()
+    local told = burnBlocked[tostring(sp):lower()]
+    local skipScan = told and (mq.gettime() - told.at) < 30000
     local function check(n)
+        if skipScan then return end
         if n == '' or n == 'NULL' then return end
         local ok, ws = pcall(function() return mq.TLO.Spell(sp).WillStack(n)() end)
         if ok and (ws == false or tostring(ws) == 'FALSE') then blockers[#blockers + 1] = n end
@@ -399,7 +412,10 @@ function burn_nobuff_diag(name, t, ds, it, kind)
         check(n)
     end
     for _, n in ipairs(songs) do check(n) end
-    rezlog('[burns]   %s would not stack with: %s', sp, (#blockers > 0) and table.concat(blockers, ', ') or 'nothing up now')
+    if not skipScan then
+        rezlog('[burns]   %s would not stack with: %s (%dms)', sp, (#blockers > 0) and table.concat(blockers, ', ') or 'nothing up now',
+            mq.gettime() - scanAt)
+    end
     local bl, by = burnBlocked[tostring(sp):lower()], nil
     if bl and (mq.gettime() - bl.at) < 30000 then
         by = bl.by or 'unknown'

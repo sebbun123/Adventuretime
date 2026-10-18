@@ -3146,6 +3146,15 @@ function burn_why_send(name, nb, mb, ns, by, dsc, sh)
             by and enc(by) or '-', dsc and enc(dsc) or '-', sh and enc(sh) or '-') end)
     end
 end
+function burn_poll_slow_note()
+    local total = mq.gettime() - (BURN_PS or mq.gettime())
+    if total < AT_SLOW_TICK_MS or (mq.gettime() - (BURN_PT_SAID or 0)) < 10000 then return end
+    BURN_PT_SAID = mq.gettime()
+    table.sort(BURN_PT, function(a, b) return a[2] > b[2] end)
+    local top = {}
+    for i = 1, math.min(3, #BURN_PT) do top[#top + 1] = string.format('%s %dms', BURN_PT[i][1], BURN_PT[i][2]) end
+    rezlog('[slow] burn_poll %dms over %d lines - slowest: %s', total, #BURN_PT, table.concat(top, ', '))
+end
 -- A BURN LINE NOT ON THIS TOON (1.23.4): said once, a minute after it was first looked for, and taken back if
 -- it turns up. entry is a BURN_WATCH entry; its missAt/missSent fields carry the state.
 function burn_miss_note(entry, have)
@@ -19304,9 +19313,14 @@ while running do
         if not feed_wanted('burns') then
             if next(burnLast) ~= nil then burnLast = {} end
         else
+        -- WHICH LINE IS SLOW (1.23.5): burn_poll held the loop 2-4s around burns since 1.21. Each line is
+        -- timed; a pass over 400ms names its three slowest in the log.
+        BURN_PT, BURN_PS = {}, mq.gettime()
         for _ord, entry in ipairs(BURN_WATCH) do
             local name, tier = entry.name, entry.tier
+            BURN_PT0 = mq.gettime()
             local have, ready, secs, active, dsecs, kind = ability_state(name)
+            BURN_PT[#BURN_PT + 1] = { name, mq.gettime() - BURN_PT0 }
             local ord = _ord
             burn_miss_note(entry, have)
             if have then
@@ -19340,6 +19354,7 @@ while running do
                 end
             end
         end
+        burn_poll_slow_note()
         end
     end
     -- CLOSE THE BURN LABEL.
