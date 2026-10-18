@@ -116,7 +116,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
 VERSION = '1.23'
-local BUILD_TAG = '1.23.5'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.23.6'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_SECTION = {
@@ -7504,7 +7504,7 @@ pcall(function()
         local nb, ns = 0, 0
         -- Slots, not count - see the note in invis_self.
         pcall(function() nb = buff_slot_max(tonumber(mq.TLO.Me.CountBuffs()) or 0) end)
-        pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
+        ns = 30   -- every song slot, not the count (1.23.6): songs leave gaps as they fade
         log('[invisprobe] Me.Invis=%s | %d buff(s), %d song(s)', any, nb, ns)
         local function dump(kind, getName, count)
             for i = 1, (count or 0) do
@@ -7540,7 +7540,7 @@ pcall(function()
         local nb, ns = 0, 0
         -- Slots, not count - see the note in invis_self.
         pcall(function() nb = buff_slot_max(tonumber(mq.TLO.Me.CountBuffs()) or 0) end)
-        pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
+        ns = 30   -- every song slot, not the count (1.23.6): songs leave gaps as they fade
         pcall(function() sweep(function(i) return mq.TLO.Me.Buff(i).Name() end, nb) end)
         pcall(function() sweep(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
         -- ALWAYS, WHATEVER WE THINK.
@@ -15612,7 +15612,7 @@ function invis_self()
     local nb, ns = 0, 0
     -- SLOTS, NOT COUNT.
     pcall(function() nb = buff_slot_max(tonumber(mq.TLO.Me.CountBuffs()) or 0) end)
-    pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
+    ns = 30   -- every song slot, not the count (1.23.6): songs leave gaps as they fade
     pcall(function() look(function(i) return mq.TLO.Me.Buff(i).Name() end, nb) end)
     pcall(function() look(function(i) return mq.TLO.Me.Song(i).Name() end, ns) end)
     -- THE BUFFS DECIDE, NOT Me.Invis.
@@ -15822,7 +15822,10 @@ function invis_prep_self()
     local nb, ns = 0, 0
     -- SLOTS, NOT COUNT.
     pcall(function() nb = buff_slot_max(tonumber(mq.TLO.Me.CountBuffs()) or 0) end)
-    pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or 0 end)
+    -- EVERY SONG SLOT, NOT THE COUNT (1.23.6). Songs leave gaps as they fade: with 12 songs up, Chaotic
+    -- Blood Focus can sit in slot 15, and walking slots 1-12 never reached it - the necros kept it, and
+    -- it broke the invis that landed on them.
+    ns = 30
     local function strip(getName, count)
         for i = 1, (count or 0) do
             local nm = ''
@@ -15830,6 +15833,7 @@ function invis_prep_self()
             if nm ~= '' and nm ~= 'NULL' and nm:lower():find('chaotic', 1, true) then
                 pcall(function() mq.cmdf('/removebuff "%s"', nm) end)
                 log('[invis] stripped %s - its proc breaks invis', nm)
+                rezlog('[invis] stripped %s (slot %d) - its proc breaks invis', nm, i)
             end
         end
     end
