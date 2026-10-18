@@ -116,7 +116,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
 VERSION = '1.23'
-local BUILD_TAG = '1.23.4'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.23.5'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_SECTION = {
@@ -1857,6 +1857,9 @@ function peer_bcast(fmt, ...)   -- broadcast to the whole in-game group in ONE r
     net_count(fmt)
     if not peerChan then peer_detect() end
     if not peerChan then return end
+    -- NO GROUP, NOBODY TO TELL (1.23.5): solo, /dgge has no channel and DanNet prints "Could not find
+    -- channel group" for every broadcast.
+    if (tonumber(mq.TLO.Group.Members()) or 0) == 0 then return end
     local cmd = fmt:format(...)
     if peerChan == 'e3' then mq.cmdf('/e3bcga %s', cmd)
     -- /bcg, not /bcga: /bcga includes the sender, /bcg is group-minus-self - the same set /dgge sends
