@@ -18603,6 +18603,25 @@ while running do
             end
             log('[sync] asked the group to re-report (driver just started)')
         end
+        -- A WORKER OUT OF ITS DRIVER'S GROUP CLOSES ITSELF (1.23.5). The driver closes a departed worker after
+        -- GROUP_CLOSE_GRACE, but that close is one message: lost, or the driver gone first, and the worker ran
+        -- on alone forever. 30s past the driver's own grace, the worker hands E3 back and stops.
+        if not SHOW_UI and driverName then
+            workerWithDriver = false
+            for _, m in ipairs(now) do
+                if m:lower() == driverName:lower() then workerWithDriver = true; break end
+            end
+            if workerWithDriver then workerAloneSince = nil
+            else
+                workerAloneSince = workerAloneSince or mq.gettime()
+                if mq.gettime() - workerAloneSince >= GROUP_CLOSE_GRACE + 30000 then
+                    atExitWhy = 'out of ' .. driverName .. "'s group too long - closed itself"
+                    log('[sync] not in %s\'s group for %ds - handing E3 back and closing', driverName,
+                        math.floor((mq.gettime() - workerAloneSince) / 1000))
+                    e3_release_all(); running = false
+                end
+            end
+        end
         -- GRACE EXPIRY. Deliberately re-checks the live roster rather than trusting the pending list:
         -- a rejoin that happened while no other roster change fired would otherwise still get closed.
         if SHOW_UI and next(pendingClose) then
