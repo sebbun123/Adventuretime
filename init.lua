@@ -116,7 +116,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
 VERSION = '1.23'
-local BUILD_TAG = '1.23.0'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.23.4'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_SECTION = {
@@ -2148,6 +2148,22 @@ pcall(function()
         peer_cmdf(driver, '/at_have %s %s %d', myName, encItem, my_count(dec(encItem)))
     end)
     -- On the DRIVER: record a peer's reported count.
+    -- On the DRIVER: a worker's buff window when one of its burn items fired with no buff (1.23.1).
+    mq.bind('/at_burnwhy', function(peer, encItem, nb, mb, ns, by, dsc, sh)
+        if not peer or not encItem then return end
+        local function u(x) return (x and x ~= '-') and dec(x) or nil end
+        burnWhy = burnWhy or {}
+        burnWhy[peer] = burnWhy[peer] or {}
+        burnWhy[peer][dec(encItem)] = { nb = nb or '?', mb = mb or '?', ns = ns or '?', by = u(by), dsc = u(dsc), sh = u(sh) }
+    end)
+    -- On the DRIVER: a worker's burn line that is not on that toon ('-' takes it back, '*' clears them all).
+    mq.bind('/at_burnmiss', function(peer, encItem, keys)
+        if not peer or not encItem then return end
+        burnMissing[peer] = burnMissing[peer] or {}
+        if encItem == '*' then burnMissing[peer] = {}; return end
+        if not keys or keys == '-' then burnMissing[peer][dec(encItem)] = nil
+        else burnMissing[peer][dec(encItem)] = burn_key_set((keys:gsub('~', ' '))) end
+    end)
     mq.bind('/at_have', function(peer, encItem, n)
         if not peer or not encItem then return end
         reportedCounts[peer:lower() .. '|' .. dec(encItem)] = tonumber(n) or 0
@@ -3114,6 +3130,44 @@ local discWatch      = nil   -- { name=, at=, expected= } : the disc currently r
 local lastDiscPoll   = 0
 burnState      = {}    -- driver: burnState[char][item] = { secs=, updated= }
 local driverName     = (not SHOW_UI) and ARGS[2] or nil   -- worker: driver name passed at launch (fallback: /at_ping)
+-- A burn item of mine fired with no buff: tell the driver what my buff window held (1.23.1). nb is nil when
+-- burn_nobuff_diag wrote nothing. The driver keeps its own straight away.
+function burn_why_send(name, nb, mb, ns, by, dsc, sh)
+    if nb == nil then return end
+    if SHOW_UI then
+        burnWhy = burnWhy or {}
+        burnWhy[myName] = burnWhy[myName] or {}
+        burnWhy[myName][name] = { nb = nb, mb = mb, ns = ns, by = by, dsc = dsc, sh = sh }
+    elseif driverName then
+        pcall(function() peer_cmdf(driverName, '/at_burnwhy %s %s %s %s %s %s %s %s', myName, enc(name), nb, mb, ns,
+            by and enc(by) or '-', dsc and enc(dsc) or '-', sh and enc(sh) or '-') end)
+    end
+end
+-- A BURN LINE NOT ON THIS TOON (1.23.4): said once, a minute after it was first looked for, and taken back if
+-- it turns up. entry is a BURN_WATCH entry; its missAt/missSent fields carry the state.
+function burn_miss_note(entry, have)
+    local now = mq.gettime()
+    if have then
+        if entry.missSent then
+            entry.missSent = nil
+            if SHOW_UI then (burnMissing[myName] or {})[entry.name] = nil
+            elseif driverName then pcall(function() peer_cmdf(driverName, '/at_burnmiss %s %s -', myName, enc(entry.name)) end) end
+        end
+        entry.missAt = nil
+        return
+    end
+    entry.missAt = entry.missAt or now
+    if entry.missSent or (now - entry.missAt) < 60000 then return end
+    entry.missSent = true
+    local keys = table.concat(entry.keys or { entry.tkey or '?' }, '+')
+    if SHOW_UI then
+        burnMissing[myName] = burnMissing[myName] or {}
+        burnMissing[myName][entry.name] = burn_key_set(keys)
+    elseif driverName then
+        pcall(function() peer_cmdf(driverName, '/at_burnmiss %s %s %s', myName, enc(entry.name), (keys:gsub(' ', '~'))) end)
+    end
+    rezlog('[burns] %s is not on this toon (not in the bags, or the AA is not bought)', entry.name)
+end
 local tributeState   = {}   -- name -> {active=bool, favor=num, updated=} : pushed by peers, never queried
 local burnClass      = {}     -- driver: char -> class short name (for the role filter)
 local burnFilter     = 'All'  -- Burns tab role filter: All / Tank / DPS / Healer
@@ -3418,7 +3472,7 @@ local function ability_state(name)
         else
             buffLatch[name] = nil       -- ready again: whatever it granted is done
         end
-        if burn_nobuff_diag then burn_nobuff_diag(name, t, ds, it) end   -- 1.22.3: why a buff item showed no buff
+        if burn_nobuff_diag then burn_why_send(name, burn_nobuff_diag(name, t, ds, it)) end   -- 1.22.3: why a buff item showed no buff
         abilityKind[name] = 'i'
         return true, (t == 0), t, (ds > 0), ds, 'i'
     end
@@ -3442,6 +3496,10 @@ local function ability_state(name)
             ds = my_effect_secs(name, function() return mq.TLO.Me.AltAbility(name).Spell.Name() end, 'a')
         else
             buffLatch[name] = nil
+        end
+        if burn_nobuff_diag then
+            burn_why_send(name, burn_nobuff_diag(name, aaRdy and 0 or ((aaSecs and aaSecs > 1) and aaSecs or 1), ds,
+                { Spell = mq.TLO.Me.AltAbility(name).Spell, Reuse = tonumber(mq.TLO.Me.AltAbility(name).MyReuseTime()) or 0 }, 'a'))
         end
         abilityKind[name] = 'a'
         if aaRdy then return true, true, 0, false, 0, 'a' end
@@ -3473,6 +3531,30 @@ local function ability_state(name)
         -- A READY DISC IS NOT THE ONE RUNNING (1.22.10): the same name can be running from a click (the Pants
         -- cast Crystalpalm Discipline), and that must not mark the Crystalpalm line as fired.
         if rdy then return true, true, 0, false, 0, 'd' end
+        -- A DISC THAT BUFFS (1.23.4): Arcane Reprisal never runs in the disc slot - it puts a buff on its
+        -- caster, so it never showed under Running now. Looked for by its own name, then by what it triggers.
+        if not active then
+            local s = my_effect_secs(name, function() return name end, 's')
+            if s <= 0 then
+                if burnTrigOf[name] == nil then
+                    local t = {}
+                    for i = 1, 4 do
+                        local tn = ''
+                        pcall(function() tn = tostring(mq.TLO.Spell(name).Trigger(i).Name() or '') end)
+                        if tn ~= '' and tn ~= 'NULL' then t[#t + 1] = tn end
+                    end
+                    burnTrigOf[name] = t
+                end
+                for _, tn in ipairs(burnTrigOf[name]) do
+                    pcall(function()
+                        s = math.max(tonumber(mq.TLO.Me.Buff(tn).Duration.TotalSeconds()) or 0,
+                                     tonumber(mq.TLO.Me.Song(tn).Duration.TotalSeconds()) or 0)
+                    end)
+                    if s > 0 then break end
+                end
+            end
+            if s > 0 then active = true; dsecs = s end
+        end
         local secs = -1; pcall(function() secs = tonumber(mq.TLO.Me.CombatAbilityTimer(name).TotalSeconds()) or -1 end)
         return true, false, (secs and secs > 0 and secs or -1), active, dsecs, 'd'
     end
@@ -8531,6 +8613,7 @@ pcall(function()
         end
     end)
     mq.bind('/at_burnresend', function()   -- driver's copy of my burns disagrees: report them all once
+        for _, e in ipairs(BURN_WATCH) do e.missSent = nil end
         burnLast = {}
         burnPending = {}
         lastBurnPoll = 0
@@ -8539,6 +8622,8 @@ pcall(function()
     mq.bind('/at_burnrefresh', function()   -- re-parse my [Burn] INI and re-report every item from scratch
         local fresh = parse_burns()
         if fresh and #fresh > 0 then BURN_WATCH = fresh end
+        if SHOW_UI then burnMissing[myName] = {}
+        elseif driverName then pcall(function() peer_cmdf(driverName, '/at_burnmiss %s *', myName) end) end
         burnLast = {}                        -- forget last-reported states so everything reports again
         burnPending = {}
         buffNameOf = {}                      -- re-resolve buff names too, in case items changed
@@ -19201,6 +19286,7 @@ while running do
             local name, tier = entry.name, entry.tier
             local have, ready, secs, active, dsecs, kind = ability_state(name)
             local ord = _ord
+            burn_miss_note(entry, have)
             if have then
                 -- dsecs IS A LIVE COUNTDOWN AND MUST NOT BE IN THE KEY.
                 local key = (ready and 'R' or 'd') .. (active and 'A' or '-')
@@ -19765,6 +19851,9 @@ pcall(function() mq.unbind('/atcothaug') end)
 pcall(function() mq.unbind('/atnv') end)
 pcall(function() mq.unbind('/atburnaudit') end)
 pcall(function() mq.unbind('/atburncheck') end)
+pcall(function() mq.unbind('/at_burnwhy') end)
+pcall(function() mq.unbind('/at_burnmiss') end)
+pcall(function() mq.unevent('at_burn_blocked') end)
 pcall(function() mq.unbind('/at_burnwarn') end)
 pcall(function() mq.unbind('/at_burnspell') end)
 pcall(function() mq.unbind('/at_burnexp') end)

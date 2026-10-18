@@ -121,9 +121,69 @@ test('a buff item on cooldown with no buff is explained once, 8s in', function()
     burn_nobuff_diag('Legs', 300, 0, it)
     now = now + 5000; burn_nobuff_diag('Legs', 295, 0, it); truthy(not has('on cooldown'), 'not yet')
     now = now + 4000; burn_nobuff_diag('Legs', 291, 0, it)
-    truthy(has('Legs: on cooldown 9s with no buff - its spell "Legs Effect" (Self, 60s)'), 'said'); truthy(has('buffs -1, songs -1'), 'window counts')
+    truthy(has('Legs: on cooldown 9s with no buff - its spell "Legs Effect" (Self, 60s)'), 'said'); truthy(has('buffs -1/-1, songs -1'), 'window counts')
     local n = #logs; now = now + 4000; burn_nobuff_diag('Legs', 287, 0, it); eq(#logs, n, 'once')
     burn_nobuff_diag('Legs', 0, 0, it); eq(burnDiag.Legs.ready, true, 'ready again')
+end)
+test('an AA with no buff is explained too, with the slot count; the driver shows it (1.23.1)', function()
+    reset(); burnDiag = {}; burnExpectCache = burnExpectCache or {}; burnExpectCache.ITC = true
+    local M = package.loaded.mq
+    local oc, om, os_ = M.TLO.Me.CountBuffs, M.TLO.Me.MaxBuffSlots, M.TLO.Me.CountSongs
+    M.TLO.Me.CountBuffs = function() return 39 end; M.TLO.Me.MaxBuffSlots = function() return 39 end
+    M.TLO.Me.CountSongs = function() return 7 end
+    spells.ITC = spell('Self', true, 60)
+    local it = { Spell = spells.ITC }
+    burn_nobuff_diag('ITC', 0, 0, it, 'a'); burn_nobuff_diag('ITC', 1, 0, it, 'a')
+    now = now + 9000
+    local nb, mb, ns = burn_nobuff_diag('ITC', 1, 0, it, 'a')
+    truthy(has('buffs 39/39, songs 7'), 'counts in the log line'); eq(nb, '39'); eq(mb, '39'); eq(ns, '7')
+    burnWhy = { Azyue = { ITC = { nb = nb, mb = mb, ns = ns } } }
+    eq(burn_why_text('Azyue', 'ITC'), ' (buffs 39/39, songs 7, buff window full)'); eq(burn_why_text('Azyue', 'Other'), '')
+    M.TLO.Me.CountBuffs, M.TLO.Me.MaxBuffSlots, M.TLO.Me.CountSongs = oc, om, os_
+end)
+test('"did not take hold ... Blocked by X" is quoted by the no-buff line and carried to the driver (1.23.3)', function()
+    reset(); burnDiag = {}; burnExpectCache = burnExpectCache or {}; burnExpectCache.ITC2 = true
+    spells.ITC2 = spell('Self', true, 60); spells.ITC2.Name = function() return 'Twincast' end
+    local it = { Spell = spells.ITC2 }
+    burnBlocked = { twincast = { by = 'Gift of Something', on = 'Tester', at = now } }
+    burn_nobuff_diag('ITC2', 0, 0, it, 'a'); burn_nobuff_diag('ITC2', 1, 0, it, 'a')
+    now = now + 9000
+    local nb, mb, ns, by = burn_nobuff_diag('ITC2', 1, 0, it, 'a')
+    eq(by, 'Gift of Something'); truthy(has('blocked by Gift of Something'), 'logged')
+    burnWhy = { Azyue = { ITC2 = { nb = '31', mb = '39', ns = '13', by = by } } }
+    eq(burn_why_text('Azyue', 'ITC2'), ' (buffs 31/39, songs 13, blocked by Gift of Something)')
+end)
+test('a block by an effect another burn line casts is called a duplicate (1.23.4)', function()
+    burnSpell = { Ejtou = { ['Battle Frenzy'] = 'Battle Frenzy', ['Fanatical Hammer'] = 'Battle Frenzy', Icon = 'Something' } }
+    burnWhy = { Ejtou = { ['Fanatical Hammer'] = { nb = '27', mb = '39', ns = '9', by = 'Battle Frenzy' },
+                          Icon = { nb = '27', mb = '39', ns = '9', by = 'Other Thing' } } }
+    eq(burn_dup_of('Ejtou', 'Fanatical Hammer'), 'Battle Frenzy')
+    eq(burn_why_text('Ejtou', 'Fanatical Hammer'), ' (buffs 27/39, songs 9, duplicate of Battle Frenzy)')
+    truthy(burn_dup_text('Ejtou', 'Fanatical Hammer'):find('Another burn item (Battle Frenzy) kept this from landing', 1, true), 'hover says what to do')
+    eq(burn_dup_of('Ejtou', 'Icon'), nil); eq(burn_why_text('Ejtou', 'Icon'), ' (buffs 27/39, songs 9, blocked by Other Thing)')
+    burnSpell = { Ejtou = { Solo = 'Solo Buff' } }; burnWhy = { Ejtou = { Solo = { nb = '1', mb = '39', ns = '0', by = 'Solo Buff' } } }
+    eq(burn_dup_of('Ejtou', 'Solo'), ''); truthy(burn_dup_text('Ejtou', 'Solo'):find('already up'), 'own effect')
+    burnSpell = {}; burnWhy = {}
+end)
+test('hints: full windows, a shared timer, a disc clash (1.23.4)', function()
+    burnSpell = {}
+    burnWhy = { A = { X = { nb = '30', mb = '39', ns = '20' }, Y = { nb = '30', mb = '39', ns = '5', sh = 'Gathering Dusk' },
+                      Z = { nb = '30', mb = '39', ns = '5', dsc = 'Crystalpalm Discipline' }, Q = { nb = '30', mb = '39', ns = '5', sh = '?' } } }
+    eq(burn_hints('A', 'X')[1][1], 'songs full'); truthy(burn_why_text('A', 'X'):find('song window full', 1, true), 'tag')
+    truthy(burn_hints('A', 'Y')[1][2]:find('Gathering Dusk', 1, true), 'names the partner')
+    eq(burn_why_text('A', 'Y'), ' (buffs 30/39, songs 5, may share a timer with Gathering Dusk)')
+    eq(burn_hints('A', 'Z')[1][1], 'disc clash'); eq(burn_hints('A', 'Q')[1][1], 'shared timer?')
+    burnWhy = {}
+end)
+test('an AA put on cooldown at a length not its own names what went down with it (1.23.4)', function()
+    reset(); burnDiag = {}; burnExpectCache = burnExpectCache or {}; burnExpectCache.ITC3 = true
+    spells.ITC3 = spell('Self', true, 60); spells.ITC3.Name = function() return 'Twincast' end
+    local it = { Spell = spells.ITC3, Reuse = 900 }
+    burn_nobuff_diag('ITC3', 0, 0, it, 'a'); burn_nobuff_diag('Dusk', 0, 0, { Spell = spells.ITC3, Reuse = 600 }, 'a')
+    burn_nobuff_diag('ITC3', 598, 0, it, 'a'); burn_nobuff_diag('Dusk', 598, 0, { Spell = spells.ITC3, Reuse = 600 }, 'a')
+    now = now + 9000
+    local _, _, _, _, _, sh = burn_nobuff_diag('ITC3', 589, 0, it, 'a')
+    eq(sh, 'Dusk'); truthy(has('may share a timer with: Dusk'), 'logged')
 end)
 test('a cooldown already running when AT loads is not explained', function()
     reset(); burnDiag = {}

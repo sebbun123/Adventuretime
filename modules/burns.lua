@@ -316,18 +316,40 @@ end
 -- them either. Once per cooldown, 8s after it starts, this worker writes what its spell is and where the effect
 -- could be: the running disc, and the spells it triggers (a click that casts X which lands Y).
 burnDiag = burnDiag or {}
-function burn_nobuff_diag(name, t, ds, it)
+-- THE GAME'S OWN ANSWER (1.23.3): "Your X did not take hold on Y. (Blocked by Z.)" is remembered by spell, and
+-- said in the log when it is about me. The no-buff line below quotes it.
+burnBlocked = burnBlocked or {}   -- spell (lower) -> { by, on, at }
+pcall(function()
+    mq.event('at_burn_blocked', 'Your #1# did not take hold on #2#.#*#', function(line, spell, who)
+        local sp = tostring(spell or ''):gsub(' spell$', '')
+        local on = tostring(who or ''):gsub('[%.%s]+$', '')
+        local by = tostring(line or ''):match('Blocked by ([^%.%)]+)')
+        burnBlocked[sp:lower()] = { by = by, on = on, at = mq.gettime() }
+        if on:lower() == tostring(myName or ''):lower() then
+            rezlog('[burns] %s did not take hold on me - blocked by %s', sp, by or '(the game did not say)')
+        end
+    end)
+end)
+-- 1.23.1: AAs too (Improved Twincast on Azyue), with the slot count, and the numbers go to the driver.
+function burn_nobuff_diag(name, t, ds, it, kind)
+    kind = kind or 'i'
     -- ONLY A COOLDOWN WE SAW START (1.22.5): one already running when AT loaded began long ago, and its buff
     -- may have come and gone - six false lines on the 18:49 restart.
     if t <= 0 then burnDiag[name] = { ready = true }; return end
     local d = burnDiag[name]
     if not d then burnDiag[name] = { done = true }; return end
     if d.done then return end
-    if not d.at then d.at = mq.gettime(); return end
+    if not d.at then
+        d.at = mq.gettime()
+        -- WHEN IT WILL BE READY AGAIN (1.23.4), for the shared-timer hint: t is the seconds left at first sight.
+        if t > 1 then d.endAt = d.at + t * 1000 end
+        d.reuse = tonumber(it and it.Reuse) or 0
+        return
+    end
     if ds > 0 then d.done = true; return end
     if (mq.gettime() - d.at) < BURNCHK_BUFF_GRACE then return end
     d.done = true
-    if not burn_expects_buff(name, 'i') then return end
+    if not burn_expects_buff(name, kind) then return end
     local sp, tt, dur, disc = '?', '?', 0, ''
     pcall(function()
         sp = tostring(it.Spell.Name() or '?'); tt = tostring(it.Spell.TargetType() or '?')
@@ -348,12 +370,13 @@ function burn_nobuff_diag(name, t, ds, it)
     -- HOW FULL ARE THE WINDOWS? (1.22.16) The 03:47 30minBurn had four effects that land as songs on other
     -- nights (Ancestral Aid, Frenzied Devastation, Seditionist's Scourge, Battle Frenzy) never showing. A full
     -- song window refuses new ones; the counts say whether that is it.
-    local nb, ns = -1, -1
+    local nb, ns, mb = -1, -1, -1
     pcall(function() nb = tonumber(mq.TLO.Me.CountBuffs()) or -1 end)
+    pcall(function() mb = tonumber(mq.TLO.Me.MaxBuffSlots()) or -1 end)
     pcall(function() ns = tonumber(mq.TLO.Me.CountSongs()) or -1 end)
-    rezlog('[burns] %s: on cooldown %ds with no buff - its spell "%s" (%s, %ds) is in neither window; running disc: %s; it triggers: %s; buffs %d, songs %d',
+    rezlog('[burns] %s: on cooldown %ds with no buff - its spell "%s" (%s, %ds) is in neither window; running disc: %s; it triggers: %s; buffs %d/%d, songs %d',
         name, math.floor((mq.gettime() - d.at) / 1000), sp, tt, dur, (disc ~= '' and disc ~= 'NULL') and disc or 'none',
-        (#trig > 0) and table.concat(trig, ', ') or 'nothing', nb, ns)
+        (#trig > 0) and table.concat(trig, ', ') or 'nothing', nb, mb, ns)
     -- WHAT IS IN THE SONG WINDOW (1.22.16), so the ones worth blocking in the E3 ini can be picked from a log.
     local songs = {}
     for i = 1, 30 do
@@ -362,6 +385,121 @@ function burn_nobuff_diag(name, t, ds, it)
         if n ~= '' and n ~= 'NULL' then songs[#songs + 1] = n end
     end
     if #songs > 0 then rezlog('[burns]   songs up now: %s', table.concat(songs, ', ')) end
+    -- WHAT IT WOULD NOT STACK WITH (1.23.2): every buff and song up now that the game says this spell will not
+    -- stack with - the likely blocker when there was room (Azyue's Twincast at 31/39).
+    local blockers = {}
+    local function check(n)
+        if n == '' or n == 'NULL' then return end
+        local ok, ws = pcall(function() return mq.TLO.Spell(sp).WillStack(n)() end)
+        if ok and (ws == false or tostring(ws) == 'FALSE') then blockers[#blockers + 1] = n end
+    end
+    for i = 1, 42 do
+        local n = ''
+        pcall(function() n = tostring(mq.TLO.Me.Buff(i).Name() or '') end)
+        check(n)
+    end
+    for _, n in ipairs(songs) do check(n) end
+    rezlog('[burns]   %s would not stack with: %s', sp, (#blockers > 0) and table.concat(blockers, ', ') or 'nothing up now')
+    local bl, by = burnBlocked[tostring(sp):lower()], nil
+    if bl and (mq.gettime() - bl.at) < 30000 then
+        by = bl.by or 'unknown'
+        rezlog('[burns]   the game said: %s did not take hold - blocked by %s', sp, by)
+    end
+    -- A SHARED TIMER (1.23.4): an AA whose cooldown started at a length that is not its own reuse was put on
+    -- cooldown by something else. What went on cooldown with it, ending at the same moment, is the likely
+    -- partner. Two abilities with the same reuse cannot be told apart this way, so nothing is said for those.
+    local shared
+    if kind == 'a' and (d.reuse or 0) > 0 and d.endAt then
+        local seenFor = (d.endAt - d.at) / 1000
+        if math.abs(seenFor - d.reuse) > 6 then
+            local with = {}
+            for other, od in pairs(burnDiag) do
+                if other ~= name and od.endAt and od.at and math.abs(od.endAt - d.endAt) <= 3000
+                   and math.abs(od.at - d.at) <= 4000 then with[#with + 1] = other end
+            end
+            table.sort(with)
+            shared = (#with > 0) and table.concat(with, ', ') or '?'
+            rezlog('[burns]   %s went on cooldown for %ds, but its own reuse is %ds - it may share a timer with: %s',
+                name, math.floor(seenFor), math.floor(d.reuse), (#with > 0) and shared or 'something not in this burn')
+        end
+    end
+    -- TWO DISCS (1.23.4): this one looks like a disc and another disc was already running.
+    local discClash
+    if disc ~= '' and disc ~= 'NULL' and disc:lower() ~= tostring(sp):lower() then
+        local isDisc = (burnEffectWhere or {})[name] == 'd'
+        if not isDisc then pcall(function() isDisc = tlo_true(mq.TLO.Spell(sp).IsSkill()) end) end
+        if isDisc then
+            discClash = disc
+            rezlog('[burns]   %s looks like a disc, and %s was already running - only one disc runs at a time', name, disc)
+        end
+    end
+    return tostring(nb), tostring(mb), tostring(ns), by, discClash, shared
+end
+-- WHAT THE BUFF WINDOW HELD when a burn item went on cooldown with no buff: each worker sends it to the driver
+-- (/at_burnwhy), shown on the amber line's hover and in the burn check's summary line.
+burnWhy = burnWhy or {}   -- char -> item -> { nb, mb, ns }
+-- NOT ON THIS TOON (1.23.4): a burn line whose item is not in the bags or whose AA is not bought, from the
+-- worker a minute after it first looked. char -> item -> set of burns it is listed under.
+burnMissing = burnMissing or {}
+-- A DISC THAT BUFFS (1.23.4): disc name -> the spells it triggers, read once.
+burnTrigOf = burnTrigOf or {}
+-- A DUPLICATE (1.23.4): blocked by an effect another burn line on the same toon casts (Ejtou's Fanatical Hammer
+-- is Battle Frenzy, and the Battle Frenzy AA fires first), or by its own effect already up. Returns the other
+-- line's name, '' when it is its own effect from somewhere else, nil when not a duplicate.
+function burn_dup_of(ch, it)
+    local w = (burnWhy[ch] or {})[it]
+    if not (w and w.by) then return nil end
+    local by = tostring(w.by):lower()
+    local mine = burnSpell[ch] or {}
+    local others = {}
+    for other, sp in pairs(mine) do
+        if other ~= it and tostring(sp):lower() == by then others[#others + 1] = other end
+    end
+    if #others > 0 then table.sort(others); return table.concat(others, ', ') end
+    if tostring(mine[it] or ''):lower() == by then return '' end
+    return nil
+end
+function burn_dup_text(ch, it)
+    local d = burn_dup_of(ch, it)
+    if not d then return nil end
+    if d == '' then return 'Its own effect (' .. tostring(burnWhy[ch][it].by) .. ') was already up, so this did not land. Consider adding an If to your ini?' end
+    return 'Another burn item (' .. d .. ') kept this from landing. Consider adding an If to your ini?'
+end
+BURN_SONG_MAX = 20   -- song window slots on this client
+-- HINTS (1.23.4): what the numbers a worker sent say to do about a burn item that showed no buff. Each is
+-- { label, hover text, summary tag }, most useful first; the amber line shows the first label.
+function burn_hints(ch, it)
+    local w = (burnWhy[ch] or {})[it]
+    local h = {}
+    if not w then return h end
+    local d = burn_dup_of(ch, it)
+    if d then h[#h + 1] = { 'duplicate', burn_dup_text(ch, it), (d ~= '') and ('duplicate of ' .. d) or 'duplicate' } end
+    local nb, mb, ns = tonumber(w.nb), tonumber(w.mb), tonumber(w.ns)
+    if nb and mb and mb > 0 and nb >= mb then
+        h[#h + 1] = { 'buffs full', string.format('Your buff window was full (%d/%d). Add a few buffs to Blocked Buffs?', nb, mb), 'buff window full' }
+    end
+    if ns and ns >= BURN_SONG_MAX then
+        h[#h + 1] = { 'songs full', string.format('Your song window was full (%d). Add a few songs to Blocked Buffs?', ns), 'song window full' }
+    end
+    if w.sh then
+        if w.sh == '?' then
+            h[#h + 1] = { 'shared timer?', 'Its cooldown started at a length that is not its own - it may share a timer with something outside this burn.', 'may share a timer' }
+        else
+            h[#h + 1] = { 'shared timer?', 'It may share a cooldown with ' .. w.sh .. ' - it went on cooldown without casting. Keep only one in this burn?', 'may share a timer with ' .. w.sh }
+        end
+    end
+    if w.dsc then
+        h[#h + 1] = { 'disc clash', 'Another disc (' .. w.dsc .. ') was running - only one disc runs at a time. Stagger them with an If?', w.dsc .. ' was running' }
+    end
+    return h
+end
+function burn_why_text(ch, it)
+    local w = (burnWhy[ch] or {})[it]
+    if not w then return '' end
+    local tags = {}
+    for _, x in ipairs(burn_hints(ch, it)) do tags[#tags + 1] = x[3] end
+    if w.by and not burn_dup_of(ch, it) then tags[#tags + 1] = 'blocked by ' .. w.by end
+    return string.format(' (buffs %s/%s, songs %s%s)', w.nb, w.mb, w.ns, (#tags > 0) and (', ' .. table.concat(tags, ', ')) or '')
 end
 -- WHAT A BURN LINE CASTS (1.22.15), for the hovers. The worker reads it once per item - the item's or AA's
 -- spell, or the disc itself - and sends it with the item's first report; the driver describes it from the
@@ -418,10 +556,21 @@ function burncheck_stop(why)
     for _, ch in ipairs(c.order) do
         local its = {}
         for it in pairs((c.nobuff or {})[ch] or {}) do its[#its + 1] = it; nn = nn + 1 end
-        if #its > 0 then table.sort(its); nob[#nob + 1] = ch .. ': ' .. table.concat(its, ', ') end
+        if #its > 0 then
+            table.sort(its)
+            for i, it in ipairs(its) do its[i] = it .. burn_why_text(ch, it) end
+            nob[#nob + 1] = ch .. ': ' .. table.concat(its, ', ')
+        end
     end
     local secs = math.floor((mq.gettime() - c.at) / 1000)
     local extra = (nn > 0) and ('; fired, but no buff showed: ' .. table.concat(nob, ' | ')) or ''
+    local miss = {}
+    for _, ch in ipairs(c.order) do
+        local its = {}
+        for it in pairs((c.missing or {})[ch] or {}) do its[#its + 1] = it end
+        if #its > 0 then table.sort(its); miss[#miss + 1] = ch .. ': ' .. table.concat(its, ', ') end
+    end
+    if #miss > 0 then extra = extra .. '; not found on the toon: ' .. table.concat(miss, ' | ') end
     if n == 0 and nn == 0 then
         log('[burncheck] %s: all %d fired in %ds', c.name, c.total, secs)
     elseif n == 0 then
@@ -432,6 +581,7 @@ function burncheck_stop(why)
     end
 end
 function burncheck_start(name)
+    burnWhy = {}
     local c = { name = name, at = mq.gettime(), pending = {}, order = {}, total = 0, notReady = 0, anyListed = false }
     for _, ch in ipairs(ordered_members()) do
         for it, st in pairs(burnState[ch] or {}) do
@@ -444,6 +594,17 @@ function burncheck_start(name)
                 else
                     c.notReady = c.notReady + 1
                 end
+            end
+        end
+    end
+    c.missing = {}
+    for _, ch in ipairs(ordered_members()) do
+        for it, keys in pairs(burnMissing[ch] or {}) do
+            if keys[name:lower()] then
+                c.anyListed = true
+                c.missing[ch] = c.missing[ch] or {}
+                c.missing[ch][it] = true
+                if not c.pending[ch] then c.pending[ch] = {}; c.order[#c.order + 1] = ch end
             end
         end
     end
@@ -467,6 +628,10 @@ function burncheck_start(name)
     -- not fired stays on the list, and anything ready that it was not already watching joins it.
     local cur = BURNCHK
     if cur and (cur.name or ''):lower() == name:lower() then
+        cur.missing = c.missing
+        for ch in pairs(c.missing) do
+            if not cur.pending[ch] then cur.pending[ch] = {}; cur.order[#cur.order + 1] = ch end
+        end
         cur.seen = cur.seen or {}
         local added = 0
         for _, ch in ipairs(c.order) do
@@ -489,7 +654,7 @@ function burncheck_start(name)
     if BURNCHK then burncheck_stop('a new check') end   -- only for a burn that exists: a typo leaves it running
     log('[burncheck] %s: watching %d ready item(s) on %d character(s)%s', name, c.total, #c.order,
         (c.notReady > 0) and string.format(' (%d already on cooldown, left out)', c.notReady) or '')
-    if c.total == 0 then return end
+    if c.total == 0 and not next(c.missing) then return end
     c.seen = {}
     for ch, its in pairs(c.pending) do c.seen[ch] = {}; for it in pairs(its) do c.seen[ch][it] = true end end
     BURNCHK = c
@@ -542,12 +707,13 @@ function draw_burncheck()
     if not c then return end
     local cols, left, nob = {}, 0, 0
     for _, ch in ipairs(c.order) do
-        local its, nb = {}, {}
+        local its, nb, ms = {}, {}, {}
         for it in pairs(c.pending[ch] or {}) do its[#its + 1] = it end
         for it in pairs((c.nobuff or {})[ch] or {}) do nb[#nb + 1] = it end
-        if #its + #nb > 0 then
-            table.sort(its); table.sort(nb)
-            cols[#cols + 1] = { ch = ch, its = its, nb = nb }; left = left + #its; nob = nob + #nb
+        for it in pairs((c.missing or {})[ch] or {}) do ms[#ms + 1] = it end
+        if #its + #nb + #ms > 0 then
+            table.sort(its); table.sort(nb); table.sort(ms)
+            cols[#cols + 1] = { ch = ch, its = its, nb = nb, ms = ms }; left = left + #its; nob = nob + #nb
         end
     end
     if #cols == 0 then return end
@@ -570,7 +736,7 @@ function draw_burncheck()
     ImGui.TableNextRow()
     for _, col in ipairs(cols) do
         ImGui.TableNextColumn()
-        ui_text(UI_LABEL, string.format('%s (%d)', col.ch, #col.its + #col.nb))
+        ui_text(UI_LABEL, string.format('%s (%d)', col.ch, #col.its + #col.nb + #col.ms))
     end
     ImGui.TableNextRow()
     for ci, col in ipairs(cols) do
@@ -600,10 +766,23 @@ function draw_burncheck()
         end
         -- fired, but the buff never showed: amber, under the ones still waiting
         for _, it in ipairs(col.nb) do
-            ui_text(UI_WAIT, burn_short_name(it, BURNCHK_CHARS) .. ' - no buff')
+            local hints = burn_hints(col.ch, it)
+            local htxt = {}
+            for _, x in ipairs(hints) do htxt[#htxt + 1] = x[2] end
+            local dup = (#htxt > 0) and table.concat(htxt, '\n') or nil
+            ui_text(UI_WAIT, burn_short_name(it, BURNCHK_CHARS) .. ' - ' .. ((hints[1] or {})[1] or 'no buff'))
             local w = (burnWarn[col.ch] or {})[it]
             if ui_tip_hover() then pcall(function() ImGui.SetTooltip(burn_tip(col.ch, it) .. '\nwent on cooldown, but its effect never showed'
+                .. (dup and ('\n' .. dup) or '')
+                .. ((burnWhy[col.ch] or {})[it] and ('\nwhen it fired: buffs ' .. burnWhy[col.ch][it].nb .. '/' .. burnWhy[col.ch][it].mb
+                    .. ', songs ' .. burnWhy[col.ch][it].ns
+                    .. (burnWhy[col.ch][it].by and ('\nblocked by ' .. burnWhy[col.ch][it].by) or '')) or '')
                 .. (w and ('\n' .. w) or '')) end) end
+        end
+        -- not on this toon at all: grey, at the bottom
+        for _, it in ipairs(col.ms) do
+            ImGui.TextDisabled(burn_short_name(it, BURNCHK_CHARS) .. ' - not found')
+            if ui_tip_hover() then pcall(function() ImGui.SetTooltip(it .. '\nNot found on this toon - not in its bags, or the AA is not bought. Remove the line?') end) end
         end
     end
     ImGui.EndTable()
