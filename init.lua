@@ -116,7 +116,7 @@ local SHOW_UI = (ARGS[1] ~= 'worker')
 MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
 VERSION = '1.24'
-local BUILD_TAG = '1.24.0'  -- bump on every change; prints on startup
+local BUILD_TAG = '1.24.1'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_SECTION = {
@@ -6784,6 +6784,34 @@ pcall(function()
         if name == '' then log('/atburncheck <burn name> (as in your E3 [Burn] section) | /atburncheck off'); return end
         if name:lower() == 'off' then burncheck_stop('cleared'); return end
         burncheck_start(name)
+    end)
+    -- WHICH BURN LINES CANNOT BE UP TOGETHER (1.24.1), from the spells' own slots: every toon's lines against each
+    -- other and against the group buffs the others' lines put on them. Written to the log with the reason.
+    mq.bind('/atstackcheck', function()
+        if not SHOW_UI then
+            if driverName then pcall(function() peer_cmdf(driverName, '/atstackcheck') end) end
+            return
+        end
+        stackCache, stackFx, stackTrig = {}, {}, {}
+        local n, seen = 0, {}
+        for _, ch in ipairs(ordered_members()) do
+            local items = {}
+            for it in pairs(burnSpell[ch] or {}) do items[#items + 1] = it end
+            table.sort(items)
+            for _, it in ipairs(items) do
+                for _, h in ipairs(burn_stack_conflicts(ch, it)) do
+                    local k1 = table.concat({ ch, it, h.och, h.oit }, '|')
+                    local k2 = table.concat({ h.och, h.oit, ch, it }, '|')
+                    if not seen[k1] and not seen[k2] then
+                        seen[k1] = true; n = n + 1
+                        local who = (h.och == ch) and h.oit or (h.och .. "'s " .. h.oit)
+                        log('[stack] %s: %s vs %s - %s', ch, it, who, stack_why(h.a, h.b, h.r))
+                    end
+                end
+            end
+        end
+        log('[stack] %d pair(s) of burn lines that cannot be up together%s', n,
+            (n > 0) and ' - hover a burn line for the detail' or '')
     end)
     mq.bind('/atcoth', function(arg)
         local a = arg and tostring(arg):lower() or ''
@@ -19892,6 +19920,7 @@ pcall(function() mq.unbind('/atcothaug') end)
 pcall(function() mq.unbind('/atnv') end)
 pcall(function() mq.unbind('/atburnaudit') end)
 pcall(function() mq.unbind('/atburncheck') end)
+pcall(function() mq.unbind('/atstackcheck') end)
 pcall(function() mq.unbind('/at_burnwhy') end)
 pcall(function() mq.unbind('/at_burnmiss') end)
 pcall(function() mq.unevent('at_burn_blocked') end)

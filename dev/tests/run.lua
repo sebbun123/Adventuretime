@@ -26,6 +26,7 @@ local logs = {}
 function log(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 function rezlog(fmt, ...) logs[#logs + 1] = string.format(fmt, ...) end
 function path_show(p) return tostring(p) end
+function tlo_true(v) return v == true or tostring(v) == 'TRUE' end
 function cast_backend() return 'e3' end
 function ordered_members() return MEMBERS end
 local function has(p) for _, l in ipairs(logs) do if l:find(p, 1, true) then return true end end return false end
@@ -184,6 +185,32 @@ test('an AA put on cooldown at a length not its own names what went down with it
     now = now + 9000
     local _, _, _, _, _, sh = burn_nobuff_diag('ITC3', 589, 0, it, 'a')
     eq(sh, 'Dusk'); truthy(has('may share a timer with: Dusk'), 'logged')
+end)
+test('stacking from the spells themselves: Glyph of Courage vs Illusions of Grandeur (1.24.1)', function()
+    reset(); stackFx = {}; stackCache = {}; stackTrig = {}
+    local function sp(id, tt, fx)
+        local o = spell(tt, true, 60)
+        o.ID = function() return id end; o.NumEffects = function() return 12 end
+        o.Attrib = function(i) return function() return (fx[i] or { 254, 0 })[1] end end
+        o.Base = function(i) return function() return (fx[i] or { 254, 0 })[2] end end
+        o.Trigger = function() return { Name = function() return nil end } end
+        return o
+    end
+    spells['Glyph of Courage'] = sp(12748, 'Self', { { 10, 0 }, { 273, 10 }, { 375, 105 }, nil, { 294, 10 } })
+    spells['Illusions of Grandeur'] = sp(38603, 'Group v2', { { 10, 0 }, { 273, 10 }, { 375, 110 }, { 10, 0 }, { 294, 10 } })
+    spells['Twincast'] = sp(10634, 'Self', { { 399, 100 }, { 137, 0 }, nil, { 348, 10 } })
+    spells['Third Spire'] = sp(16290, 'Self', { { 375, 155 } })
+    local r = stack_check('Glyph of Courage', 'Illusions of Grandeur')
+    eq(r.slot, 3); eq(r.spa, 375); eq(r.wins, 'b'); eq(r.va, 105); eq(r.vb, 110)
+    truthy(stack_why('Glyph of Courage', 'Illusions of Grandeur', r):find('110 - Illusions of Grandeur wins', 1, true), 'reason')
+    eq(stack_check('Twincast', 'Third Spire'), nil, 'different effects in slot 1')
+    eq(stack_check('Twincast', 'Twincast').same, true)
+    burnSpell = { Azyue = { GoC = 'Glyph of Courage', ITC = 'Twincast' }, Shela = { IoG = 'Illusions of Grandeur' } }
+    local txt = burn_stack_text('Azyue', 'GoC')
+    truthy(txt and txt:find("Shela's IoG", 1, true), 'names the other toon and line')
+    eq(burn_stack_text('Azyue', 'ITC'), nil, 'Twincast fights nothing')
+    eq(#burn_stack_conflicts('Shela', 'IoG'), 0, "Azyue's self-only Glyph is not on Shela")
+    burnSpell = {}; stackFx = {}; stackCache = {}
 end)
 test('a cooldown already running when AT loads is not explained', function()
     reset(); burnDiag = {}

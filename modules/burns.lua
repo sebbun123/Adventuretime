@@ -403,6 +403,8 @@ function burn_nobuff_diag(name, t, ds, it, kind)
     local function check(n)
         if skipScan then return end
         if n == '' or n == 'NULL' then return end
+        local r = stack_check(sp, n)
+        if r then blockers[#blockers + 1] = n .. ' (' .. stack_why(sp, n, r) .. ')'; return end
         local ok, ws = pcall(function() return mq.TLO.Spell(sp).WillStack(n)() end)
         if ok and (ws == false or tostring(ws) == 'FALSE') then blockers[#blockers + 1] = n end
     end
@@ -517,6 +519,136 @@ function burn_why_text(ch, it)
     if w.by and not burn_dup_of(ch, it) then tags[#tags + 1] = 'blocked by ' .. w.by end
     return string.format(' (buffs %s/%s, songs %s%s)', w.nb, w.mb, w.ns, (#tags > 0) and (', ' .. table.concat(tags, ', ')) or '')
 end
+-- WHY TWO BUFFS DO NOT STACK (1.24.1), from the spells themselves. MQ reads the same spells_us.txt the client
+-- ships with, so a spell update on the server needs no change here: every slot is read live. The rule is the one
+-- the server applies: the same effect in the same slot conflicts, and the stronger value wins; blank slots and
+-- focus limits never conflict. WillStack said Glyph of Courage stacks with Illusions of Grandeur; the server
+-- blocked it, and the slots show why (slot 3, DoT crit damage, 110 beats 105).
+STACK_SKIP = { [254] = true }   -- blank
+for _, n in ipairs({ 134, 135, 136, 137, 138, 139, 140, 141, 142, 143, 144, 311, 348, 385, 391, 403, 404,
+                     411, 412, 413, 414, 460 }) do STACK_SKIP[n] = true end   -- focus limits
+-- Plain names for the effects people will meet in burns; anything else shows as its number.
+SPA_NAME = { [0] = 'HP', [1] = 'AC', [2] = 'attack', [3] = 'movement speed', [11] = 'attack speed',
+    [15] = 'mana', [55] = 'rune', [69] = 'max HP', [85] = 'melee proc', [119] = 'overhaste',
+    [273] = 'DoT crit chance', [294] = 'nuke crit chance/damage', [375] = 'DoT crit damage',
+    [399] = 'twincast' }
+function spa_name(n) return SPA_NAME[n] or ('effect ' .. tostring(n)) end
+stackFx = stackFx or {}   -- spell name -> { id, ben, dur, fx = { slot -> { spa, base } } } (false = unreadable)
+function stack_fx(name)
+    if not name or name == '' then return nil end
+    local c = stackFx[name]
+    if c ~= nil then return c or nil end
+    local r = false
+    pcall(function()
+        local sp = mq.TLO.Spell(name)
+        local id = tonumber(sp.ID()) or 0
+        if id <= 0 then return end
+        local fx = {}
+        local n = 12
+        pcall(function() n = tonumber(sp.NumEffects()) or 12 end)
+        for i = 1, math.min(n, 12) do
+            local a = tonumber(sp.Attrib(i)()) or 254
+            local b = tonumber(sp.Base(i)()) or 0
+            if not STACK_SKIP[a] and not (a == 10 and b == 0) then fx[i] = { a, b } end
+        end
+        local ben = tlo_true(sp.Beneficial())
+        local dur = tonumber(sp.Duration.TotalSeconds()) or 0
+        r = { id = id, ben = ben, dur = dur, fx = fx, tt = tostring(sp.TargetType() or '') }
+    end)
+    stackFx[name] = r
+    return r or nil
+end
+-- nil when a and b can both be on you; otherwise why not: { same = true } for one spell twice, or the first slot
+-- they fight over with both values and which one wins (equal goes to whichever lands last).
+function stack_check(a, b)
+    local A, B = stack_fx(a), stack_fx(b)
+    -- buffs only: two debuffs land on the mob, where each caster's copy is its own
+    if not (A and B) or A.dur <= 0 or B.dur <= 0 or not (A.ben and B.ben) then return nil end
+    if A.id == B.id then return { same = true } end
+    -- the slot that decides it: the first where one is stronger, else the first tie
+    local tie
+    for slot = 1, 12 do
+        local ea, eb = A.fx[slot], B.fx[slot]
+        if ea and eb and eb[1] == ea[1] then
+            local va, vb = math.abs(ea[2]), math.abs(eb[2])
+            local r = { slot = slot, spa = ea[1], va = va, vb = vb, wins = (va > vb) and 'a' or (vb > va) and 'b' or 'tie' }
+            if r.wins ~= 'tie' then return r end
+            tie = tie or r
+        end
+    end
+    return tie
+end
+function stack_why(mine, theirs, c)
+    if c.same then return string.format('%s is the same effect as %s', mine, theirs) end
+    local who = (c.wins == 'a') and mine or (c.wins == 'b') and theirs or 'whichever lands last'
+    return string.format('slot %d, %s: %d vs %d - %s wins', c.slot, spa_name(c.spa), c.va, c.vb, who)
+end
+-- What one burn line puts on its toon: its spell and what that triggers, buffs only.
+stackTrig = stackTrig or {}
+function stack_spells_of(sp)
+    if not sp or sp == '' then return {} end
+    if stackTrig[sp] then return stackTrig[sp] end
+    local out = {}
+    stackTrig[sp] = out
+    out[#out + 1] = sp
+    for i = 1, 4 do
+        local t = ''
+        pcall(function() t = tostring(mq.TLO.Spell(sp).Trigger(i).Name() or '') end)
+        if t ~= '' and t ~= 'NULL' then out[#out + 1] = t end
+    end
+    return out
+end
+-- EVERY BURN LINE THAT FIGHTS THIS ONE (driver): the toon's own other lines, and the group buffs anyone else's
+-- burn lines put on it. Cached a minute; the hovers ask every frame.
+stackCache = stackCache or {}
+function burn_stack_conflicts(ch, it)
+    local key = tostring(ch) .. '|' .. tostring(it)
+    local c = stackCache[key]
+    if c and (mq.gettime() - c.at) < 60000 then return c.list end
+    local list = {}
+    local mine = stack_spells_of((burnSpell[ch] or {})[it])
+    if #mine > 0 then
+        for och, items in pairs(burnSpell) do
+            for oit, osp in pairs(items) do
+                if not (och == ch and oit == it) then
+                    local theirs = stack_spells_of(osp)
+                    local shared = (och == ch)
+                    if not shared then
+                        local f = stack_fx(osp)
+                        shared = f and (f.tt:find('Group', 1, true) or f.tt:find('AE PC', 1, true)) and true or false
+                    end
+                    if shared then
+                        local hit
+                        for _, a in ipairs(mine) do
+                            for _, b in ipairs(theirs) do
+                                local r = stack_check(a, b)
+                                if r then hit = { och = och, oit = oit, a = a, b = b, r = r }; break end
+                            end
+                            if hit then break end
+                        end
+                        if hit then list[#list + 1] = hit end
+                    end
+                end
+            end
+        end
+        table.sort(list, function(x, y) return (x.och .. x.oit) < (y.och .. y.oit) end)
+    end
+    stackCache[key] = { at = mq.gettime(), list = list }
+    return list
+end
+function burn_stack_text(ch, it, max)
+    local list = burn_stack_conflicts(ch, it)
+    if #list == 0 then return nil end
+    local lines = { "Doesn't stack with:" }
+    for i = 1, math.min(#list, max or 5) do
+        local h = list[i]
+        local who = (h.och == ch) and h.oit or (h.och .. "'s " .. h.oit)
+        lines[#lines + 1] = '  ' .. who .. ' - ' .. stack_why(h.a, h.b, h.r)
+    end
+    if #list > (max or 5) then lines[#lines + 1] = string.format('  +%d more', #list - (max or 5)) end
+    lines[#lines + 1] = 'Only one can be up at a time. Consider an If in your ini?'
+    return table.concat(lines, '\n')
+end
 -- WHAT A BURN LINE CASTS (1.22.15), for the hovers. The worker reads it once per item - the item's or AA's
 -- spell, or the disc itself - and sends it with the item's first report; the driver describes it from the
 -- spell table (target type, duration).
@@ -549,8 +681,9 @@ function burn_tip(c, it, st)
     if tt == 'NULL' then tt = '' end
     local d = (dur > 0) and string.format('%d:%02d', math.floor(dur / 60), dur % 60) or 'no duration'
     local how = ((tt ~= '') and (tt .. ', ') or '') .. d
-    if sp == it then return string.format('%s\n%s', it, how) end
-    return string.format('%s\ncasts %s (%s)', it, sp, how)
+    local base = (sp == it) and string.format('%s\n%s', it, how) or string.format('%s\ncasts %s (%s)', it, sp, how)
+    local st = c and burn_stack_text(c, it)
+    return st and (base .. '\n' .. st) or base
 end
 BURNCHK_BUFF_GRACE = 8000   -- after its cooldown starts, how long a buff item gets for its buff to show
 function burn_in(st, burn)
