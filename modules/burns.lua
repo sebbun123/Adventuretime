@@ -466,8 +466,10 @@ function burn_nobuff_diag(name, t, ds, it, kind)
     -- TWO DISCS (1.23.4): this one looks like a disc and another disc was already running.
     local discClash
     if disc ~= '' and disc ~= 'NULL' and disc:lower() ~= tostring(sp):lower() then
-        local isDisc = (burnEffectWhere or {})[name] == 'd'
-        if not isDisc then pcall(function() isDisc = tlo_true(mq.TLO.Spell(sp).IsSkill()) end) end
+        local where = (burnEffectWhere or {})[name]
+        local isDisc = where == 'd'
+        -- a disc that lands as a buff (Arcane Reprisal) does not need the disc slot, so a running disc is no clash
+        if not isDisc and where == nil then pcall(function() isDisc = tlo_true(mq.TLO.Spell(sp).IsSkill()) end) end
         if isDisc then
             discClash = disc
             rezlog('[burns]   %s looks like a disc, and %s was already running - only one disc runs at a time', name, disc)

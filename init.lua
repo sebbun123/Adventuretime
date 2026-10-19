@@ -3544,7 +3544,10 @@ local function ability_state(name)
         burn_cd_mark(name, rdy)
         -- A READY DISC IS NOT THE ONE RUNNING (1.22.10): the same name can be running from a click (the Pants
         -- cast Crystalpalm Discipline), and that must not mark the Crystalpalm line as fired.
-        if rdy then return true, true, 0, false, 0, 'd' end
+        if rdy then
+            if burn_nobuff_diag then burn_nobuff_diag(name, 0, 0, nil, 'd') end   -- marks it ready for the check below
+            return true, true, 0, false, 0, 'd'
+        end
         -- A DISC THAT BUFFS (1.23.4): Arcane Reprisal never runs in the disc slot - it puts a buff on its
         -- caster, so it never showed under Running now. Looked for by its own name, then by what it triggers.
         if not active then
@@ -3570,6 +3573,11 @@ local function ability_state(name)
             if s > 0 then active = true; dsecs = s end
         end
         local secs = -1; pcall(function() secs = tonumber(mq.TLO.Me.CombatAbilityTimer(name).TotalSeconds()) or -1 end)
+        -- A DISC THAT FIRED AND DID NOT LAND (1.24.1): the same explanation items and AAs get (Arcane Reprisal).
+        if burn_nobuff_diag then
+            burn_why_send(name, burn_nobuff_diag(name, (secs and secs > 1) and secs or 1, active and math.max(dsecs or 0, 1) or 0,
+                { Spell = mq.TLO.Spell(name) }, 'd'))
+        end
         return true, false, (secs and secs > 0 and secs or -1), active, dsecs, 'd'
     end
     abilityMiss[name] = mq.gettime()
