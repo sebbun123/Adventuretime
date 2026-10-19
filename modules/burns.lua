@@ -397,14 +397,24 @@ function burn_nobuff_diag(name, t, ds, it, kind)
     -- WHAT IT WOULD NOT STACK WITH (1.23.2): every buff and song up now that the game says this spell will not
     -- stack with - the likely blocker when there was room (Azyue's Twincast at 31/39).
     local blockers = {}
+    local best, bestWhy, bestWins   -- what is in the way, and why, from the spells' own slots (1.24.1)
+    local mineSet = stack_spells_of(sp)
     local scanAt = mq.gettime()
     local told = burnBlocked[tostring(sp):lower()]
-    local skipScan = told and (mq.gettime() - told.at) < 30000
+    local skipScan = false   -- always scan now: the slots say why, even when the game said what
     local function check(n)
         if skipScan then return end
         if n == '' or n == 'NULL' then return end
-        local r = stack_check(sp, n)
-        if r then blockers[#blockers + 1] = n .. ' (' .. stack_why(sp, n, r) .. ')'; return end
+        for _, m in ipairs(mineSet) do
+            local r = stack_check(m, n)
+            if r then
+                local why = stack_why(m, n, r)
+                blockers[#blockers + 1] = n .. ' (' .. why .. ')'
+                -- the one that beat it (or tied and got there first) is the answer
+                if not best or (r.wins ~= 'a' and bestWins == 'a') then best, bestWhy, bestWins = n, why, r.wins end
+                return
+            end
+        end
         local ok, ws = pcall(function() return mq.TLO.Spell(sp).WillStack(n)() end)
         if ok and (ws == false or tostring(ws) == 'FALSE') then blockers[#blockers + 1] = n end
     end
@@ -423,6 +433,18 @@ function burn_nobuff_diag(name, t, ds, it, kind)
         by = bl.by or 'unknown'
         rezlog('[burns]   the game said: %s did not take hold - blocked by %s', sp, by)
     end
+    -- THE REASON. The game names the blocker; the slots say why. With no game line, a conflicting buff still up
+    -- is what blocked or overwrote it.
+    local why
+    if by then
+        for _, m in ipairs(mineSet) do
+            local r = stack_check(m, by)
+            if r then why = stack_why(m, by, r); break end
+        end
+    elseif best then
+        by, why = best, bestWhy
+    end
+    if why then rezlog('[burns]   why: %s', why) end
     -- A SHARED TIMER (1.23.4): an AA whose cooldown started at a length that is not its own reuse was put on
     -- cooldown by something else. What went on cooldown with it, ending at the same moment, is the likely
     -- partner. Two abilities with the same reuse cannot be told apart this way, so nothing is said for those.
@@ -451,7 +473,7 @@ function burn_nobuff_diag(name, t, ds, it, kind)
             rezlog('[burns]   %s looks like a disc, and %s was already running - only one disc runs at a time', name, disc)
         end
     end
-    return tostring(nb), tostring(mb), tostring(ns), by, discClash, shared
+    return tostring(nb), tostring(mb), tostring(ns), by, discClash, shared, why
 end
 -- WHAT THE BUFF WINDOW HELD when a burn item went on cooldown with no buff: each worker sends it to the driver
 -- (/at_burnwhy), shown on the amber line's hover and in the burn check's summary line.
@@ -598,57 +620,6 @@ function stack_spells_of(sp)
     end
     return out
 end
--- EVERY BURN LINE THAT FIGHTS THIS ONE (driver): the toon's own other lines, and the group buffs anyone else's
--- burn lines put on it. Cached a minute; the hovers ask every frame.
-stackCache = stackCache or {}
-function burn_stack_conflicts(ch, it)
-    local key = tostring(ch) .. '|' .. tostring(it)
-    local c = stackCache[key]
-    if c and (mq.gettime() - c.at) < 60000 then return c.list end
-    local list = {}
-    local mine = stack_spells_of((burnSpell[ch] or {})[it])
-    if #mine > 0 then
-        for och, items in pairs(burnSpell) do
-            for oit, osp in pairs(items) do
-                if not (och == ch and oit == it) then
-                    local theirs = stack_spells_of(osp)
-                    local shared = (och == ch)
-                    if not shared then
-                        local f = stack_fx(osp)
-                        shared = f and (f.tt:find('Group', 1, true) or f.tt:find('AE PC', 1, true)) and true or false
-                    end
-                    if shared then
-                        local hit
-                        for _, a in ipairs(mine) do
-                            for _, b in ipairs(theirs) do
-                                local r = stack_check(a, b)
-                                if r then hit = { och = och, oit = oit, a = a, b = b, r = r }; break end
-                            end
-                            if hit then break end
-                        end
-                        if hit then list[#list + 1] = hit end
-                    end
-                end
-            end
-        end
-        table.sort(list, function(x, y) return (x.och .. x.oit) < (y.och .. y.oit) end)
-    end
-    stackCache[key] = { at = mq.gettime(), list = list }
-    return list
-end
-function burn_stack_text(ch, it, max)
-    local list = burn_stack_conflicts(ch, it)
-    if #list == 0 then return nil end
-    local lines = { "Doesn't stack with:" }
-    for i = 1, math.min(#list, max or 5) do
-        local h = list[i]
-        local who = (h.och == ch) and h.oit or (h.och .. "'s " .. h.oit)
-        lines[#lines + 1] = '  ' .. who .. ' - ' .. stack_why(h.a, h.b, h.r)
-    end
-    if #list > (max or 5) then lines[#lines + 1] = string.format('  +%d more', #list - (max or 5)) end
-    lines[#lines + 1] = 'Only one can be up at a time. Consider an If in your ini?'
-    return table.concat(lines, '\n')
-end
 -- WHAT A BURN LINE CASTS (1.22.15), for the hovers. The worker reads it once per item - the item's or AA's
 -- spell, or the disc itself - and sends it with the item's first report; the driver describes it from the
 -- spell table (target type, duration).
@@ -681,9 +652,8 @@ function burn_tip(c, it, st)
     if tt == 'NULL' then tt = '' end
     local d = (dur > 0) and string.format('%d:%02d', math.floor(dur / 60), dur % 60) or 'no duration'
     local how = ((tt ~= '') and (tt .. ', ') or '') .. d
-    local base = (sp == it) and string.format('%s\n%s', it, how) or string.format('%s\ncasts %s (%s)', it, sp, how)
-    local st = c and burn_stack_text(c, it)
-    return st and (base .. '\n' .. st) or base
+    if sp == it then return string.format('%s\n%s', it, how) end
+    return string.format('%s\ncasts %s (%s)', it, sp, how)
 end
 BURNCHK_BUFF_GRACE = 8000   -- after its cooldown starts, how long a buff item gets for its buff to show
 function burn_in(st, burn)
@@ -925,7 +895,8 @@ function draw_burncheck()
                 .. (dup and ('\n' .. dup) or '')
                 .. ((burnWhy[col.ch] or {})[it] and ('\nwhen it fired: buffs ' .. burnWhy[col.ch][it].nb .. '/' .. burnWhy[col.ch][it].mb
                     .. ', songs ' .. burnWhy[col.ch][it].ns
-                    .. (burnWhy[col.ch][it].by and ('\nblocked by ' .. burnWhy[col.ch][it].by) or '')) or '')
+                    .. (burnWhy[col.ch][it].by and ('\nblocked by ' .. burnWhy[col.ch][it].by
+                        .. (burnWhy[col.ch][it].why and ('\n' .. burnWhy[col.ch][it].why) or '')) or '')) or '')
                 .. (w and ('\n' .. w) or '')) end) end
         end
         -- not on this toon at all: grey, at the bottom

@@ -205,12 +205,24 @@ test('stacking from the spells themselves: Glyph of Courage vs Illusions of Gran
     truthy(stack_why('Glyph of Courage', 'Illusions of Grandeur', r):find('110 - Illusions of Grandeur wins', 1, true), 'reason')
     eq(stack_check('Twincast', 'Third Spire'), nil, 'different effects in slot 1')
     eq(stack_check('Twincast', 'Twincast').same, true)
-    burnSpell = { Azyue = { GoC = 'Glyph of Courage', ITC = 'Twincast' }, Shela = { IoG = 'Illusions of Grandeur' } }
-    local txt = burn_stack_text('Azyue', 'GoC')
-    truthy(txt and txt:find("Shela's IoG", 1, true), 'names the other toon and line')
-    eq(burn_stack_text('Azyue', 'ITC'), nil, 'Twincast fights nothing')
-    eq(#burn_stack_conflicts('Shela', 'IoG'), 0, "Azyue's self-only Glyph is not on Shela")
-    burnSpell = {}; stackFx = {}; stackCache = {}
+    -- a failed Glyph with IoG up: the failure names IoG and says why, with no game line needed
+    burnDiag = {}; burnBlocked = {}; burnExpectCache = burnExpectCache or {}; burnExpectCache.GoC = true
+    local M = package.loaded.mq.TLO.Me
+    local ob, os_, oc, om, ocs = M.Buff, M.Song, M.CountBuffs, M.MaxBuffSlots, M.CountSongs
+    M.Buff = function(i) return { Name = function() return nil end, Duration = { TotalSeconds = function() return 0 end } } end
+    M.Song = function(i) return { Name = function() return (i == 1) and 'Illusions of Grandeur' or nil end,
+                                  Duration = { TotalSeconds = function() return 0 end } } end
+    M.CountBuffs = function() return 20 end; M.MaxBuffSlots = function() return 39 end; M.CountSongs = function() return 1 end
+    local it = { Spell = spells['Glyph of Courage'], Reuse = 900 }
+    spells['Glyph of Courage'].Name = function() return 'Glyph of Courage' end
+    burn_nobuff_diag('GoC', 0, 0, it, 'a'); burn_nobuff_diag('GoC', 899, 0, it, 'a')
+    now = now + 9000
+    local _, _, _, by, _, _, why = burn_nobuff_diag('GoC', 890, 0, it, 'a')
+    eq(by, 'Illusions of Grandeur'); truthy(why and why:find('110 - Illusions of Grandeur wins', 1, true), 'why')
+    burnWhy = { Azyue = { GoC = { nb = '20', mb = '39', ns = '1', by = by, why = why } } }
+    truthy(burn_why_text('Azyue', 'GoC'):find('blocked by Illusions of Grandeur', 1, true), 'summary')
+    M.Buff, M.Song, M.CountBuffs, M.MaxBuffSlots, M.CountSongs = ob, os_, oc, om, ocs
+    burnWhy = {}; stackFx = {}; stackTrig = {}
 end)
 test('a cooldown already running when AT loads is not explained', function()
     reset(); burnDiag = {}
