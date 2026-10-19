@@ -115,8 +115,8 @@ AT_ENTRY = AT_ENTRY or 'adventuretime'
 local SHOW_UI = (ARGS[1] ~= 'worker')
 MQCLEAR_EVERY_MS = 3600000   -- workers: /mqclear this often (0 = never); see the main loop
 -- VERSION vs BUILD_TAG.
-VERSION = '1.23'
-local BUILD_TAG = '1.23.6'  -- bump on every change; prints on startup
+VERSION = '1.24'
+local BUILD_TAG = '1.24.0'  -- bump on every change; prints on startup
 
 -- ONE PLACE FOR THE UI COLOURS.
 UI_SECTION = {
